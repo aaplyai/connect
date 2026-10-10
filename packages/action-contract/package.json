@@ -1,0 +1,34 @@
+{
+  "name": "@aaply/action-contract",
+  "version": "0.3.0",
+  "description": "The contract between the Aaply Flow Engine and whatever performs its actions (Aaply Connect, the connector kit): the approved-action envelope, outcomes, operation contracts, refusal codes, JSON and schema helpers, and a port conformance suite. No dependencies.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./conformance": {
+      "source": "./src/api/conformance.ts",
+      "types": "./dist/api/conformance.d.ts",
+      "default": "./dist/api/conformance.js"
+    },
+    "./internal": {
+      "source": "./src/api/internal.ts",
+      "types": "./dist/api/internal.d.ts",
+      "default": "./dist/api/internal.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}

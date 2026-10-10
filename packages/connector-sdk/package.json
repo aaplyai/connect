@@ -1,0 +1,32 @@
+{
+  "name": "@aaply/connector-sdk",
+  "version": "0.3.0",
+  "description": "The public kit for building connectors that flows run as actions: definitions, egress-checked HTTP, an action port for approved actions, a test kit and a conformance suite. Depends only on @aaply/action-contract.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "source": "./src/testing.ts",
+      "types": "./dist/testing.d.ts",
+      "default": "./dist/testing.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@aaply/action-contract": "workspace:*"
+  }
+}

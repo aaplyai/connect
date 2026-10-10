@@ -1,0 +1,13 @@
+{
+  "name": "@aaply/connectors",
+  "version": "0.0.0",
+  "description": "First-party connectors for Aaply Connect, one subpath each.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "private": true,
+  "exports": {},
+  "files": [],
+  "dependencies": {
+    "@aaply/connector-sdk": "workspace:*"
+  }
+}

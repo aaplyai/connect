@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # The Postgres tests start a throwaway server from these binaries.
+      PG_BIN: /usr/lib/postgresql/16/bin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Check Postgres 16 is available
+        run: test -x "$PG_BIN/initdb" || (sudo apt-get update && sudo apt-get install -y postgresql-16)
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run vendor:check
+      - run: pnpm run typecheck
+      - run: pnpm test
+      - run: pnpm run build

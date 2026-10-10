@@ -1,0 +1,23 @@
+{
+  "name": "aaply-connect-monorepo",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Aaply Connect: the side of Aaply that holds credentials and performs the actions the Flow Engine approves, the public connector kit and the first connectors.",
+  "type": "module",
+  "packageManager": "pnpm@10.28.0",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck && tsc -p test/tsconfig.json",
+    "test": "vitest run",
+    "check": "pnpm run typecheck && pnpm run test",
+    "vendor:check": "node scripts/vendor.mjs check"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "6.0.3",
+    "vitest": "4.1.11"
+  }
+}
