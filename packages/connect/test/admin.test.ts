@@ -10,9 +10,9 @@ const AUDIENCE = "connect.admin-test";
 const TOKEN = "a-transport-token-long-enough-for-the-check-0123";
 const scope: Scope = { ...CONFORMANCE_SCOPE, appId: "admin-app" };
 const KEY = { "header:authorization": "Bearer key-1" };
-const boss: AdminActor = { domain: "member", id: "boss", roles: ["connect-admin"] };
-const ana: AdminActor = { domain: "member", id: "ana", roles: [] };
-const bo: AdminActor = { domain: "member", id: "bo", roles: [] };
+const boss: AdminActor = { tenantId: scope.tenantId, domain: "member", id: "boss", roles: ["connect-admin"] };
+const ana: AdminActor = { tenantId: scope.tenantId, domain: "member", id: "ana", roles: [] };
+const bo: AdminActor = { tenantId: scope.tenantId, domain: "member", id: "bo", roles: [] };
 
 describe.skipIf(postgresUnavailable())("the signed admin API", () => {
   let db: TestDatabase;
@@ -47,7 +47,7 @@ describe.skipIf(postgresUnavailable())("the signed admin API", () => {
     expect(c).toMatchObject({ connectorId: "notes", ownerSubject: null, status: "active" });
     const log = await as(boss).log(scope.tenantId);
     expect(log.map((e) => e.action).slice(0, 2)).toEqual(["createConnection", "install"]);
-    expect(log[0]).toMatchObject({ actor: { domain: "member", id: "boss", roles: ["connect-admin"] }, target: c.id });
+    expect(log[0]).toMatchObject({ actor: { tenantId: scope.tenantId, domain: "member", id: "boss", roles: ["connect-admin"] }, target: c.id });
     expect(JSON.stringify(log)).not.toContain("key-1");
   });
 
@@ -88,6 +88,27 @@ describe.skipIf(postgresUnavailable())("the signed admin API", () => {
     expect((await as(boss).log(scope.tenantId))[0]).toMatchObject({ action: "setPolicy", actor: { operator: true }, detail: { denied: ["notes.create"] } });
   });
 
+  it("holds every request to the actor's own tenant, and refuses changes a person may not make", async () => {
+    const elsewhere = { ...scope, tenantId: "another-tenant" };
+    await expect(as(boss).install(elsewhere, "notes")).rejects.toMatchObject({ code: "admin/forbidden" });
+    await expect(as(boss).log("another-tenant")).rejects.toMatchObject({ code: "admin/forbidden" });
+    await expect(as(boss).createConnection({ scope: elsewhere, connectorId: "notes", owner: { business: true }, secret: KEY })).rejects.toMatchObject({ code: "admin/forbidden" });
+    const mine = await as(bo).createConnection({ scope, connectorId: "notes", owner: { person: "member:bo" }, secret: KEY });
+    await expect(as(bo).revokeConnection("another-tenant", mine.id)).rejects.toMatchObject({ code: "admin/forbidden" });
+    await expect(as(bo).updateConnection(scope.tenantId, mine.id, mine.version, { status: "revoked" } as never)).rejects.toMatchObject({ code: "admin/invalid" });
+    await expect(as(bo).updateConnection(scope.tenantId, mine.id, mine.version, { grantedScopes: ["everything"] })).rejects.toMatchObject({ code: "admin/forbidden" });
+    await expect(as(bo).updateConnection(scope.tenantId, mine.id, mine.version, { owner: "x" } as never)).rejects.toMatchObject({ code: "admin/invalid" });
+    await expect(as(bo).createConnection({ scope, connectorId: "notes", owner: { person: "member:bo" }, config: { host: "10.0.0.1" }, secret: KEY })).rejects.toMatchObject({ code: "admin/forbidden" });
+    await expect(as(bo).connections({ tenantId: scope.tenantId } as never)).rejects.toMatchObject({ code: "admin/invalid" });
+    expect(await as(bo).revokeConnection(scope.tenantId, mine.id)).toMatchObject({ status: "revoked" });
+  });
+
+  it("logs nothing for a removal that removed nothing", async () => {
+    const before = (await as(boss).log(scope.tenantId)).length;
+    expect(await as(boss).uninstall(scope, "never-installed")).toBe(false);
+    expect((await as(boss).log(scope.tenantId)).length).toBe(before);
+  });
+
   it("pages the log, newest first", async () => {
     const all = await as(boss).log(scope.tenantId);
     const first = await as(boss).log(scope.tenantId, { limit: 2 });
@@ -103,6 +124,7 @@ describe.skipIf(postgresUnavailable())("the signed admin API", () => {
   it("refuses a request that is unsigned, signed for another Connect, too old, replayed, or signed by an unknown key", async () => {
     const body = JSON.stringify({ actor: boss, scope });
     expect((await signed("/admin/operations", {}, body)).status).toBe(401);
+    expect((await signed("/admin/operations", { "x-aaply-key": "backend-1", "x-aaply-signature": "AAAA", "x-aaply-time": String(Date.now()), "x-aaply-nonce": "n".repeat(20) }, "x".repeat(600_000))).status).toBe(413);
 
     const elsewhere = createAdminClient({ url, audience: "another.connect", signer: backend });
     await expect(elsewhere.as(boss).operations(scope)).rejects.toMatchObject({ message: expect.stringMatching(/signature/) });

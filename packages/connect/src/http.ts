@@ -106,7 +106,8 @@ export function createConnectHandler(connect: Connect, options: ConnectHttpOptio
         return send(res, 200, await connect.perform(value, gone.signal));
       }
       if (path.startsWith("/admin/")) {
-        const body = await readBody(req, max);
+        // A SQL definition is at most 256 KiB of JSON; nothing an admin sends needs more than twice that.
+        const body = await readBody(req, Math.min(max, 512 * 1024));
         if (body === null) return send(res, 413, { error: { code: "admin/invalid", message: "the request was too large" } });
         const answer = await connect.adminRequest({ method: req.method ?? "", path, headers: req.headers, body: body.toString("utf8") });
         return send(res, answer.status, answer.body);

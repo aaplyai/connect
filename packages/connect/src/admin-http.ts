@@ -5,7 +5,9 @@
  * The signature covers a tag, Connect's audience, the method, the path, the
  * time, a nonce and the body's SHA-256, so a request can't be moved to
  * another Connect, path or body, and is refused once more than a minute old
- * or seen before. The body names the person acting (`actor`) and the
+ * or seen before. The body is read only after the signature verifies. The
+ * actor names their tenant, and every operation is held to it. Admin
+ * requests carry secrets: serve this hop over TLS (or mTLS). The body names the person acting (`actor`) and the
  * operation's arguments; Connect checks the person's permission itself
  * (admin.ts).
  *
@@ -13,7 +15,7 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import type { ApprovedActionSigner, ApprovedActionVerifier, Scope } from "@aaply/action-contract";
+import type { ApprovedActionSigner, ApprovedActionVerifier } from "@aaply/action-contract";
 import { AdminError, adminActorProblem, type ActorAdmin, type AdminActor, type AdminErrorCode } from "./admin.js";
 import type { Connect } from "./connect.js";
 import { StoreConflict, type ConnectStore } from "./store/store.js";
@@ -31,13 +33,6 @@ type Operation = (typeof OPERATIONS)[number];
 function signingBytes(r: { audience: string; method: string; path: string; time: string; nonce: string; body: string }): Uint8Array {
   const digest = createHash("sha256").update(r.body, "utf8").digest("hex");
   return new TextEncoder().encode(`${TAG}\n${r.audience}\n${r.method}\n${r.path}\n${r.time}\n${r.nonce}\n${digest}`);
-}
-
-/** The tenant a request is for: every operation names it, in `scope`, `input.scope` or `tenantId`. */
-function tenantOf(body: Record<string, unknown>): string | null {
-  const scope = (body.scope ?? (body.input as Record<string, unknown> | undefined)?.scope) as Partial<Scope> | undefined;
-  const tenant = scope?.tenantId ?? body.tenantId;
-  return typeof tenant === "string" && tenant.length > 0 && tenant.length <= 256 ? tenant : null;
 }
 
 const STATUS: Record<AdminErrorCode, number> = { "admin/invalid": 400, "admin/forbidden": 403, "admin/not-found": 404, "admin/conflict": 409 };
@@ -77,30 +72,30 @@ export function createAdminRoutes(connect: Connect, options: { audience: string;
     const nonce = header(r, H.nonce);
     if (!keyId || !sig || !time || !nonce || !/^\d{1,16}$/.test(time) || !/^[A-Za-z0-9_-]{16,128}$/.test(nonce)) return refused("admin/unauthenticated", "the request is not signed");
     if (Math.abs(now() - Number(time)) > WINDOW_MS) return refused("admin/unauthenticated", "the request's time is too far from now");
+    // The signature first: nothing of an unsigned body is parsed.
+    const bytes = signingBytes({ audience: options.audience, method: r.method, path: r.path, time, nonce, body: r.body });
+    let valid = false;
+    try {
+      valid = await options.verifier.verify(bytes, { alg: "Ed25519", keyId, sig }, { audience: options.audience, scope: { tenantId: "", appId: "", environmentId: "" } });
+    } catch {
+      valid = false;
+    }
+    if (!valid) return refused("admin/unauthenticated", "the signature does not verify");
     let body: Record<string, unknown>;
     try {
       const parsed: unknown = JSON.parse(r.body);
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("not an object");
       body = parsed as Record<string, unknown>;
     } catch {
-      return refused("admin/unauthenticated", "the request is not signed");
+      return refused("admin/invalid", "the body is not a JSON object");
     }
-    const tenantId = tenantOf(body);
-    if (tenantId === null) return refused("admin/invalid", "the request names no tenant");
-    const bytes = signingBytes({ audience: options.audience, method: r.method, path: r.path, time, nonce, body: r.body });
-    let valid = false;
-    try {
-      valid = await options.verifier.verify(bytes, { alg: "Ed25519", keyId, sig }, { audience: options.audience, scope: { tenantId, appId: "", environmentId: "" } });
-    } catch {
-      valid = false;
-    }
-    if (!valid) return refused("admin/unauthenticated", "the signature does not verify");
-    // Once only: the nonce is held well past the window.
-    if (!(await options.store.claim(tenantId, `admin:${nonce}`, Number(time) + WINDOW_MS))) return refused("admin/unauthenticated", "the request was already used");
-
     const problem = adminActorProblem(body.actor);
     if (problem) return refused("admin/invalid", problem);
-    const admin = connect.adminAs(body.actor as AdminActor);
+    const actor = body.actor as AdminActor;
+    // Once only: the nonce is held well past the window, under the actor's tenant (every operation is held to it).
+    if (!(await options.store.claim(actor.tenantId, `admin:${nonce}`, Number(time) + WINDOW_MS))) return refused("admin/unauthenticated", "the request was already used");
+
+    const admin = connect.adminAs(actor);
     try {
       return { status: 200, body: { result: (await run(admin, op, body)) ?? null } };
     } catch (error) {
@@ -172,10 +167,9 @@ export function createAdminClient(options: AdminClientOptions): { as(actor: Admi
     const body = JSON.stringify({ actor, ...args });
     const time = String((options.now ?? Date.now)());
     const nonce = randomBytes(18).toString("base64url");
-    const tenantId = tenantOf(JSON.parse(body) as Record<string, unknown>) ?? "";
     const proof = await options.signer.sign(signingBytes({ audience: options.audience, method: "POST", path, time, nonce, body }), {
       audience: options.audience,
-      scope: { tenantId, appId: "", environmentId: "" },
+      scope: { tenantId: actor.tenantId, appId: "", environmentId: "" },
     });
     const res = await doFetch(`${options.url}${path}`, {
       method: "POST",

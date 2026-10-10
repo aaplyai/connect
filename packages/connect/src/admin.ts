@@ -21,9 +21,11 @@ export const ADMIN_ROLE = "connect-admin";
 
 /** The person acting, as the Aaply backend signed it. */
 export interface AdminActor {
+  /** The tenant they act in: every request is held to it, and their roles are theirs there. */
+  tenantId: string;
   domain: string;
   id: string;
-  /** Their roles in the tenant the request is for. */
+  /** Their roles in that tenant. */
   roles: readonly string[];
 }
 
@@ -48,10 +50,31 @@ export type ActorAdmin = Omit<ConnectAdmin, "setGlobalDisabled"> & {
 
 const personOf = (actor: AdminActor) => `${actor.domain}:${actor.id}`;
 
+function scopeProblem(scope: unknown): string | null {
+  if (typeof scope !== "object" || scope === null) return "scope is { tenantId, appId, environmentId }";
+  const s = scope as Record<string, unknown>;
+  for (const k of ["tenantId", "appId", "environmentId"]) if (typeof s[k] !== "string" || (s[k] as string).length === 0 || (s[k] as string).length > 256) return `scope.${k} is 1-256 characters`;
+  return null;
+}
+
+const CHANGE_KEYS = new Set(["secret", "status", "grantedScopes", "account", "config"]);
+
+/** A connection change: known fields only, and a status that is not a revoke (revoking deletes the secret too: `revokeConnection`). */
+function changeProblem(change: unknown): string | null {
+  if (typeof change !== "object" || change === null || Array.isArray(change)) return "change is { secret?, status?, grantedScopes?, account?, config? }";
+  const c = change as Record<string, unknown>;
+  for (const k of Object.keys(c)) if (!CHANGE_KEYS.has(k)) return `change has an unknown field ${k}`;
+  if (c.status !== undefined && c.status !== "active" && c.status !== "reauth") return "change.status is active or reauth (revoke with revokeConnection)";
+  if (c.grantedScopes !== undefined && (!Array.isArray(c.grantedScopes) || !c.grantedScopes.every((x) => typeof x === "string"))) return "change.grantedScopes is a list of scopes";
+  for (const k of ["secret", "account", "config"]) if (c[k] !== undefined && (typeof c[k] !== "object" || c[k] === null || Array.isArray(c[k]))) return `change.${k} is an object`;
+  return null;
+}
+
 /** Checks an actor's shape: the backend's signature vouches for it, not for its form. */
 export function adminActorProblem(value: unknown): string | null {
-  if (typeof value !== "object" || value === null) return "actor is { domain, id, roles }";
+  if (typeof value !== "object" || value === null) return "actor is { tenantId, domain, id, roles }";
   const a = value as Record<string, unknown>;
+  if (typeof a.tenantId !== "string" || a.tenantId.length === 0 || a.tenantId.length > 256) return "actor.tenantId is 1-256 characters";
   if (typeof a.domain !== "string" || !/^[^:\s]{1,64}$/.test(a.domain)) return "actor.domain is 1-64 characters, no ':' or spaces";
   if (typeof a.id !== "string" || !/^\S{1,256}$/.test(a.id)) return "actor.id is 1-256 characters, no spaces";
   if (!Array.isArray(a.roles) || a.roles.length > 64 || !a.roles.every((r) => typeof r === "string" && r.length > 0 && r.length <= 128)) return "actor.roles is a list of role names";
@@ -83,7 +106,8 @@ export function loggedAdmin(raw: ConnectAdmin, store: ConnectStore, who: JsonObj
         { ...scopeDetail(input.scope), connectorId: input.connectorId, owner: "person" in input.owner ? "person" : "business", environmentKind: input.environmentKind ?? "production", grantedScopes: [...(input.grantedScopes ?? [])] },
         () => raw.createConnection(input),
       ),
-    updateConnection: (tenantId, id, expectedVersion, change) => audited("updateConnection", id, { fields: Object.keys(change).sort() }, () => raw.updateConnection(tenantId, id, expectedVersion, change)),
+    updateConnection: (tenantId, id, expectedVersion, change) =>
+      audited("updateConnection", id, { fields: Object.keys(change).sort(), ...(change.status ? { status: change.status } : {}) }, () => raw.updateConnection(tenantId, id, expectedVersion, change)),
     revokeConnection: (tenantId, id) => audited("revokeConnection", id, {}, () => raw.revokeConnection(tenantId, id)),
     connection: (tenantId, id) => raw.connection(tenantId, id),
     connections: (scope, filter) => raw.connections(scope, filter),
@@ -97,12 +121,23 @@ export function loggedAdmin(raw: ConnectAdmin, store: ConnectStore, who: JsonObj
  */
 export function adminAs(raw: ConnectAdmin, store: ConnectStore, actor: AdminActor): ActorAdmin {
   const isAdmin = actor.roles.includes(ADMIN_ROLE);
-  const admin = loggedAdmin(raw, store, { domain: actor.domain, id: actor.id, roles: [...actor.roles] });
+  const admin = loggedAdmin(raw, store, { tenantId: actor.tenantId, domain: actor.domain, id: actor.id, roles: [...actor.roles] });
   const requireAdmin = (what: string) => {
     if (!isAdmin) throw new AdminError("admin/forbidden", `${what} needs the ${ADMIN_ROLE} role`);
   };
+  /** Every request stays in the actor's tenant: their roles mean nothing in another. */
+  const own = (tenantId: unknown) => {
+    if (tenantId !== actor.tenantId) throw new AdminError("admin/forbidden", "a request acts only in the actor's own tenant");
+  };
+  const scoped = (scope: Scope) => {
+    const problem = scopeProblem(scope);
+    if (problem) throw new AdminError("admin/invalid", problem);
+    own(scope.tenantId);
+  };
   /** The connection, if the actor may see it; an admin sees any, a person only their own (others read as missing). */
   const visible = async (tenantId: string, id: string): Promise<Connection> => {
+    own(tenantId);
+    if (typeof id !== "string" || id.length === 0 || id.length > 64) throw new AdminError("admin/invalid", "id is a connection id");
     const c = await raw.connection(tenantId, id);
     if (!c || (!isAdmin && c.ownerSubject !== personOf(actor))) throw new AdminError("admin/not-found", `no connection ${id}`);
     return c;
@@ -110,31 +145,43 @@ export function adminAs(raw: ConnectAdmin, store: ConnectStore, actor: AdminActo
 
   return {
     install(scope, connectorId) {
+      scoped(scope);
       requireAdmin("installing a connector");
       return admin.install(scope, connectorId);
     },
     installSql(scope, definition) {
+      scoped(scope);
       requireAdmin("installing a connector");
       return admin.installSql(scope, definition);
     },
     uninstall(scope, connectorId) {
+      scoped(scope);
       requireAdmin("removing a connector");
       return admin.uninstall(scope, connectorId);
     },
     setPolicy(scope, change) {
+      scoped(scope);
       requireAdmin("changing policy");
+      if (typeof change !== "object" || change === null || Object.keys(change).some((k) => k !== "disabled" && k !== "denied")) throw new AdminError("admin/invalid", "a policy change is { disabled?, denied? }");
       return admin.setPolicy(scope, change);
     },
     createConnection(input) {
+      if (typeof input !== "object" || input === null || typeof input.owner !== "object" || input.owner === null) throw new AdminError("admin/invalid", "input is { scope, connectorId, owner, … }");
+      scoped(input.scope);
       if ("person" in input.owner) {
         if (input.owner.person !== personOf(actor)) throw new AdminError("admin/forbidden", "a person connects only their own account");
+        // Where a connection points, and what it may do, are the business's to set.
+        if (input.config !== undefined || input.grantedScopes !== undefined) throw new AdminError("admin/forbidden", "config and grantedScopes of a connection need the " + ADMIN_ROLE + " role");
       } else requireAdmin("connecting the business's account");
       return admin.createConnection(input);
     },
     async updateConnection(tenantId, id, expectedVersion, change) {
+      const problem = changeProblem(change);
+      if (problem) throw new AdminError("admin/invalid", problem);
       const c = await visible(tenantId, id);
       if (c.ownerSubject === null) requireAdmin("changing the business's connection");
       else if (c.ownerSubject !== personOf(actor)) throw new AdminError("admin/forbidden", "only its owner changes a person's connection");
+      else if (!isAdmin && (change.config !== undefined || change.grantedScopes !== undefined)) throw new AdminError("admin/forbidden", "config and grantedScopes of a connection need the " + ADMIN_ROLE + " role");
       return admin.updateConnection(tenantId, id, expectedVersion, change);
     },
     async revokeConnection(tenantId, id) {
@@ -151,15 +198,19 @@ export function adminAs(raw: ConnectAdmin, store: ConnectStore, actor: AdminActo
       }
     },
     connections(scope, filter = {}) {
+      scoped(scope);
+      if (typeof filter !== "object" || filter === null) throw new AdminError("admin/invalid", "filter is { connectorId?, ownerSubject? }");
       if (isAdmin) return admin.connections(scope, filter);
       if (filter.ownerSubject !== undefined && filter.ownerSubject !== personOf(actor)) throw new AdminError("admin/forbidden", "a person lists only their own connections");
       return admin.connections(scope, { ...filter, ownerSubject: personOf(actor) });
     },
     operations(scope) {
+      scoped(scope);
       requireAdmin("reading operation contracts");
       return admin.operations(scope);
     },
     log(tenantId, page) {
+      own(tenantId);
       requireAdmin("reading the admin log");
       return store.adminLog(tenantId, page);
     },

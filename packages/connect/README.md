@@ -63,14 +63,18 @@ backend's Ed25519 key (`adminKeys` in `createConnect`). The signature covers Con
 method, the path, the time, a nonce and the body, so a request cannot be sent to another Connect,
 changed, or sent again, and is refused when more than a minute away from Connect's clock. The backend
 uses `createAdminClient({ url, audience, signer }).as(person)`, where `person` is
-`{ domain, id, roles }` as the backend knows them.
+`{ tenantId, domain, id, roles }` as the backend knows them: every request is held to that tenant.
+The signature does not hide the body (a new connection's secret travels in it), so the admin hop runs
+over TLS, like `/perform`.
 
 Connect decides the permission itself. Installing connectors, policy, operation contracts, the
 business's own connections and the admin log need the tenant's `connect-admin` role. A person
 connects only their own account (an admin does not connect someone else's), and sees, changes and
 removes only their own; an admin may see and remove any. Every change is written to the admin log in
 the change's own transaction (the service's role can only add to it), without secrets; changes made
-through `connect.admin` in the deployment's code are logged as the operator's.
+through `connect.admin` in the deployment's code are logged as the operator's. The log is kept until
+the deployment removes old entries itself (the service's role cannot): set a retention that suits
+the business's audit needs.
 
 ## Databases
 

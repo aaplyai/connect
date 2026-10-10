@@ -158,21 +158,26 @@ export interface ConnectStore {
 export function createPgStore(pool: pg.Pool): ConnectStore {
   const audits = new AsyncLocalStorage<Omit<AdminLogEntry, "id" | "at" | "tenantId">>();
 
-  /** A transaction with the tenant set. A `change` also writes the admin entry of the call it runs under. */
-  async function tx<T>(tenantId: string | null, work: (client: pg.PoolClient) => Promise<T>, change: boolean | ((result: T) => string) = false): Promise<T> {
+  /**
+   * A transaction with the tenant set. A `change` also writes the admin entry
+   * of the call it runs under; as a function of the result it names the
+   * entry's target, or answers false when nothing changed (no entry).
+   */
+  async function tx<T>(tenantId: string | null, work: (client: pg.PoolClient) => Promise<T>, change: boolean | ((result: T) => string | false) = false): Promise<T> {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
       if (tenantId !== null) await client.query("SELECT set_config('aaply_connect.tenant', $1, true)", [tenantId]);
       const result = await work(client);
       const entry = change ? audits.getStore() : undefined;
-      if (entry && tenantId !== null) {
+      const named = typeof change === "function" ? change(result) : null;
+      if (entry && tenantId !== null && named !== false) {
         await client.query("INSERT INTO aaply_connect.admin_log (id, tenant_id, actor, action, target, detail) VALUES ($1, $2, $3, $4, $5, $6)", [
           newId("adm"),
           tenantId,
           entry.actor,
           entry.action,
-          entry.target ?? (typeof change === "function" ? change(result) : null),
+          entry.target ?? named,
           entry.detail,
         ]);
       }
@@ -270,14 +275,18 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
                ) END
              WHERE i.kind = 'sql'`
           : "";
-      const { rowCount } = await tx(scope.tenantId, (client) =>
-        client.query(
-          `INSERT INTO aaply_connect.installations AS i (id, tenant_id, app_id, environment_id, connector_id, kind, definition, digest) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ${replace}`,
-          [i.id, ...scopeParams(scope), i.connectorId, i.kind, i.definition ?? null, i.digest ?? null],
-        ),
+      await tx(
+        scope.tenantId,
+        async (client) => {
+          const { rowCount } = await client.query(
+            `INSERT INTO aaply_connect.installations AS i (id, tenant_id, app_id, environment_id, connector_id, kind, definition, digest) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ${replace}`,
+            [i.id, ...scopeParams(scope), i.connectorId, i.kind, i.definition ?? null, i.digest ?? null],
+          );
+          // Thrown inside the transaction, so its log entry rolls back with it.
+          if (rowCount === 0) throw new StoreConflict(`${i.connectorId} is installed as a code connector here`);
+        },
         true,
       );
-      if (rowCount === 0) throw new StoreConflict(`${i.connectorId} is installed as a code connector here`);
     },
 
     async uninstall(scope, connectorId) {
@@ -287,7 +296,7 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
           connectorId,
         ]);
         return (rowCount ?? 0) > 0;
-      }, true);
+      }, (removed) => (removed ? connectorId : false));
     },
 
     async installations(scope) {
@@ -369,7 +378,7 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
           [tenantId, id],
         );
         return rows[0] ? connectionOf(rows[0]) : null;
-      }, true);
+      }, (revoked) => (revoked ? revoked.id : false));
     },
 
     async connection(tenantId, id) {
