@@ -40,8 +40,8 @@ export interface Installation {
 
 /** What one call needs, read in one round trip. */
 export interface Resolution {
-  global: { disabled: boolean; version: number };
-  policy: { disabled: boolean; denied: string[]; version: number } | null;
+  global: { disabled: boolean };
+  policy: { disabled: boolean; denied: string[] } | null;
   installation: Installation | null;
   connection: (Omit<Connection, "scope" | "connectorId"> & { secret: { sealed: SealedSecret; dataKey: WrappedDataKey } | null }) | null;
 }
@@ -72,6 +72,8 @@ export interface NewConnection {
 export class StoreConflict extends Error {
   override readonly name = "StoreConflict";
 }
+
+const PURGE_BATCH = 5_000;
 
 /** How long a replay claim outlives its envelope's deadline. */
 const CLAIM_MARGIN_MS = 10 * 60_000;
@@ -123,8 +125,8 @@ export interface ConnectStore {
   revokeConnection(tenantId: string, id: string): Promise<Connection | null>;
   connection(tenantId: string, id: string): Promise<Connection | null>;
   connections(scope: Scope, filter?: { connectorId?: string; ownerSubject?: string }): Promise<Connection[]>;
-  /** Deletes up to `limit` expired claims across tenants; answers how many. */
-  purgeExpired(limit?: number): Promise<number>;
+  /** Deletes expired claims across tenants in batches, until none are left or `budgetMs` (default 5 s) runs out; answers how many. */
+  purgeExpired(budgetMs?: number): Promise<number>;
   /** Refuses a database made by another build, and a login role that can bypass row security. */
   check(): Promise<void>;
 }
@@ -161,8 +163,8 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
       const r = rows[0]?.r as Record<string, any>;
       const c = r.connection as Record<string, any> | null;
       return {
-        global: { disabled: r.global.disabled, version: Number(r.global.version) },
-        policy: r.policy ? { disabled: r.policy.disabled, denied: r.policy.denied, version: Number(r.policy.version) } : null,
+        global: { disabled: r.global.disabled },
+        policy: r.policy ? { disabled: r.policy.disabled, denied: r.policy.denied } : null,
         installation: r.installation ? { id: r.installation.id, kind: r.installation.kind, definition: r.installation.definition ?? null, digest: r.installation.digest ?? null } : null,
         connection: c
           ? {
@@ -338,9 +340,15 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
       });
     },
 
-    async purgeExpired(limit = 1000) {
-      const { rows } = await pool.query("SELECT aaply_connect.purge_expired($1) AS n", [limit]);
-      return Number(rows[0]?.n ?? 0);
+    async purgeExpired(budgetMs = 5_000) {
+      const until = Date.now() + budgetMs;
+      let total = 0;
+      for (;;) {
+        const { rows } = await pool.query("SELECT aaply_connect.purge_expired($1) AS n", [PURGE_BATCH]);
+        const n = Number(rows[0]?.n ?? 0);
+        total += n;
+        if (n < PURGE_BATCH || Date.now() >= until) return total;
+      }
     },
 
     async check() {

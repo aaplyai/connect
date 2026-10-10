@@ -45,6 +45,8 @@ const BLOCKED = blockList([...BLOCKED_V4, ...BLOCKED_V6]);
 
 /** Operator settings for private networks. */
 export interface EgressOptions {
+  /** Sockets kept per origin (scheme, host and port) for connector requests. Default 64; calls beyond it wait for one. */
+  connectionsPerOrigin?: number;
   /**
    * Private addresses Connect may reach anyway: CIDRs (`10.20.0.0/16`) and
    * exact host names (`db.internal.aaply.ai`). Deployment config only. A host

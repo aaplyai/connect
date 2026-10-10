@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { operationDigest, signApprovedAction, type ApprovedAction, type ApprovedActionSigner, type Scope } from "@aaply/action-contract";
 import { actionPortConformance, CONFORMANCE_SCOPE, draftApprovedAction, type ApprovedActionDraft } from "@aaply/action-contract/conformance";
 import { operationContractOf } from "@aaply/connector-sdk";
@@ -244,9 +244,34 @@ describe.skipIf(postgresUnavailable())("Connect", () => {
     expect(ops["notes.create"]!.digest).toBe(operationDigest(operationContractOf(v2, "create")!));
   });
 
+  it("checks the engine's signature once per call", async () => {
+    const spy = vi.spyOn(globalThis.crypto.subtle, "verify");
+    try {
+      expect((await connect.perform(await read())).status).toBe("ok");
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("finds the call's connection by index however many connections there are", async () => {
+    const admin = db.pool("postgres");
+    await admin.query(`INSERT INTO aaply_connect.connections (id, tenant_id, app_id, environment_id, connector_id, role, environment_kind)
+      SELECT 'conn_bulk' || g, 'tenant-' || (g % 500), 'app', 'env', 'notes', 'r' || g, 'production' FROM generate_series(1, 20000) g`);
+    await admin.query("ANALYZE aaply_connect.connections");
+    const plan = await admin.query(`EXPLAIN SELECT id FROM aaply_connect.connections c
+      WHERE c.tenant_id = 'tenant-7' AND c.app_id = 'app' AND c.environment_id = 'env' AND c.connector_id = 'notes' AND c.environment_kind = 'production'
+        AND c.owner_subject IS NULL AND c.role = 'r7' ORDER BY (c.status <> 'revoked') DESC, c.created_at DESC LIMIT 1`);
+    const text = plan.rows.map((r) => r["QUERY PLAN"]).join("\n");
+    expect(text).toMatch(/Index Scan|Bitmap Index Scan/);
+    expect(text).not.toMatch(/Seq Scan/);
+    await admin.query("DELETE FROM aaply_connect.connections WHERE id LIKE 'conn_bulk%'");
+  });
+
   it("deletes expired replay claims", async () => {
+    await db.pool("postgres").query("INSERT INTO aaply_connect.replay_claims (tenant_id, claim_key, until) SELECT 't', 'k' || g, now() - interval '1 minute' FROM generate_series(1, 12000) g");
     await db.pool("postgres").query("UPDATE aaply_connect.replay_claims SET until = now() - interval '1 minute'");
-    expect(await connect.purgeExpired()).toBeGreaterThan(0);
+    expect(await connect.purgeExpired()).toBeGreaterThan(12_000);
     expect((await db.pool("postgres").query("SELECT count(*)::int AS n FROM aaply_connect.replay_claims")).rows[0].n).toBe(0);
   });
 });

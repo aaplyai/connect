@@ -15,7 +15,7 @@ import { egressPolicy, safeFetch, type EgressOptions } from "./egress.js";
 import { newId } from "./ids.js";
 import { compareVersions } from "./semver.js";
 import { createPerformer, DEFAULT_ROLE } from "./performer.js";
-import { createPgStore, type Connection, type ConnectStore } from "./store/store.js";
+import { createPgStore, type Connection } from "./store/store.js";
 import { createVault, type KeyProvider } from "./vault.js";
 
 export interface ConnectOptions {
@@ -90,10 +90,9 @@ export interface Connect {
   perform(value: unknown, signal?: AbortSignal): Promise<ActionOutcome>;
   describe(): ActionPortDescription;
   admin: ConnectAdmin;
-  store: ConnectStore;
   /** Whether the store answers. */
   ready(): Promise<boolean>;
-  /** Deletes expired replay claims; run it from a timer on any instance. */
+  /** Deletes expired replay claims; run it every minute from any instance (several at once is safe). */
   purgeExpired(): Promise<number>;
   close(): Promise<void>;
 }
@@ -108,7 +107,7 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
   const store = createPgStore(options.pool);
   await store.check();
   const vault = createVault({ keys: options.keys, store, ...(options.now ? { now: options.now } : {}) });
-  const egress = safeFetch(egressPolicy(options.egress));
+  const egress = safeFetch(egressPolicy(options.egress), { connections: options.egress?.connectionsPerOrigin ?? 64 });
   const performer = createPerformer({
     audience: options.audience,
     verifier: ed25519ActionVerifier(options.engineKeys, options.now ? { now: options.now } : {}),
@@ -195,7 +194,6 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
     perform: performer.perform,
     describe: performer.describe,
     admin,
-    store,
     async ready() {
       try {
         await options.pool.query("SELECT 1");

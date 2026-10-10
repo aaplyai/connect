@@ -28,6 +28,7 @@ import {
   type ActionOutcome,
   type ActionPortDescription,
   type ApprovedAction,
+  type ActionProof,
   type ApprovedActionVerifier,
   type Sha256Digest,
 } from "@aaply/action-contract";
@@ -84,6 +85,8 @@ interface CallState {
   tenantId: string;
   resolution: Resolution;
   connector: Connector;
+  /** The proof `perform` already verified for this envelope, so the kit's own check need not verify it again. */
+  verified: ActionProof;
   /** The opened secret, once a request asked for it. */
   secret?: Readonly<Record<string, string>> | null;
 }
@@ -133,6 +136,17 @@ export function createPerformer(options: PerformerOptions): Performer {
     return s.secret;
   };
 
+  // The kit checks every envelope again, signature included. perform() has just verified this very envelope
+  // and hands the kit the same object, so the kit's check of that proof is answered from the call state.
+  const kitVerifier: ApprovedActionVerifier = {
+    verify: (data, proof, context) => {
+      const done = calls.getStore()?.verified;
+      if (done && done.alg === proof.alg && done.keyId === proof.keyId && done.sig === proof.sig) return true;
+      return options.verifier.verify(data, proof, context);
+    },
+  };
+
+  // One kit port per connector version, so a flow's pin routes to the version it was published against.
   const versions = new Map<string, Served[]>();
   for (const connector of options.connectors) {
     const list = versions.get(connector.id) ?? [];
@@ -141,7 +155,7 @@ export function createPerformer(options: PerformerOptions): Performer {
     for (const name of Object.keys(connector.operations)) digests.set(name, operationDigest(operationContractOf(connector, name)!));
     const port = createConnectorActionPort({
       audience: options.audience,
-      verifier: options.verifier,
+      verifier: kitVerifier,
       connectors: [connector],
       fetch: options.fetch,
       clock: { now },
@@ -226,7 +240,7 @@ export function createPerformer(options: PerformerOptions): Performer {
 
     const served = pick(list, operation, a.action.contract);
     try {
-      return await calls.run({ tenantId: a.scope.tenantId, resolution, connector: served.connector }, () => served.port.run(a, capped));
+      return await calls.run({ tenantId: a.scope.tenantId, resolution, connector: served.connector, verified: a.proof }, () => served.port.run(a, capped));
     } catch (error) {
       // The kit's port never throws; this is a last guard so /perform always answers an outcome.
       report(error, "perform");

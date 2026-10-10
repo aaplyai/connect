@@ -53,6 +53,16 @@ describe("the vault", () => {
     expect(() => localKeyProvider({ keyId: "k", key: new Uint8Array(16) })).toThrow(/32 bytes/);
   });
 
+  it("unwraps a data key once for concurrent first calls", async () => {
+    let unwraps = 0;
+    const counting = { keyId: provider.keyId, wrap: provider.wrap, unwrap: async (w: Uint8Array, c: { tenantId: string; dataKeyId: string; keyId: string }) => (unwraps++, provider.unwrap(w, c)) };
+    const store = memoryKeys();
+    const sealed = await createVault({ keys: provider, store }).seal("t1", "c", 1, { a: "b" });
+    const vault = createVault({ keys: counting, store });
+    await Promise.all(Array.from({ length: 10 }, () => vault.open("t1", "c", sealed, store.get("t1"))));
+    expect(unwraps).toBe(1);
+  });
+
   it("keeps unwrapped data keys for at most five minutes", async () => {
     let unwraps = 0;
     const counting = { ...provider, keyId: provider.keyId, wrap: provider.wrap, unwrap: async (w: Uint8Array, c: { tenantId: string; dataKeyId: string; keyId: string }) => (unwraps++, provider.unwrap(w, c)) };

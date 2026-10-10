@@ -92,6 +92,8 @@ CREATE TABLE aaply_connect.connections (
   updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK ((owner_subject IS NULL) <> (role IS NULL))
 );
+-- What resolve() reads on every call (it also sees revoked rows, which the partial unique indexes leave out).
+CREATE INDEX connections_resolve ON aaply_connect.connections (tenant_id, app_id, environment_id, connector_id, environment_kind);
 CREATE UNIQUE INDEX connections_business ON aaply_connect.connections (tenant_id, app_id, environment_id, connector_id, role, environment_kind) WHERE owner_subject IS NULL AND status <> 'revoked';
 CREATE UNIQUE INDEX connections_person ON aaply_connect.connections (tenant_id, app_id, environment_id, connector_id, owner_subject, environment_kind) WHERE role IS NULL AND status <> 'revoked';
 
@@ -130,8 +132,8 @@ DECLARE
 BEGIN
   PERFORM set_config('aaply_connect.tenant', p_tenant, true);
   SELECT jsonb_build_object(
-    'global', (SELECT jsonb_build_object('disabled', g.disabled, 'version', g.version) FROM aaply_connect.global_policy g),
-    'policy', (SELECT jsonb_build_object('disabled', p.disabled, 'denied', to_jsonb(p.denied), 'version', p.version) FROM aaply_connect.policy p
+    'global', (SELECT jsonb_build_object('disabled', g.disabled) FROM aaply_connect.global_policy g),
+    'policy', (SELECT jsonb_build_object('disabled', p.disabled, 'denied', to_jsonb(p.denied)) FROM aaply_connect.policy p
                WHERE p.tenant_id = p_tenant AND p.app_id = p_app AND p.environment_id = p_env),
     'installation', (SELECT jsonb_build_object('id', i.id, 'kind', i.kind, 'definition', i.definition, 'digest', i.digest) FROM aaply_connect.installations i
                WHERE i.tenant_id = p_tenant AND i.app_id = p_app AND i.environment_id = p_env AND i.connector_id = p_connector),

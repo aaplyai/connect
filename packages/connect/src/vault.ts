@@ -103,31 +103,25 @@ const CACHE_MAX = 10_000;
 
 export function createVault(options: { keys: KeyProvider; store: DataKeyStore; now?: () => number }): Vault {
   const now = options.now ?? Date.now;
-  const cache = new Map<string, { key: Uint8Array; until: number }>();
-  const cached = (tenantId: string, dataKeyId: string): Uint8Array | null => {
-    const hit = cache.get(`${tenantId}\n${dataKeyId}`);
-    if (!hit) return null;
-    if (hit.until <= now()) {
-      cache.delete(`${tenantId}\n${dataKeyId}`);
-      return null;
+  // Least recently used first; one pending unwrap per key, so concurrent first calls unwrap once.
+  const cache = new Map<string, { key: Promise<Uint8Array>; until: number }>();
+  const unwrap = (tenantId: string, dataKey: WrappedDataKey): Promise<Uint8Array> => {
+    const id = `${tenantId}\n${dataKey.dataKeyId}`;
+    const hit = cache.get(id);
+    if (hit && hit.until > now()) {
+      cache.delete(id);
+      cache.set(id, hit);
+      return hit.key;
     }
-    return hit.key;
-  };
-  const remember = (tenantId: string, dataKeyId: string, key: Uint8Array) => {
-    if (cache.size >= CACHE_MAX) {
-      for (const k of cache.keys()) {
-        cache.delete(k);
-        if (cache.size < CACHE_MAX / 2) break;
-      }
-    }
-    cache.set(`${tenantId}\n${dataKeyId}`, { key, until: now() + CACHE_MS });
-  };
-  const unwrap = async (tenantId: string, dataKey: WrappedDataKey): Promise<Uint8Array> => {
-    const hit = cached(tenantId, dataKey.dataKeyId);
-    if (hit) return hit;
-    const key = await options.keys.unwrap(dataKey.wrapped, { tenantId, dataKeyId: dataKey.dataKeyId, keyId: dataKey.wrappingKeyId });
-    if (key.length !== 32) throw new Error("a data key must be 32 bytes");
-    remember(tenantId, dataKey.dataKeyId, key);
+    const key = options.keys.unwrap(dataKey.wrapped, { tenantId, dataKeyId: dataKey.dataKeyId, keyId: dataKey.wrappingKeyId }).then((k) => {
+      if (k.length !== 32) throw new Error("a data key must be 32 bytes");
+      return k;
+    });
+    cache.delete(id);
+    cache.set(id, { key, until: now() + CACHE_MS });
+    // A failed unwrap is not kept: the next call tries again.
+    key.catch(() => cache.get(id)?.key === key && cache.delete(id));
+    if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value as string);
     return key;
   };
   return {
