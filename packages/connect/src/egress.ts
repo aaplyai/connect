@@ -54,6 +54,12 @@ export interface EgressOptions {
    * list names only of hosts whose DNS the operator controls; prefer CIDRs.
    */
   allowPrivate?: readonly string[];
+  /**
+   * Tenants whose declared SQL connections may reach an `allowPrivate`
+   * address (Aaply's own database, say). Every other tenant's SQL connection
+   * is refused there: `allowPrivate` is for the operator, not for tenants.
+   */
+  sqlPrivateTenants?: readonly string[];
 }
 
 /** The egress policy: which addresses a socket may connect to. */

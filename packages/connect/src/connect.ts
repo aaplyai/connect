@@ -8,13 +8,16 @@
  */
 
 import type pg from "pg";
-import { ed25519ActionVerifier, operationDigest, type ActionOutcome, type ActionPortDescription, type Ed25519PublicKey, type EnvironmentKind, type JsonObject, type OperationContract, type Scope } from "@aaply/action-contract";
+import { ed25519ActionVerifier, type ActionOutcome, type ActionPortDescription, type Ed25519PublicKey, type EnvironmentKind, type JsonObject, type OperationContract, type Scope } from "@aaply/action-contract";
 import { operationContractOf, type Connector, type ConnectorLogSink, type FetchLike } from "@aaply/connector-sdk";
 import { secretProblem, type TokenRefresher } from "./credentials.js";
 import { egressPolicy, safeFetch, type EgressOptions } from "./egress.js";
 import { newId } from "./ids.js";
 import { compareVersions } from "./semver.js";
 import { createPerformer, DEFAULT_ROLE } from "./performer.js";
+import { sqlConnector } from "./sql/connector.js";
+import { definitionDigest, sqlDefinitionProblems, type SqlConnectorDefinition } from "./sql/definition.js";
+import { createSqlExecutor, sqlTargetProblem, type SqlExecutor } from "./sql/executor.js";
 import { createPgStore, type Connection } from "./store/store.js";
 import { createVault, type KeyProvider } from "./vault.js";
 
@@ -66,7 +69,14 @@ export interface NewConnectionInput {
 
 /** What the admin API (and later the signed /admin routes) can do. Permission checks belong to the caller. */
 export interface ConnectAdmin {
+  /** Installs one of this build's code connectors for a scope. */
   install(scope: Scope, connectorId: string): Promise<string>;
+  /**
+   * Installs a declared SQL connector (data) for a scope, replacing its
+   * earlier definition. Flows pinned to an operation whose statement changed
+   * are refused (`connect/contract-mismatch`) until they are published again.
+   */
+  installSql(scope: Scope, definition: SqlConnectorDefinition): Promise<string>;
   uninstall(scope: Scope, connectorId: string): Promise<boolean>;
   setPolicy(scope: Scope, change: { disabled?: boolean; denied?: readonly string[] }): Promise<void>;
   setGlobalDisabled(disabled: boolean): Promise<void>;
@@ -81,8 +91,12 @@ export interface ConnectAdmin {
   revokeConnection(tenantId: string, id: string): Promise<Connection | null>;
   connection(tenantId: string, id: string): Promise<Connection | null>;
   connections(scope: Scope, filter?: { connectorId?: string; ownerSubject?: string }): Promise<Connection[]>;
-  /** The operation contracts of the connectors installed for a scope (their newest version), which a host pins when it publishes a flow. */
-  operations(scope: Scope): Promise<Record<string, OperationContract & { digest: string }>>;
+  /**
+   * The operation contracts of the connectors installed for a scope (their
+   * newest version), as the engine's `pinActionContracts` takes them when a
+   * host publishes a flow. A pin is `operationDigest(contract)`.
+   */
+  operations(scope: Scope): Promise<Record<string, OperationContract>>;
 }
 
 export interface Connect {
@@ -107,7 +121,9 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
   const store = createPgStore(options.pool);
   await store.check();
   const vault = createVault({ keys: options.keys, store, ...(options.now ? { now: options.now } : {}) });
-  const egress = safeFetch(egressPolicy(options.egress), { connections: options.egress?.connectionsPerOrigin ?? 64 });
+  const policy = egressPolicy(options.egress);
+  const egress = safeFetch(policy, { connections: options.egress?.connectionsPerOrigin ?? 64 });
+  const sql = createSqlExecutor({ egress: policy, ...(options.egress?.sqlPrivateTenants ? { privateTenants: options.egress.sqlPrivateTenants } : {}) });
   const performer = createPerformer({
     audience: options.audience,
     verifier: ed25519ActionVerifier(options.engineKeys, options.now ? { now: options.now } : {}),
@@ -115,6 +131,7 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
     store,
     vault,
     fetch: options.fetch ?? egress.fetch,
+    sql,
     ...(options.refresher ? { refresher: options.refresher } : {}),
     ...(options.now ? { now: options.now } : {}),
     ...(options.ceilingMs !== undefined ? { ceilingMs: options.ceilingMs } : {}),
@@ -128,6 +145,24 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
     return c;
   };
 
+  /** A SQL definition as a kit connector, for its checks and contracts only (it never runs). */
+  const declared = (definition: SqlConnectorDefinition) => sqlConnector(definition, idle, async () => Promise.reject(new Error("not running")));
+  const idle: SqlExecutor = { run: () => Promise.reject(new Error("not running")), close: async () => {} };
+
+  /** What is wrong with a connection's secret and config for its connector in this scope, or null. */
+  const connectionProblem = async (scope: Scope, connectorId: string, secret: Readonly<Record<string, string>> | null, config: JsonObject | undefined, creating = false): Promise<string | null> => {
+    const code = newest(options.connectors, connectorId);
+    if (code) return secretProblem(code.auth, secret);
+    const installed = (await store.installations(scope)).find((i) => i.connectorId === connectorId && i.kind === "sql");
+    if (!installed) return `no connector ${connectorId} in this build or installed here`;
+    if (config !== undefined) {
+      const problem = sqlTargetProblem(config);
+      if (problem) return problem;
+    }
+    if ((creating || secret !== null) && (secret === null || Object.keys(secret).join() !== "password" || !secret.password)) return "a SQL connection's secret is { password }";
+    return null;
+  };
+
   const admin: ConnectAdmin = {
     async install(scope, connectorId) {
       connectorOf(connectorId);
@@ -135,12 +170,20 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
       await store.install(scope, { id, connectorId, kind: "code" });
       return id;
     },
+    async installSql(scope, definition) {
+      const problems = sqlDefinitionProblems(definition);
+      if (problems.length > 0) throw new Error(`the SQL connector is not valid: ${problems.join("; ")}`);
+      if (newest(options.connectors, definition.id)) throw new Error(`${definition.id} is the id of a code connector in this build`);
+      declared(definition); // the kit's own checks: schemas, undo pairing, risk floors
+      const id = newId("inst");
+      await store.install(scope, { id, connectorId: definition.id, kind: "sql", definition: definition as unknown as JsonObject, digest: definitionDigest(definition) });
+      return id;
+    },
     uninstall: (scope, connectorId) => store.uninstall(scope, connectorId),
     setPolicy: (scope, change) => store.setPolicy(scope, change),
     setGlobalDisabled: (disabled) => store.setGlobalDisabled(disabled),
     async createConnection(input) {
-      const connector = connectorOf(input.connectorId);
-      const problem = secretProblem(connector.auth, input.secret);
+      const problem = await connectionProblem(input.scope, input.connectorId, input.secret, input.config ?? {}, true);
       if (problem) throw new Error(`${input.connectorId}: ${problem}`);
       const id = newId("conn");
       const person = "person" in input.owner ? input.owner.person : null;
@@ -164,10 +207,10 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
     },
     async updateConnection(tenantId, id, expectedVersion, change) {
       const { secret, ...fields } = change;
-      if (secret) {
+      if (secret || fields.config) {
         const current = await store.connection(tenantId, id);
         if (!current) throw new Error(`no connection ${id}`);
-        const problem = secretProblem(connectorOf(current.connectorId).auth, secret);
+        const problem = await connectionProblem(current.scope, current.connectorId, secret ?? null, fields.config);
         if (problem) throw new Error(`${current.connectorId}: ${problem}`);
       }
       return store.updateConnection(tenantId, id, expectedVersion, fields, secret ? (version) => vault.seal(tenantId, id, version, secret) : undefined);
@@ -176,14 +219,13 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
     connection: (tenantId, id) => store.connection(tenantId, id),
     connections: (scope, filter) => store.connections(scope, filter),
     async operations(scope) {
-      const out: Record<string, OperationContract & { digest: string }> = {};
+      const out: Record<string, OperationContract> = {};
       for (const inst of await store.installations(scope)) {
-        if (inst.kind !== "code") continue;
-        const connector = newest(options.connectors, inst.connectorId);
+        const connector = inst.kind === "sql" ? declared(inst.definition as unknown as SqlConnectorDefinition) : newest(options.connectors, inst.connectorId);
         if (!connector) continue;
         for (const name of Object.keys(connector.operations)) {
           const contract = operationContractOf(connector, name)!;
-          out[`${connector.id}.${name}`] = { ...contract, digest: operationDigest(contract) };
+          out[`${connector.id}.${name}`] = contract;
         }
       }
       return out;
@@ -203,6 +245,8 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
       }
     },
     purgeExpired: () => store.purgeExpired(),
-    close: () => egress.close(),
+    close: async () => {
+      await Promise.all([egress.close(), sql.close()]);
+    },
   };
 }

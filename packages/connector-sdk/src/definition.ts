@@ -28,7 +28,7 @@
  * a signed or pinned connector will be identified by.
  */
 
-import { DiagnosticBag, DiagnosticsError, canonicalJson, checkJson, checkSchema, cloneJson, isJsonObject, isOperationCompletion, MAX_COMPLETION_WINDOW_MS, sha256, toHex, type Diagnostic, type JsonObject, type JsonSchema, type JsonValue, type OperationCompletion, type OperationContract, type PathSegment, type Risk } from "@aaply/action-contract";
+import { DiagnosticBag, DiagnosticsError, canonicalJson, checkJson, checkSchema, cloneJson, isJsonObject, isOperationCompletion, isSha256Digest, MAX_COMPLETION_WINDOW_MS, sha256, toHex, type Diagnostic, type JsonObject, type JsonSchema, type JsonValue, type OperationCompletion, type OperationContract, type PathSegment, type Risk, type Sha256Digest } from "@aaply/action-contract";
 import { fixedPattern } from "@aaply/action-contract/internal";
 import type { ConnectorBlobs } from "./blobs.js";
 import { SAFE_METHODS, hostCovers, parseEgressRule, parseHostPattern, ruleCovers, type EgressRule, type HostPattern } from "./egress.js";
@@ -130,6 +130,14 @@ export interface OperationDefinition {
    */
   completion?: OperationCompletion;
   /**
+   * For an operation whose behaviour is declared data the host interprets (a
+   * SQL statement, a request template) rather than this code: the digest of
+   * that data. It is part of the operation contract, so a flow pinned to it
+   * covers the exact statement, and changing it needs the flow pinned again.
+   * Code connectors leave it out.
+   */
+  implementation?: Sha256Digest;
+  /**
    * Does the work. Return the output (plain JSON) when the operation was
    * applied; throw a `ConnectorError` otherwise. Annotate `input` with the
    * shape the input schema guarantees (a type alias or inline type).
@@ -176,6 +184,8 @@ export interface Operation {
   readonly scopes?: readonly string[];
   /** The completion window it declared, when it declared one. */
   readonly completion?: Readonly<OperationCompletion>;
+  /** The digest of the declared data it runs, when it declared one. */
+  readonly implementation?: Sha256Digest;
   readonly handler: OperationDefinition["handler"];
 }
 
@@ -208,6 +218,7 @@ export interface OperationManifest {
   egress: string[];
   scopes?: string[];
   completion?: OperationCompletion;
+  implementation?: Sha256Digest;
 }
 
 /** Everything about a connector except its code. Plain JSON. */
@@ -247,7 +258,7 @@ export const CONNECTOR_LIMITS = deepFreeze({
 const RISK_FLOORS: readonly RiskFloor[] = ["none", "confirm", "approval"];
 const RISK_RANK: Record<RiskFloor, number> = { none: 0, confirm: 1, approval: 2 };
 const CONNECTOR_KEYS = ["id", "version", "title", "description", "auth", "egress", "operations", "webhooks", "propagateTrace"];
-const OPERATION_KEYS = ["title", "description", "effect", "input", "output", "idempotent", "compensate", "irreversible", "riskFloor", "egress", "scopes", "completion"];
+const OPERATION_KEYS = ["title", "description", "effect", "input", "output", "idempotent", "compensate", "irreversible", "riskFloor", "egress", "scopes", "completion", "implementation"];
 
 /** Whether `risk` is at least `floor`. */
 export function riskAtLeast(risk: RiskFloor, floor: RiskFloor): boolean {
@@ -492,6 +503,9 @@ function checkInto(raw: unknown, bag: DiagnosticBag, mode: Mode): void {
         `Set \`completion\` to \`{ windowMs }\` with a whole number of milliseconds from 1 to ${MAX_COMPLETION_WINDOW_MS}, or remove it.`,
       );
     }
+    if (op.implementation !== undefined && !isSha256Digest(op.implementation)) {
+      bag.error("connector/invalid-field", [...path, "implementation"], "implementation is a sha256 digest (sha256:<64 hex>)");
+    }
     if (mode === "definition" && typeof op.handler !== "function") {
       bag.error("connector/missing-handler", [...path, "handler"], "an operation needs a handler function");
     }
@@ -543,7 +557,8 @@ function checkInto(raw: unknown, bag: DiagnosticBag, mode: Mode): void {
       }
     }
     if (op.scopes !== undefined) checkOperationScopes(op.scopes, def.auth, [...path, "scopes"], bag);
-    if (effect === "write" && rules.every((r) => SAFE_METHODS.has(r.method))) {
+    // A write's effect is a POST, PUT, PATCH or DELETE, unless it runs declared data (SQL) the host interprets instead of HTTP.
+    if (effect === "write" && op.implementation === undefined && rules.every((r) => SAFE_METHODS.has(r.method))) {
       bag.error("connector/write-without-unsafe-egress", path, "a write must be allowed a POST, PUT, PATCH or DELETE; GET and HEAD are treated as reads");
     }
   }
@@ -641,6 +656,7 @@ export function defineConnector(definition: ConnectorDefinition): Connector {
       egress,
       ...(def.scopes !== undefined ? { scopes: Object.freeze([...def.scopes]) } : {}),
       ...(def.completion !== undefined ? { completion: Object.freeze({ windowMs: def.completion.windowMs }) } : {}),
+      ...(def.implementation !== undefined ? { implementation: def.implementation } : {}),
       handler: def.handler,
     });
     Object.defineProperty(operations, name, { value: operation, enumerable: true });
@@ -693,6 +709,7 @@ export function manifestOf(connector: Connector): ConnectorManifest {
       egress: [...op.egress],
       ...(op.scopes !== undefined ? { scopes: [...op.scopes] } : {}),
       ...(op.completion !== undefined ? { completion: { windowMs: op.completion.windowMs } } : {}),
+      ...(op.implementation !== undefined ? { implementation: op.implementation } : {}),
     };
   }
   return {
@@ -728,7 +745,8 @@ export function manifestDigest(manifest: ConnectorManifest): string {
 /**
  * What one operation promises, as the contract's `OperationContract`: its
  * effect, idempotency, undo (`compensate` as an action id), risk floor,
- * schemas and, when it declares one, its completion window. Its
+ * schemas and, when it declares them, its completion window and the digest
+ * of the declared data it runs (`implementation`). Its
  * `operationDigest` is what a flow pins. Null for an unknown operation.
  */
 export function operationContractOf(connector: Connector, operation: string): OperationContract | null {
@@ -744,6 +762,7 @@ export function operationContractOf(connector: Connector, operation: string): Op
     input: cloneJson(op.input as unknown as JsonValue) as unknown as JsonSchema,
     output: cloneJson(op.output as unknown as JsonValue) as unknown as JsonSchema,
     ...(op.completion !== undefined ? { completion: { windowMs: op.completion.windowMs } } : {}),
+    ...(op.implementation !== undefined ? { implementation: op.implementation } : {}),
   };
 }
 

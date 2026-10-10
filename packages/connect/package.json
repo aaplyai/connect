@@ -43,6 +43,7 @@
     "undici": "7.29.1"
   },
   "devDependencies": {
+    "@aaply/flow": "workspace:*",
     "@types/pg": "^8.23.1"
   }
 }

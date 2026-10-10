@@ -1,0 +1,95 @@
+{
+  "name": "@aaply/flow",
+  "version": "0.3.0",
+  "description": "General-purpose flow engine: a pure step function over declared facts, plus a small runtime with ports.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./core": {
+      "source": "./src/api/core.ts",
+      "types": "./dist/api/core.d.ts",
+      "default": "./dist/api/core.js"
+    },
+    "./expr": {
+      "source": "./src/api/expr.ts",
+      "types": "./dist/api/expr.d.ts",
+      "default": "./dist/api/expr.js"
+    },
+    "./definition": {
+      "source": "./src/api/definition.ts",
+      "types": "./dist/api/definition.d.ts",
+      "default": "./dist/api/definition.js"
+    },
+    "./store": {
+      "source": "./src/api/store.ts",
+      "types": "./dist/api/store.d.ts",
+      "default": "./dist/api/store.js"
+    },
+    "./lanes": {
+      "source": "./src/api/lanes.ts",
+      "types": "./dist/api/lanes.d.ts",
+      "default": "./dist/api/lanes.js"
+    },
+    "./privacy": {
+      "source": "./src/api/privacy.ts",
+      "types": "./dist/api/privacy.d.ts",
+      "default": "./dist/api/privacy.js"
+    },
+    "./migrate": {
+      "source": "./src/api/migrate.ts",
+      "types": "./dist/api/migrate.d.ts",
+      "default": "./dist/api/migrate.js"
+    },
+    "./contracts": {
+      "source": "./src/api/contracts.ts",
+      "types": "./dist/api/contracts.d.ts",
+      "default": "./dist/api/contracts.js"
+    },
+    "./blobs": {
+      "source": "./src/api/blobs.ts",
+      "types": "./dist/api/blobs.d.ts",
+      "default": "./dist/api/blobs.js"
+    },
+    "./decide": {
+      "source": "./src/api/decide.ts",
+      "types": "./dist/api/decide.d.ts",
+      "default": "./dist/api/decide.js"
+    },
+    "./eval": {
+      "source": "./src/api/eval.ts",
+      "types": "./dist/api/eval.d.ts",
+      "default": "./dist/api/eval.js"
+    },
+    "./internal": {
+      "source": "./src/api/internal.ts",
+      "types": "./dist/api/internal.d.ts",
+      "default": "./dist/api/internal.js"
+    },
+    "./testing": {
+      "source": "./src/testing/index.ts",
+      "types": "./dist/testing/index.d.ts",
+      "default": "./dist/testing/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@aaply/action-contract": "workspace:*"
+  },
+  "devDependencies": {
+    "@aaply/connector-sdk": "workspace:*"
+  }
+}

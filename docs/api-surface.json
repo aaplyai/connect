@@ -226,10 +226,16 @@
       "EgressPolicy:t",
       "KeyProvider:t",
       "NewConnectionInput:t",
+      "SqlConnectorDefinition:t",
+      "SqlOperation:t",
+      "SqlRows:t",
+      "SqlStatement:t",
+      "SqlTarget:t",
       "TokenRefresher:t",
       "createConnect:v",
       "egressPolicy:v",
-      "localKeyProvider:v"
+      "localKeyProvider:v",
+      "sqlDefinitionProblems:v"
     ],
     "@aaply/connect/postgres": [
       "APP_ROLE:v",

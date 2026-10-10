@@ -7,6 +7,8 @@
  *   pool, a `KeyProvider` for the vault, and the operator's egress allowlist.
  *   Its `perform` takes an approved action and never throws; `admin` installs
  *   connectors, sets policy and keeps connections.
+ * - Declared SQL connectors are data (`SqlConnectorDefinition`), installed per
+ *   scope with `admin.installSql` and checked by `sqlDefinitionProblems`.
  * - `localKeyProvider` wraps tenants' data keys with one local key.
  * - `egressPolicy` is the network check under every socket Connect opens.
  *
@@ -25,6 +27,8 @@ export {
 export type { TokenRefresher } from "./credentials.js";
 export { egressPolicy, type EgressOptions, type EgressPolicy } from "./egress.js";
 export { DEFAULT_ROLE } from "./performer.js";
+export { sqlDefinitionProblems, type SqlConnectorDefinition, type SqlOperation, type SqlRows, type SqlStatement } from "./sql/definition.js";
+export type { SqlTarget } from "./sql/executor.js";
 export type { Connection, ConnectionStatus } from "./store/store.js";
 export { localKeyProvider, type KeyProvider } from "./vault.js";
 export { CONNECT_VERSION } from "./version.js";
