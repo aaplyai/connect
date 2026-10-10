@@ -10,7 +10,9 @@
     "@aaply/connect/postgres": 10,
     "@aaply/connect/http": 8,
     "@aaply/connect/testing": 12,
-    "@aaply/connectors/gmail": 6
+    "@aaply/connectors/gmail": 6,
+    "@aaply/connectors/google-drive": 2,
+    "@aaply/connectors/notion": 3
   },
   "entries": {
     "@aaply/action-contract": [
@@ -379,6 +381,15 @@
       "GMAIL_SEND_URL:v",
       "GmailSendInput:t",
       "gmail:v"
+    ],
+    "@aaply/connectors/google-drive": [
+      "DRIVE_FILE_SCOPE:v",
+      "googleDrive:v"
+    ],
+    "@aaply/connectors/notion": [
+      "NOTION_API:v",
+      "NOTION_VERSION:v",
+      "notion:v"
     ]
   }
 }

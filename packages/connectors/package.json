@@ -10,6 +10,16 @@
       "source": "./src/gmail.ts",
       "types": "./dist/gmail.d.ts",
       "default": "./dist/gmail.js"
+    },
+    "./google-drive": {
+      "source": "./src/google-drive.ts",
+      "types": "./dist/google-drive.d.ts",
+      "default": "./dist/google-drive.js"
+    },
+    "./notion": {
+      "source": "./src/notion.ts",
+      "types": "./dist/notion.d.ts",
+      "default": "./dist/notion.js"
     }
   },
   "files": [

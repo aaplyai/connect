@@ -9,7 +9,7 @@
 
 import type pg from "pg";
 import { ed25519ActionVerifier, type ActionOutcome, type ActionPortDescription, type Ed25519PublicKey, type EnvironmentKind, type JsonObject, type OperationContract, type Scope } from "@aaply/action-contract";
-import { operationContractOf, type Connector, type ConnectorLogSink, type FetchLike } from "@aaply/connector-sdk";
+import { operationContractOf, type BlobLimits, type BlobStore, type Connector, type ConnectorLogSink, type FetchLike, type HttpLimits } from "@aaply/connector-sdk";
 import { adminAs, AdminError, loggedAdmin, type ActorAdmin, type AdminActor, type RawAdmin } from "./admin.js";
 import { createAdminRoutes, type AdminAnswer, type AdminRequest } from "./admin-http.js";
 import { secretProblem, type TokenRefresher } from "./credentials.js";
@@ -54,6 +54,23 @@ export interface ConnectOptions {
    * answers `http/401`.
    */
   oauth?: OAuthOptions;
+  /**
+   * The Aaply backend's file store (ADR-0008), for connectors that take or
+   * give files by reference (Drive's upload and download): a `BlobStore`
+   * over the same object store the backend serves files from, scoped by
+   * tenant, app and environment. Connect only stores what a call returns
+   * and reads what a call was given; the backend deletes files when runs
+   * release them (the engine's blob ledger). Without it, those operations
+   * fail with `connect/blob-no-store`. `limits` default to the kit's
+   * (25 MiB a file, 64 MiB a call).
+   */
+  files?: { store: BlobStore; limits?: Partial<BlobLimits> };
+  /**
+   * Bounds on what one call sends and reads over HTTP (default 5 MiB a
+   * request or response, 16 MiB of responses a call). A deployment that
+   * downloads files larger than 16 MiB raises `maxTotalResponseBytes`.
+   */
+  httpLimits?: Partial<HttpLimits>;
   /** Longest a call may run, in ms. Default 55 000. */
   ceilingMs?: number;
   /**
@@ -65,6 +82,9 @@ export interface ConnectOptions {
   log?: ConnectorLogSink;
   observer?: { error?(error: unknown, where: string): void };
 }
+
+/** How long `close` waits for deletes of files calls stored and did not answer. */
+const CLOSE_SETTLE_MS = 10_000;
 
 /** Whose account a new connection is. */
 export type ConnectionOwner = { business: true; role?: string } | { person: string };
@@ -137,6 +157,7 @@ export interface Connect {
   ready(): Promise<boolean>;
   /** Deletes expired replay claims, OAuth attempts and dead refresh leases; run it every minute from any instance (several at once is safe). */
   purgeExpired(): Promise<number>;
+  /** Waits (up to 10 s) for deletes of files calls stored and did not answer, then closes the pools; once, however often called. Call it after `serveConnect`'s `close`. */
   close(): Promise<void>;
 }
 
@@ -179,9 +200,13 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
     ...(options.oauth ? { refresher: { refresh: (request) => refresher!.refresh(request) } satisfies TokenRefresher } : {}),
     ...(options.now ? { now: options.now } : {}),
     ...(options.ceilingMs !== undefined ? { ceilingMs: options.ceilingMs } : {}),
+    ...(options.files ? { files: options.files } : {}),
+    ...(options.httpLimits ? { httpLimits: options.httpLimits } : {}),
     ...(options.log ? { log: options.log } : {}),
     ...(options.observer ? { observer: options.observer } : {}),
   });
+
+  let closing: Promise<void> | undefined;
 
   const connectorOf = (id: string): Connector => {
     const c = newest(options.connectors, id);
@@ -327,9 +352,12 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
       }
     },
     purgeExpired: () => store.purgeExpired(),
-    close: async () => {
-      await Promise.all([egress.close(), sql.close()]);
-    },
+    close: () =>
+      (closing ??= (async () => {
+        // Deletes of files calls stored and did not answer, so none is left behind; then the pools.
+        await performer.settle(CLOSE_SETTLE_MS);
+        await Promise.all([egress.close(), sql.close()]);
+      })()),
   };
   if (options.oauth) {
     const oauthStore = createOAuthStore(options.pool);

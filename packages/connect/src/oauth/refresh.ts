@@ -110,7 +110,8 @@ export function createRefresher(options: {
         throw failed();
       }
       if (res.status !== 200 || typeof res.json.access_token !== "string" || !res.json.access_token) {
-        if (res.json.error === "invalid_grant") {
+        // RFC 6749 names the error in `error`; Notion's API errors name it in `code`.
+        if ((res.json.error ?? res.json.code) === "invalid_grant") {
           // The grant is gone (revoked, expired, or a refresh token used twice): only the person can fix it.
           await markReauth(tenantId, connectionId, c.version);
           throw reconsent();

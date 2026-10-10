@@ -9,12 +9,14 @@ The engine never holds a credential.
 import pg from "pg";
 import { createConnect, localKeyProvider, oauthProviders } from "@aaply/connect";
 import { gmail } from "@aaply/connectors/gmail";
+import { googleDrive } from "@aaply/connectors/google-drive";
+import { notion } from "@aaply/connectors/notion";
 import { serveConnect } from "@aaply/connect/http";
 
 const connect = await createConnect({
   audience: "connect.aaply.internal",
   engineKeys: { "engine-2026-10": process.env.ENGINE_PUBLIC_KEY! }, // the engine's public key, base64url
-  connectors: [gmail],                                               // imported modules of this build only
+  connectors: [gmail, googleDrive, notion],                          // imported modules of this build only
   pool: new pg.Pool({ connectionString: process.env.CONNECT_DATABASE_URL, max: 10, connectionTimeoutMillis: 2_000, statement_timeout: 5_000 }),
   keys: localKeyProvider({ keyId: "local-1", key: Buffer.from(process.env.CONNECT_WRAPPING_KEY!, "base64") }),
   adminKeys: { "backend-2026-10": process.env.BACKEND_PUBLIC_KEY! }, // the Aaply backend's public key, for /admin
@@ -22,8 +24,13 @@ const connect = await createConnect({
   oauth: {
     redirectUri: "https://connect.aaply.ai/oauth/callback",            // registered with each provider
     returnOrigins: ["https://app.aaply.ai"],
-    apps: { gmail: { provider: oauthProviders.google, clientId: process.env.GOOGLE_CLIENT_ID!, clientSecret: process.env.GOOGLE_CLIENT_SECRET! } },
+    apps: {
+      gmail: { provider: oauthProviders.google, clientId: process.env.GOOGLE_CLIENT_ID!, clientSecret: process.env.GOOGLE_CLIENT_SECRET! },
+      "google-drive": { provider: oauthProviders.google, clientId: process.env.GOOGLE_CLIENT_ID!, clientSecret: process.env.GOOGLE_CLIENT_SECRET! },
+      notion: { provider: oauthProviders.notion, clientId: process.env.NOTION_CLIENT_ID!, clientSecret: process.env.NOTION_CLIENT_SECRET! },
+    },
   },
+  files: { store: backendFiles },                                    // the backend's BlobStore, for Drive's upload and download
 });
 await serveConnect(connect, { port: 8080, host: "0.0.0.0", performToken: process.env.CONNECT_PERFORM_TOKEN });
 ```
@@ -41,7 +48,23 @@ await serveConnect(connect, { port: 8080, host: "0.0.0.0", performToken: process
    envelope reaching two instances is performed once.
 
 Each call is cut off 2 s before its deadline and at 55 s, and `serveConnect` lets calls in flight finish
-when it shuts down.
+when it shuts down. Shut down with `await served.close()` and then `await connect.close()`, which also
+waits (up to 10 s) for the deletes of files calls stored and did not answer.
+
+## Files
+
+Connectors that take or give files (Drive's upload and download) do so by reference (ADR-0008 in the
+flow repo): `files.store` is a `BlobStore` over the same object store the Aaply backend serves files
+from, scoped by tenant, app and environment. A handler reads only a file named in its signed input or
+one it stored itself; what a call stores and does not answer is deleted when the call ends. The
+backend deletes the rest when runs release them (the engine's blob ledger); Connect never deletes a
+file a run still names. Without `files`, those operations answer `connect/blob-no-store`.
+
+A file is held in memory while a call moves it (a 25 MiB download peaks near three copies), so size
+Connect's instances for the calls they run at once. `httpLimits` applies to every connector: raising
+`maxTotalResponseBytes` for Drive raises it for all. A Docs, Sheets or Slides export arrives in one
+response, so it is bounded by `maxResponseBytes` (5 MiB by default), and binary downloads by
+`maxTotalResponseBytes` (16 MiB by default) as well as the file store's 25 MiB.
 
 ## The database
 
