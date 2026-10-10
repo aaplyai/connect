@@ -38,8 +38,11 @@ import {
   operationContractOf,
   type Connector,
   type ConnectorActionPort,
+  type BlobLimits,
+  type BlobStore,
   type ConnectorLogSink,
   type FetchLike,
+  type HttpLimits,
 } from "@aaply/connector-sdk";
 import { headersOf, nearExpiry, type TokenRefresher } from "./credentials.js";
 import { compareVersions } from "./semver.js";
@@ -65,6 +68,10 @@ export interface PerformerOptions {
   /** Runs declared SQL connectors' statements. Without it, SQL installations are refused. */
   sql?: SqlExecutor;
   now?: () => number;
+  /** The host's file store and its limits, for handlers' `ctx.blobs` (see `ConnectOptions.files`). */
+  files?: { store: BlobStore; limits?: Partial<BlobLimits> };
+  /** Bounds on what one call sends and reads over HTTP. Default the kit's. */
+  httpLimits?: Partial<HttpLimits>;
   /** Longest a call may run, in ms. Default 55 000. */
   ceilingMs?: number;
   /** How long before the envelope's deadline Connect answers, in ms. Default 2 000. */
@@ -174,6 +181,8 @@ export function createPerformer(options: PerformerOptions): Performer {
       connectors: [connector],
       fetch: options.fetch,
       clock: { now },
+      ...(options.files ? { blobs: options.files.store, ...(options.files.limits ? { blobLimits: options.files.limits } : {}) } : {}),
+      ...(options.httpLimits ? { limits: options.httpLimits } : {}),
       ...(options.log ? { log: options.log } : {}),
       ...(options.observer ? { observer: options.observer } : {}),
       replayGuard: {

@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { operationDigest, signApprovedAction, type ApprovedAction, type ApprovedActionSigner, type Scope } from "@aaply/action-contract";
+import { BLOB_REF_SCHEMA, blobDigest, operationDigest, signApprovedAction, type BlobRef, type ApprovedAction, type ApprovedActionSigner, type Scope } from "@aaply/action-contract";
 import { actionPortConformance, CONFORMANCE_SCOPE, draftApprovedAction, type ApprovedActionDraft } from "@aaply/action-contract/conformance";
-import { operationContractOf } from "@aaply/connector-sdk";
+import { defineConnector, memoryBlobStore, operationContractOf } from "@aaply/connector-sdk";
 import type { MockFetch } from "@aaply/connector-sdk/testing";
 import { createConnect, type Connect } from "@aaply/connect";
 import { serveConnect } from "@aaply/connect/http";
@@ -293,6 +293,52 @@ describe.skipIf(postgresUnavailable())("Connect", () => {
     expect(text).toMatch(/Index Scan|Bitmap Index Scan/);
     expect(text).not.toMatch(/Seq Scan/);
     await admin.query("DELETE FROM aaply_connect.connections WHERE id LIKE 'conn_bulk%'");
+  });
+
+  it("gives handlers the backend's file store, and refuses file references made for another workspace", async () => {
+    const copier = defineConnector({
+      id: "copier",
+      version: "1.0.0",
+      title: "Copier",
+      auth: { kind: "none" },
+      egress: [],
+      operations: {
+        upper: {
+          title: "Upper-case a text file",
+          effect: "read",
+          input: { type: "object", required: ["file"], properties: { file: BLOB_REF_SCHEMA }, additionalProperties: false },
+          output: { type: "object", required: ["file"], properties: { file: BLOB_REF_SCHEMA }, additionalProperties: false },
+          async handler(input, ctx) {
+            const text = new TextDecoder().decode(await ctx.blobs.get(input.file as unknown as BlobRef));
+            return { file: (await ctx.blobs.put(new TextEncoder().encode(text.toUpperCase()), { mediaType: "text/plain" })) as never };
+          },
+        },
+      },
+    });
+    const store = memoryBlobStore();
+    const files = await make({ connectors: [v1, copier], files: { store } });
+    const none = await make({ connectors: [v1, copier] });
+    try {
+      const s = { ...scope, tenantId: "tenant-files" };
+      await files.admin.install(s, "copier");
+      await files.admin.createConnection({ scope: s, connectorId: "copier", owner: { business: true }, secret: null });
+      const bytes = new TextEncoder().encode("hello");
+      const context = { connectorId: "x", operation: "x", connectionId: "x", effectId: null };
+      const file = await store.put(s, { bytes, digest: await blobDigest(bytes), size: 5, mediaType: "text/plain" }, context);
+      const action = (input: object) => sign({ scope: s, action: "copier.upper", effect: "read", input: input as never, effectId: `e-${++seq}` });
+
+      const done = await files.perform(await action({ file }));
+      expect(done.status).toBe("ok");
+      const out = (done as unknown as { output: { file: BlobRef } }).output.file;
+      expect(new TextDecoder().decode((await store.get(s, out, context))!)).toBe("HELLO");
+
+      const foreign = await store.put(scope, { bytes, digest: await blobDigest(bytes), size: 5, mediaType: "text/plain" }, context);
+      expect(await files.perform(await action({ file: foreign }))).toMatchObject({ status: "final", error: { code: "connect/invalid-input" } });
+      expect(await none.perform(await action({ file }))).toMatchObject({ status: "final", error: { code: "connect/blob-no-store" } });
+    } finally {
+      await files.close();
+      await none.close();
+    }
   });
 
   it("deletes expired replay claims", async () => {
