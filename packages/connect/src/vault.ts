@@ -137,6 +137,9 @@ export function createVault(options: { keys: KeyProvider; store: DataKeyStore; n
     async open(tenantId, connectionId, secret, dataKey) {
       if (secret.dataKeyId !== dataKey.dataKeyId) throw new Error("the secret is sealed under another data key");
       const key = await unwrap(tenantId, dataKey);
+      // The AAD binds the secret's own version (sealed_version), not the connection's, so edits that keep the secret
+      // keep it readable. The trade-off: someone who can write the database can put back an older sealed secret of
+      // the same connection together with its version, and it still opens. That person could already break the connection.
       const plain = aesOpen(key, secret.iv, secret.sealed, aad(tenantId, connectionId, secret.version));
       const parsed: unknown = JSON.parse(plain.toString("utf8"));
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed) || !Object.values(parsed).every((v) => typeof v === "string")) throw new Error("a sealed secret is not a map of strings");

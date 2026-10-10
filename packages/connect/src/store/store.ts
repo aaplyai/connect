@@ -354,16 +354,17 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
     async check() {
       const { rows } = await pool.query(
         `SELECT (SELECT schema_version FROM aaply_connect.meta) AS version, pg_has_role(current_user, $1, 'MEMBER') AS member,
-                EXISTS (SELECT 1 FROM pg_roles r WHERE (r.rolsuper OR r.rolbypassrls) AND pg_has_role(current_user, r.oid, 'MEMBER')) AS bypass,
+                EXISTS (SELECT 1 FROM pg_roles r WHERE (r.rolsuper OR r.rolbypassrls OR r.rolcreaterole) AND pg_has_role(current_user, r.oid, 'MEMBER')) AS bypass,
                 EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                        WHERE n.nspname = 'aaply_connect' AND pg_has_role(current_user, c.relowner, 'MEMBER')) AS owns`,
+                        WHERE n.nspname = 'aaply_connect' AND pg_has_role(current_user, c.relowner, 'MEMBER'))
+                OR EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspname = 'aaply_connect' AND pg_has_role(current_user, n.nspowner, 'MEMBER')) AS owns`,
         [APP_ROLE],
       );
       const row = rows[0];
       if (!row) throw new Error("cannot read the login role");
       if (row.version !== SCHEMA_VERSION) throw new Error(`the database has Connect schema ${row.version}; this build needs ${SCHEMA_VERSION}. Pre-1.0 builds do not migrate: make a new database.`);
-      if (row.bypass) throw new Error("the login role is, or is a member of, a role that can bypass row security; use a role that is only a member of aaply_connect_app");
-      if (row.owns) throw new Error("the login role owns Connect's tables, or is a member of their owner, so it can switch row security off; use a role that is only a member of aaply_connect_app");
+      if (row.owns) throw new Error("the login role owns Connect's schema or tables, or is a member of their owner, so it can switch row security off; use a role that is only a member of aaply_connect_app");
+      if (row.bypass) throw new Error("the login role is, or is a member of, a role that can bypass row security or create roles (before PostgreSQL 16 such a role can grant itself the owner); use a role that is only a member of aaply_connect_app");
       if (!row.member) throw new Error("the login role is not a member of aaply_connect_app");
     },
   };

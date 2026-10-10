@@ -183,6 +183,31 @@ describe.skipIf(postgresUnavailable())("Connect", () => {
     }
   });
 
+  it("answers before the deadline when the replay claim stalls", async () => {
+    const stalling = new Proxy(db.app, {
+      get(target, key, receiver) {
+        if (key === "query") {
+          return async (...args: unknown[]) => {
+            if (typeof args[0] === "string" && args[0].includes("aaply_connect.claim")) await new Promise((r) => setTimeout(r, 8_000));
+            return (target.query as (...a: unknown[]) => unknown)(...args);
+          };
+        }
+        const v = Reflect.get(target, key, receiver);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+    const stalled = await make({ pool: stalling });
+    try {
+      const started = Date.now();
+      const outcome = await stalled.perform(await write({ timeoutMs: 4_000 }));
+      expect(outcome.status).toBe("retryable");
+      expect(Date.now() - started).toBeLessThan(3_000);
+      expect(service.calls).toHaveLength(0);
+    } finally {
+      await stalled.close();
+    }
+  }, 15_000);
+
   it("refuses an envelope already inside its answer margin without reading or claiming anything", async () => {
     counter.reset();
     expect(await connect.perform(await write({ timeoutMs: 1_500 }))).toMatchObject({ status: "retryable", error: { code: "connect/late" } });
@@ -210,13 +235,15 @@ describe.skipIf(postgresUnavailable())("Connect", () => {
 
   it("refuses to start as the owner, a member of the owner, or a role that can bypass row security", async () => {
     const start = (pool: typeof db.owner) => createConnect({ audience: AUDIENCE, engineKeys: engine.engineKeys, connectors: [v1], pool, keys });
-    await expect(start(db.owner)).rejects.toThrow(/owns Connect's tables/);
+    await expect(start(db.owner)).rejects.toThrow(/owns Connect's schema or tables/);
     const admin = db.pool("postgres");
     await admin.query("CREATE ROLE sneaky LOGIN IN ROLE aaply_connect_app, connect_owner");
-    await expect(start(db.pool("sneaky"))).rejects.toThrow(/owns Connect's tables/);
+    await expect(start(db.pool("sneaky"))).rejects.toThrow(/owns Connect's schema or tables/);
     await admin.query("CREATE ROLE bypasser NOLOGIN BYPASSRLS");
     await admin.query("CREATE ROLE sly LOGIN IN ROLE aaply_connect_app, bypasser");
     await expect(start(db.pool("sly"))).rejects.toThrow(/bypass row security/);
+    await admin.query("CREATE ROLE maker LOGIN CREATEROLE IN ROLE aaply_connect_app");
+    await expect(start(db.pool("maker"))).rejects.toThrow(/create roles/);
   });
 
   it("refuses an envelope whose person's domain could read as another person", async () => {

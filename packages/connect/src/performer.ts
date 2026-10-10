@@ -87,6 +87,8 @@ interface CallState {
   connector: Connector;
   /** The proof `perform` already verified for this envelope, so the kit's own check need not verify it again. */
   verified: ActionProof;
+  /** The call's budget: every store, vault or refresh step inside the kit stops when it runs out. */
+  signal: AbortSignal;
   /** The opened secret, once a request asked for it. */
   secret?: Readonly<Record<string, string>> | null;
 }
@@ -128,7 +130,7 @@ export function createPerformer(options: PerformerOptions): Performer {
     const c = s.resolution.connection;
     if (!c?.secret) return (s.secret = null);
     try {
-      s.secret = await options.vault.open(s.tenantId, c.id, c.secret.sealed, c.secret.dataKey);
+      s.secret = await whileOpen(s.signal, options.vault.open(s.tenantId, c.id, c.secret.sealed, c.secret.dataKey));
     } catch (error) {
       report(error, "vault.open");
       throw new ConnectorError("retryable", "connect/unavailable", "The account's credentials could not be read right now.");
@@ -161,7 +163,12 @@ export function createPerformer(options: PerformerOptions): Performer {
       clock: { now },
       ...(options.log ? { log: options.log } : {}),
       ...(options.observer ? { observer: options.observer } : {}),
-      replayGuard: { claim: (key, until) => options.store.claim(state().tenantId, key, until) },
+      replayGuard: {
+        claim: (key, until) => {
+          const s = state();
+          return whileOpen(s.signal, options.store.claim(s.tenantId, key, until));
+        },
+      },
       connections: (_scope, query) => {
         const c = state().resolution.connection;
         if (!c) return null;
@@ -180,7 +187,7 @@ export function createPerformer(options: PerformerOptions): Performer {
                 const c = s.resolution.connection;
                 const secret = await secretOf(s);
                 if (!c || !secret || s.connector.auth.kind !== "oauth2") throw new ConnectorError("final", "connect/reconsent", "This account needs to be connected again.");
-                s.secret = await options.refresher!.refresh({ tenantId: s.tenantId, connectionId: c.id, version: c.version, secret, signal: request.signal });
+                s.secret = await whileOpen(s.signal, options.refresher!.refresh({ tenantId: s.tenantId, connectionId: c.id, version: c.version, secret, signal: AbortSignal.any([request.signal, s.signal]) }));
                 return headersOf(s.connector.auth, s.secret);
               },
             }
@@ -240,7 +247,7 @@ export function createPerformer(options: PerformerOptions): Performer {
 
     const served = pick(list, operation, a.action.contract);
     try {
-      return await calls.run({ tenantId: a.scope.tenantId, resolution, connector: served.connector, verified: a.proof }, () => served.port.run(a, capped));
+      return await calls.run({ tenantId: a.scope.tenantId, resolution, connector: served.connector, verified: a.proof, signal: capped }, () => served.port.run(a, capped));
     } catch (error) {
       // The kit's port never throws; this is a last guard so /perform always answers an outcome.
       report(error, "perform");
