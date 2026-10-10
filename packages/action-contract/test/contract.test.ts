@@ -336,7 +336,7 @@ describe("verifyApprovedAction and signing", () => {
 
 describe("actionPortConformance", () => {
   const read = { action: "notes.get", input: { id: "n-1" } as JsonObject };
-  const write = { action: "notes.create", input: { title: "Hi" } as JsonObject, risk: "confirm" as const };
+  const write = { action: "notes.create", input: { title: "Hi" } as JsonObject, risk: "confirm" as const, idempotent: false };
   // Each write names the undo it declares; an undo states its own risk floor and idempotency.
   const served = new Map<string, { effect: "read" | "write"; digest: ReturnType<typeof sha256Digest>; compensate?: string; riskFloor?: "none" | "confirm" | "approval"; idempotent?: boolean }>([
     ["notes.get", { effect: "read", digest: sha256Digest({ op: "get" }) }],
@@ -356,6 +356,7 @@ describe("actionPortConformance", () => {
   /** A minimal performer that follows the contract. */
   function referencePort(): { port: ActionPort; performed: () => number } {
     let performed = 0;
+    const claimed = new Set<string>();
     const port: ActionPort = {
       async run(value) {
         const check = await verifyApprovedAction(value, { now: Date.now(), audience: CONFORMANCE_AUDIENCE, verifier: conformanceVerifier() });
@@ -372,6 +373,12 @@ describe("actionPortConformance", () => {
           if (op.idempotent !== true) return refuse("connect/idempotency-mismatch", "Not safe to send again.");
           if ((op.riskFloor ?? "none") !== "none") return refuse("connect/approval-invalid", "Needs a review.");
         }
+        // Claimed last, after every other check: an attempt of a write that does not de-duplicate runs once.
+        if (a.action.effect === "write" && op.idempotent !== true) {
+          const key = `${a.effectId}#${a.attempt}`;
+          if (claimed.has(key)) return refuse("connect/replayed", "Already received.");
+          claimed.add(key);
+        }
         performed++;
         return { status: "ok", output: { id: "n-1" } };
       },
@@ -387,8 +394,18 @@ describe("actionPortConformance", () => {
       expect.arrayContaining(["refuses a declared undo that needs a review", "refuses a declared undo that does not de-duplicate", "refuses an undo sent for a write that does not declare it"]),
     );
     for (const c of cases) await c.run();
-    // The well-formed read, the read with a malformed traceparent, and the read and write each sent again after a version refusal.
-    expect(performed()).toBe(4);
+    // The well-formed read, the read with a malformed traceparent, the read and write each sent again after a version
+    // refusal, and the write delivered twice (performed once).
+    expect(performed()).toBe(5);
+  });
+
+  it("fails a port that performs a write again when the same envelope arrives twice", async () => {
+    const { port } = referencePort();
+    let performed = 0;
+    // Forgets every claim: the duplicate delivery is performed again.
+    const forgetful: ActionPort = { run: async (value, signal) => (value.action.effect === "write" ? (performed++, { status: "ok", output: { id: "n-1" } }) : port.run(value, signal)) };
+    const replay = actionPortConformance(forgetful, { read, performedWrite: write, performed: () => performed }).find((c) => c.name === "performs a write that does not de-duplicate once, when the same envelope arrives again")!;
+    await expect(replay.run()).rejects.toThrow(/delivered again: expected a refusal/);
   });
 
   it("fails a port that claims an attempt before it checks the envelope's version", async () => {

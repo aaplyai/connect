@@ -5,10 +5,11 @@
  * published. Whoever performs the action (Aaply Connect, the connector kit)
  * may run any implementation with that digest, so a security patch needs no
  * republishing; a change to the contract (its effect, its idempotency, its
- * undo, its risk floor, its schemas or its completion window) does.
+ * undo, its risk floor, its schemas, its completion window, or the declared
+ * implementation of an operation made of data, such as a SQL statement) does.
  */
 
-import { sha256Digest, type Sha256Digest } from "./digest.js";
+import { isSha256Digest, sha256Digest, type Sha256Digest } from "./digest.js";
 import { checkJson, isJsonObject, type JsonObject, type JsonValue } from "./json.js";
 import { checkSchema, type JsonSchema } from "./schema.js";
 import { DiagnosticBag } from "./diagnostics.js";
@@ -39,9 +40,17 @@ export interface OperationContract {
    * for the completion instead of the call's `timeoutMs`.
    */
   completion?: OperationCompletion;
+  /**
+   * The digest of the implementation itself, for an operation whose
+   * behaviour is declared data rather than code: a SQL statement, a
+   * request template. A pin then covers that exact text, so changing it
+   * needs the flow to be pinned again, as a contract change does. Code
+   * connectors leave it out, so a security patch needs no republishing.
+   */
+  implementation?: Sha256Digest;
 }
 
-const KEYS = new Set(["effect", "idempotent", "irreversible", "compensate", "riskFloor", "input", "output", "completion"]);
+const KEYS = new Set(["effect", "idempotent", "irreversible", "compensate", "riskFloor", "input", "output", "completion", "implementation"]);
 
 /**
  * Whether `value` is a well-formed operation contract: the known keys only,
@@ -55,6 +64,7 @@ export function isOperationContract(value: unknown): value is OperationContract 
   if (typeof c.idempotent !== "boolean" || typeof c.irreversible !== "boolean" || !isRisk(c.riskFloor)) return false;
   if (c.compensate !== undefined && (typeof c.compensate !== "string" || c.compensate.length === 0)) return false;
   if (c.completion !== undefined && !isOperationCompletion(c.completion)) return false;
+  if (c.implementation !== undefined && !isSha256Digest(c.implementation)) return false;
   const bag = new DiagnosticBag();
   checkSchema(c.input, ["input"], bag);
   checkSchema(c.output, ["output"], bag);
@@ -65,8 +75,9 @@ export function isOperationContract(value: unknown): value is OperationContract 
 /**
  * The digest a flow pins: `sha256:` of the canonical JSON of the contract,
  * tagged with {@link OPERATION_CONTRACT_VERSION}. Key order and absent
- * optional fields do not change it, so a field added later (`completion`)
- * leaves the digest of every contract without it as it was.
+ * optional fields do not change it, so a field added later (`completion`,
+ * `implementation`) leaves the digest of every contract without it as it
+ * was.
  */
 export function operationDigest(contract: OperationContract): Sha256Digest {
   const body: JsonObject = {
@@ -80,5 +91,6 @@ export function operationDigest(contract: OperationContract): Sha256Digest {
   };
   if (contract.compensate !== undefined) body.compensate = contract.compensate;
   if (contract.completion !== undefined) body.completion = { windowMs: contract.completion.windowMs };
+  if (contract.implementation !== undefined) body.implementation = contract.implementation;
   return sha256Digest(body);
 }

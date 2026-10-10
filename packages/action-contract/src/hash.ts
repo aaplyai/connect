@@ -122,6 +122,31 @@ export function toHex(bytes: Uint8Array): string {
 
 const B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+/**
+ * The bytes of unpadded base64url text (RFC 4648 §5). Throws on any other
+ * character, on padding, and on a length or trailing bits no encoder makes,
+ * so each byte string has exactly one accepted text.
+ */
+export function fromBase64Url(text: string): Uint8Array {
+  if (typeof text !== "string" || text.length % 4 === 1) throw new Error("not unpadded base64url");
+  const out = new Uint8Array(Math.floor((text.length * 3) / 4));
+  let bits = 0;
+  let value = 0;
+  let o = 0;
+  for (const ch of text) {
+    const v = B64URL.indexOf(ch);
+    if (v < 0) throw new Error("not unpadded base64url");
+    value = (value << 6) | v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out[o++] = (value >> bits) & 255;
+    }
+  }
+  if ((value & ((1 << bits) - 1)) !== 0) throw new Error("not unpadded base64url");
+  return out;
+}
+
 /** Unpadded base64url (RFC 4648 §5) of bytes. */
 export function toBase64Url(bytes: Uint8Array): string {
   let out = "";

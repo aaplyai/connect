@@ -5,7 +5,7 @@
  * never the engine.
  *
  * - `ApprovedAction` (contract 1): the envelope the engine sends, and `checkApprovedAction` and `verifyApprovedAction`, the checks every performer runs first.
- * - `ApprovedActionSigner` and `ApprovedActionVerifier`: the host-supplied ports that sign and verify an envelope, over `approvedActionSigningBytes`; `hmacActionSigner` and `hmacActionVerifier` are the reference pair.
+ * - `ApprovedActionSigner` and `ApprovedActionVerifier`: the host-supplied ports that sign and verify an envelope, over `approvedActionSigningBytes`; `hmacActionSigner` and `hmacActionVerifier` are the reference pair for one trust domain, `ed25519ActionSigner` and `ed25519ActionVerifier` the pair across trust domains.
  * - `ActionPort`: the port that receives it.
  * - `ActionOutcome` and `normalizeOutcome`: the five answers.
  * - `OperationContract` and `operationDigest`: what a flow pins at publish; `completion` (`MAX_COMPLETION_WINDOW_MS`) is how long a deferred result may take.
@@ -87,7 +87,7 @@ export { DiagnosticBag, DiagnosticsError, type Diagnostic, type Severity } from 
 export { isSha256Digest, sha256Digest, type Sha256Digest } from "./digest.js";
 export { ENVIRONMENT_KINDS, environmentAllows, isEnvironmentKind, UNDECLARED_ENVIRONMENT } from "./environment.js";
 export type { FixedPattern } from "./frozen.js";
-export { fingerprint, hmacSha256, safeEqual, sha256, toBase64Url, toHex } from "./hash.js";
+export { fingerprint, fromBase64Url, hmacSha256, safeEqual, sha256, toBase64Url, toHex } from "./hash.js";
 export {
   canonicalJson,
   checkJson,
@@ -171,4 +171,5 @@ export {
   type ApprovedActionVerifier,
   type UnsignedApprovedAction,
 } from "./signing.js";
+export { ED25519_PROOF_ALG, ed25519ActionSigner, ed25519ActionVerifier, generateEd25519KeyPair, type Ed25519KeyPair, type Ed25519PublicKey } from "./ed25519.js";
 export { isTraceparent, TRACEPARENT_RE } from "./trace.js";
