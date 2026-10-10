@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { signApprovedAction, type ApprovedAction, type ApprovedActionSigner, type Scope } from "@aaply/action-contract";
 import { CONFORMANCE_SCOPE, draftApprovedAction, type ApprovedActionDraft } from "@aaply/action-contract/conformance";
+import { defineConnector } from "@aaply/connector-sdk";
 import { mockFetch, type MockFetch, type MockRequest } from "@aaply/connector-sdk/testing";
 import { gmail, GMAIL_SEND_SCOPE, GMAIL_SEND_URL } from "@aaply/connectors/gmail";
 import { createFlowRuntime, createMemoryCatalog, createMemoryStore, e, hmacKeyMinter, pinActionContracts, type FlowDefinition, type TrustedContext } from "@aaply/flow";
@@ -24,12 +25,13 @@ const USERINFO = "GET https://openidconnect.googleapis.com/v1/userinfo";
 const REVOKE = "POST https://oauth2.googleapis.com/revoke";
 const boss: AdminActor = { tenantId: scope.tenantId, domain: "member", id: "boss", roles: [ADMIN_ROLE] };
 const ana: AdminActor = { tenantId: scope.tenantId, domain: "member", id: "ana", roles: [] };
+const keys = testKeyProvider();
 const s256 = (text: string) => createHash("sha256").update(text).digest("base64url");
 const form = (r: MockRequest) => new URLSearchParams(r.body ?? "");
 
 describe.skipIf(postgresUnavailable())("OAuth connections", () => {
   let db: TestDatabase;
-  let engine: { signer: ApprovedActionSigner };
+  let engine: { signer: ApprovedActionSigner; engineKeys: Record<string, string> };
   let google: MockFetch;
   let connect: Connect;
   let clock = Date.now();
@@ -90,7 +92,7 @@ describe.skipIf(postgresUnavailable())("OAuth connections", () => {
       engineKeys: (engine = await testEngineKeys()).engineKeys,
       connectors: [gmail],
       pool: db.app,
-      keys: testKeyProvider(),
+      keys,
       fetch: google,
       now: () => clock,
       oauth: {
@@ -236,6 +238,88 @@ describe.skipIf(postgresUnavailable())("OAuth connections", () => {
     expect(Buffer.from((sent[0]!.json() as { raw: string }).raw, "base64url").toString("utf8")).toContain("To: patient@example.com\r\nSubject: Your booking is confirmed");
   });
 
+  /** The business's Gmail connection now, and a fresh secret on it that runs out in `inMs`. */
+  async function nearlyExpired(inMs: number, refreshToken = `refresh-${issued}`) {
+    const [c] = (await connect.admin.connections(scope, { connectorId: "gmail" })).filter((x) => x.status === "active");
+    return connect.admin.updateConnection(scope.tenantId, c!.id, c!.version, { secret: { accessToken: "old-access", refreshToken, expiresAt: String(clock + inMs) } });
+  }
+  const sentWith = () => google.callsTo(`POST ${GMAIL_SEND_URL}`).map((r) => r.headers.authorization);
+
+  it("keeps a renewed token although the connection changed meanwhile, and a call that gave up does not stop it", async () => {
+    const c = await nearlyExpired(-1000);
+    google.on(TOKEN_URL, async (r) => {
+      // An admin edit lands while Google answers, and the first caller gives up.
+      const now = (await connect.admin.connection(scope.tenantId, c.id))!;
+      await connect.admin.updateConnection(scope.tenantId, c.id, now.version, { account: { ...now.account, note: "edited" } });
+      gaveUp.abort();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return tokens(r);
+    });
+    const gaveUp = new AbortController();
+    const [first, second] = await Promise.all([connect.perform(await sign(), gaveUp.signal), connect.perform(await sign())]);
+    expect(first.status).not.toBe("ok");
+    expect(second).toMatchObject({ status: "ok" });
+    google.on(TOKEN_URL, tokens);
+    google.calls.splice(0);
+    // The renewed token was saved: the next call uses it without renewing again.
+    expect(await connect.perform(await sign())).toMatchObject({ status: "ok" });
+    expect(google.callsTo(TOKEN_URL)).toEqual([]);
+    expect(sentWith()).toEqual([`Bearer access-${issued}`]);
+  });
+
+  it("keeps the refresh token when Google sends no new one", async () => {
+    await nearlyExpired(-1000, "the-long-lived-one");
+    const used: Array<string | null> = [];
+    google.on(TOKEN_URL, (r) => (used.push(form(r).get("refresh_token")), { json: { access_token: `access-short-${used.length}`, expires_in: 1, token_type: "Bearer" } }));
+    expect(await connect.perform(await sign())).toMatchObject({ status: "ok" });
+    clock += 5_000; // that token has run out: the next call renews with the refresh token it kept
+    expect(await connect.perform(await sign())).toMatchObject({ status: "ok" });
+    expect(used).toEqual(["the-long-lived-one", "the-long-lived-one"]);
+    expect(sentWith()).toEqual(["Bearer access-short-1", "Bearer access-short-2"]);
+    google.on(TOKEN_URL, tokens);
+  });
+
+  it("leaves the connection alone when Google refuses Aaply's client, and uses a token that still works", async () => {
+    const c = await nearlyExpired(20_000);
+    google.on(TOKEN_URL, { status: 401, json: { error: "invalid_client" } });
+    expect(await connect.perform(await sign())).toMatchObject({ status: "ok" });
+    expect(sentWith()).toEqual(["Bearer old-access"]);
+    await nearlyExpired(-1000);
+    expect(await connect.perform(await sign())).toMatchObject({ status: "retryable", error: { code: "connect/refresh-failed" } });
+    expect((await connect.admin.connection(scope.tenantId, c.id))!.status).toBe("active");
+    google.on(TOKEN_URL, tokens);
+  });
+
+  it("does not wait on another instance's renewal while the token still works", async () => {
+    const c = await nearlyExpired(20_000);
+    await db.pool("postgres").query("INSERT INTO aaply_connect.refresh_leases (connection_id, tenant_id, holder, until) VALUES ($1, $2, 'elsewhere', now() + interval '30 seconds')", [c.id, scope.tenantId]);
+    const started = Date.now();
+    expect(await connect.perform(await sign())).toMatchObject({ status: "ok" });
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(sentWith()).toEqual(["Bearer old-access"]);
+    expect(google.callsTo(TOKEN_URL)).toEqual([]);
+    await db.pool("postgres").query("DELETE FROM aaply_connect.refresh_leases");
+  });
+
+  it("refuses a sign-in that unticked a scope the connector needs, or used another account than expected", async () => {
+    google.on(TOKEN_URL, (r) => ({ ...tokens(r), json: { ...(tokens(r) as { json: Record<string, unknown> }).json, scope: "openid email" } }));
+    expect((await connectInBrowser(boss)).landed!.searchParams.get("reason")).toBe("scopes-declined");
+    google.on(TOKEN_URL, tokens);
+    const wrong = await connectInBrowser(ana, { owner: { person: "member:ana" }, expectAccount: "ana@clinic.example" });
+    expect(wrong.atGoogle.searchParams.get("login_hint")).toBe("ana@clinic.example");
+    expect(wrong.landed!.searchParams.get("reason")).toBe("different-account");
+    account = { sub: "g-ana", email: "Ana@Clinic.example" };
+    expect((await connectInBrowser(ana, { owner: { person: "member:ana" }, expectAccount: "ana@clinic.example" })).landed!.searchParams.get("connect")).toBe("ok");
+    account = { sub: "g-111", email: "desk@clinic.example" };
+  });
+
+  it("lets a start link go unused for two minutes at most", async () => {
+    const { url } = await connect.adminAs(boss).startOAuth({ scope, connectorId: "gmail", owner: { business: true }, returnTo: `${APP}/x` });
+    const start = new URL(url);
+    await db.pool("postgres").query("UPDATE aaply_connect.oauth_states SET created_at = now() - interval '3 minutes' WHERE id = $1", [start.searchParams.get("attempt")]);
+    expect(await connect.oauthRequest({ path: start.pathname, query: start.searchParams, cookie: undefined })).toMatchObject({ status: 400 });
+  });
+
   it("asks for the account again when Google no longer takes the grant", async () => {
     const [c] = await connect.admin.connections(scope, { connectorId: "gmail" });
     await connect.admin.updateConnection(scope.tenantId, c!.id, c!.version, { secret: { accessToken: "old", refreshToken: "revoked-refresh", expiresAt: String(clock + 1000) } });
@@ -255,6 +339,65 @@ describe.skipIf(postgresUnavailable())("OAuth connections", () => {
     expect(revoked.length).toBe(1);
     expect(form(revoked[0]!).get("token")).toMatch(/^refresh-/);
     expect(await connect.perform(await sign())).toMatchObject({ status: "final" });
+  });
+
+  it("connects Notion with HTTP Basic and a JSON token request, as the person who authorized", async () => {
+    const notion = mockFetch({
+      "POST https://api.notion.com/v1/oauth/token": (r) => {
+        const basic = Buffer.from("notion-client:notion-secret").toString("base64");
+        if (r.headers.authorization !== `Basic ${basic}` || r.headers["content-type"] !== "application/json") return { status: 401, json: { error: "invalid_client" } };
+        const body = r.json() as Record<string, string>;
+        if (body.grant_type !== "authorization_code" || !body.code_verifier || body.client_secret) return { status: 400, json: { error: "invalid_request" } };
+        return { json: { access_token: "notion-access", token_type: "bearer", bot_id: "bot-1", workspace_id: "ws-1", workspace_name: "Clinic", owner: { type: "user", user: { id: "u-ana", person: { email: "ana@clinic.example" } } } } };
+      },
+      "GET https://api.notion.com/v1/users/me": { json: { object: "user" } },
+    });
+    const pages = defineConnector({
+      id: "notion-test",
+      version: "1.0.0",
+      title: "Notion",
+      auth: { kind: "oauth2", scopes: [] },
+      egress: ["GET api.notion.com/v1/users/me"],
+      operations: { me: { title: "Me", effect: "read", input: { type: "object" }, output: { type: "object" }, handler: async (_i, ctx) => (await ctx.http({ url: "https://api.notion.com/v1/users/me" })).ensureOk().json() as never } },
+    });
+    const other = await createConnect({
+      audience: AUDIENCE,
+      engineKeys: engine.engineKeys,
+      connectors: [pages],
+      pool: db.app,
+      keys,
+      fetch: notion,
+      oauth: { redirectUri: "https://connect.example/oauth/callback", returnOrigins: [APP], apps: { "notion-test": { provider: oauthProviders.notion, clientId: "notion-client", clientSecret: "notion-secret" } } },
+    });
+    try {
+      const { url } = await other.adminAs(ana).startOAuth({ scope, connectorId: "notion-test", owner: { person: "member:ana" }, returnTo: `${APP}/x`, expectAccount: "ana@clinic.example" });
+      const start = new URL(url);
+      const begun = (await other.oauthRequest({ path: start.pathname, query: start.searchParams, cookie: undefined })) as { redirect: string; setCookie: string };
+      expect(new URL(begun.redirect).searchParams.get("owner")).toBe("user");
+      const state = new URL(begun.redirect).searchParams.get("state")!;
+      const done = (await other.oauthRequest({ path: "/oauth/callback", query: new URLSearchParams({ code: "c", state }), cookie: begun.setCookie.split(";")[0] })) as { redirect: string };
+      const landed = new URL(done.redirect);
+      expect(landed.searchParams.toString()).toBe("connect=ok&connection=" + landed.searchParams.get("connection"));
+      expect(await other.admin.connection(scope.tenantId, landed.searchParams.get("connection")!)).toMatchObject({ account: { provider: "notion", id: "u-ana", name: "Clinic" }, ownerSubject: "member:ana" });
+    } finally {
+      await other.close();
+    }
+  });
+
+  it("sends the person back with a reason when the connection cannot be saved", async () => {
+    // Another key provider cannot open this tenant's data key: saving fails after Google said yes.
+    const broken = await createConnect({ audience: AUDIENCE, engineKeys: engine.engineKeys, connectors: [gmail], pool: db.app, keys: testKeyProvider(), fetch: google, oauth: { redirectUri: "https://connect.example/oauth/callback", returnOrigins: [APP], apps: { gmail: { provider: oauthProviders.google, clientId: "aaply-client", clientSecret: "aaply-secret" } } } });
+    try {
+      const cy: AdminActor = { ...ana, id: "cy" };
+      const { url } = await broken.adminAs(cy).startOAuth({ scope, connectorId: "gmail", owner: { person: "member:cy" }, returnTo: `${APP}/x` });
+      const start = new URL(url);
+      const begun = (await broken.oauthRequest({ path: start.pathname, query: start.searchParams, cookie: undefined })) as { redirect: string; setCookie: string };
+      const state = new URL(begun.redirect).searchParams.get("state")!;
+      const done = await broken.oauthRequest({ path: "/oauth/callback", query: new URLSearchParams({ code: "c", state }), cookie: begun.setCookie.split(";")[0] });
+      expect("redirect" in done && new URL(done.redirect).searchParams.get("reason")).toBe("failed");
+    } finally {
+      await broken.close();
+    }
   });
 
   it("serves the browser's routes over HTTP, uncached and unframed", async () => {

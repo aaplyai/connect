@@ -156,6 +156,7 @@ CREATE TABLE aaply_connect.oauth_states (
   verifier text NOT NULL,
   -- SHA-256 of the browser's cookie nonce, set once when the browser opens the attempt.
   nonce_hash text,
+  created_at timestamptz NOT NULL DEFAULT now(),
   expires_at timestamptz NOT NULL
 );
 CREATE INDEX oauth_states_expires ON aaply_connect.oauth_states (expires_at);
@@ -170,6 +171,8 @@ $$;
 CREATE FUNCTION aaply_connect.oauth_state_begin(p_id text, p_nonce_hash text)
 RETURNS jsonb LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
   UPDATE aaply_connect.oauth_states SET nonce_hash = p_nonce_hash WHERE id = p_id AND nonce_hash IS NULL AND expires_at > now()
+    -- The backend sends the browser on at once: a start link left lying about (forwarded, pasted) has run out.
+    AND created_at > now() - interval '2 minutes'
   RETURNING jsonb_build_object('tenantId', tenant_id, 'request', request, 'verifier', verifier)
 $$;
 
@@ -235,6 +238,8 @@ $$;
 DO $$ BEGIN
   EXECUTE format('CREATE POLICY purge_read ON aaply_connect.replay_claims FOR SELECT TO %I USING (true)', current_user);
   EXECUTE format('CREATE POLICY purge ON aaply_connect.replay_claims FOR DELETE TO %I USING (true)', current_user);
+  EXECUTE format('CREATE POLICY purge_read ON aaply_connect.refresh_leases FOR SELECT TO %I USING (true)', current_user);
+  EXECUTE format('CREATE POLICY purge ON aaply_connect.refresh_leases FOR DELETE TO %I USING (true)', current_user);
 END $$;
 
 -- Deletes expired claims across tenants, in batches. Runs as the owner (SECURITY DEFINER): row security would hide other tenants' rows.
@@ -244,7 +249,10 @@ RETURNS integer LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = pg_cata
     DELETE FROM aaply_connect.replay_claims WHERE ctid IN (SELECT ctid FROM aaply_connect.replay_claims WHERE until < now() LIMIT p_limit) RETURNING 1
   ), attempts AS (
     DELETE FROM aaply_connect.oauth_states WHERE ctid IN (SELECT ctid FROM aaply_connect.oauth_states WHERE expires_at < now() LIMIT p_limit) RETURNING 1
-  ) SELECT ((SELECT count(*) FROM gone) + (SELECT count(*) FROM attempts))::integer
+  ), leases AS (
+    -- A lease outlives its holder only when the holder died: kept a minute for the record, then removed.
+    DELETE FROM aaply_connect.refresh_leases WHERE ctid IN (SELECT ctid FROM aaply_connect.refresh_leases WHERE until < now() - interval '1 minute' LIMIT p_limit) RETURNING 1
+  ) SELECT ((SELECT count(*) FROM gone) + (SELECT count(*) FROM attempts) + (SELECT count(*) FROM leases))::integer
 $$;
 
 DO $$ BEGIN

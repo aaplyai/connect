@@ -16,6 +16,9 @@ describe("gmail.send", () => {
     expect(call.headers.authorization).toBe("Bearer test-token");
     const message = raw(call.json());
     expect(message).toContain("To: ana@example.com\r\nCc: bo@example.org\r\nSubject: Your booking\r\n");
+    const many = buildMessage({ to: Array.from({ length: 50 }, (_, i) => `person.number.${i}@a-rather-long-domain.example.com`), subject: "Hi", text: "x" }, "k");
+    for (const line of many.split("\r\n")) expect(line.length).toBeLessThanOrEqual(998);
+    expect(unfold(many)).toContain("To: person.number.0@a-rather-long-domain.example.com, person.number.1@");
     expect(message).toContain("Content-Type: text/plain; charset=UTF-8");
     expect(message.split("\r\n\r\n")[1]).toBe(Buffer.from("See you at 10.").toString("base64"));
   });

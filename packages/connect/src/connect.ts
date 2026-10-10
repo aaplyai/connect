@@ -135,7 +135,7 @@ export interface Connect {
   oauthRequest(request: { path: string; query: URLSearchParams; cookie: string | undefined }): Promise<OAuthAnswer>;
   /** Whether the store answers. */
   ready(): Promise<boolean>;
-  /** Deletes expired replay claims; run it every minute from any instance (several at once is safe). */
+  /** Deletes expired replay claims, OAuth attempts and dead refresh leases; run it every minute from any instance (several at once is safe). */
   purgeExpired(): Promise<number>;
   close(): Promise<void>;
 }
@@ -268,7 +268,10 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
       const before = oauth ? await store.connection(tenantId, id) : null;
       const secret = before && oauth?.serves(before.connectorId) && before.status !== "revoked" ? await oauth.secretOf(tenantId, id).catch(() => null) : null;
       const revoked = await store.revokeConnection(tenantId, id);
-      if (revoked && secret) await oauth!.revokeAtProvider(before!.connectorId, secret);
+      // A provider revokes the whole grant (account and Aaply's client), so it is left alone while another connection here uses that account.
+      // Connections of the same account in another app or tenant cannot be seen from here: they go to reauth on their next refresh.
+      const shared = (c: Connection) => c.id !== id && c.status !== "revoked" && c.account.provider === before!.account.provider && c.account.id === before!.account.id;
+      if (revoked && secret && !(await store.connections(before!.scope)).some(shared)) await oauth!.revokeAtProvider(before!.connectorId, secret);
       return revoked;
     },
     connection: (tenantId, id) => store.connection(tenantId, id),
@@ -277,6 +280,7 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
       if (!oauth) throw new AdminError("admin/invalid", "OAuth is not configured here");
       const connector = newest(options.connectors, input.connectorId);
       if (connector?.auth.kind !== "oauth2" || !oauth.serves(input.connectorId)) throw new AdminError("admin/invalid", `${input.connectorId} is not an OAuth connector served here`);
+      if ("person" in input.owner && (typeof input.owner.person !== "string" || !/^[^:\s]{1,64}:\S{1,256}$/.test(input.owner.person))) throw new AdminError("admin/invalid", "a person is named domain:id");
       if (input.reconnect !== undefined) {
         const c = await store.connection(input.scope.tenantId, input.reconnect);
         const owner = "person" in input.owner ? input.owner.person : null;
@@ -341,6 +345,13 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
         return auth?.kind === "oauth2" ? auth.scopes : [];
       },
       ...(options.now ? { now: options.now } : {}),
+      report: (error, where) => {
+        try {
+          options.observer?.error?.(error, where);
+        } catch {
+          // An observer that throws changes nothing.
+        }
+      },
     });
     refresher = oauth.refresher(async (tenantId, connectionId) => (await store.connection(tenantId, connectionId))?.connectorId ?? null);
   }

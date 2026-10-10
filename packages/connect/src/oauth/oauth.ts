@@ -10,17 +10,17 @@
  * new one, or the same account connected again (a different account is
  * refused). The person lands back on the backend's page with the result.
  *
- * Refreshing (`refresher`): on demand, when a token is near its expiry or
- * the service refused it. One refresh per connection at a time, in this
- * process (single flight) and across instances (a lease row); the new
- * secret is saved with a versioned write before the lease is released, so a
- * rotated refresh token is never lost. A refused grant (`invalid_grant`)
- * marks the connection `reauth` and is never retried.
+ * The start link works once and only within two minutes, so the backend
+ * sends the browser on at once and never shows the link. Who opens it is
+ * not provable: `expectAccount` pins the account (its email) that may be
+ * connected, which the backend should give for a person's own connection.
+ *
+ * Refreshing is refresh.ts.
  */
 
 import { createHash, randomBytes } from "node:crypto";
 import type { EnvironmentKind, JsonObject, Scope } from "@aaply/action-contract";
-import { ConnectorError, type FetchLike } from "@aaply/connector-sdk";
+import type { FetchLike } from "@aaply/connector-sdk";
 import { AdminError, loggedAdmin, type RawAdmin } from "../admin.js";
 import type { ConnectionOwner } from "../connect.js";
 import type { TokenRefresher } from "../credentials.js";
@@ -28,7 +28,8 @@ import { newId } from "../ids.js";
 import type { OAuthStore } from "../store/oauth-store.js";
 import { StoreConflict, type ConnectStore, type Connection } from "../store/store.js";
 import type { Vault } from "../vault.js";
-import type { OAuthProvider } from "./providers.js";
+import { identify, providerPost, type OAuthApp } from "./provider-http.js";
+import { createRefresher, tokenSecret } from "./refresh.js";
 
 export interface OAuthOptions {
   /** Connect's callback, as registered with every provider: `https://<connect>/oauth/callback`. */
@@ -36,7 +37,7 @@ export interface OAuthOptions {
   /** Origins a finished attempt may send the person back to (the Aaply app's), exactly. */
   returnOrigins: readonly string[];
   /** Per OAuth connector id: its provider and Aaply's client there. */
-  apps: Readonly<Record<string, { provider: OAuthProvider; clientId: string; clientSecret: string }>>;
+  apps: Readonly<Record<string, OAuthApp>>;
   /** How long an attempt lasts, in ms. Default 10 minutes. */
   attemptTtlMs?: number;
 }
@@ -50,6 +51,13 @@ export interface StartOAuthInput {
   returnTo: string;
   /** Connect this connection's account again (after `reauth`, or for more scopes). */
   reconnect?: string;
+  /**
+   * The email of the only account that may be connected (suggested to the
+   * provider, and checked when the person comes back). Give it for a
+   * person's own connection, so a start link opened by someone else cannot
+   * attach their account to this person.
+   */
+  expectAccount?: string;
 }
 
 /** What an HTTP route answers: a redirect (with a cookie to set), or a short page. */
@@ -57,26 +65,23 @@ export type OAuthAnswer = { redirect: string; setCookie?: string } | { status: n
 
 const COOKIE = "__Host-aaply-oauth-";
 const sha256 = (text: string) => createHash("sha256").update(text).digest("base64url");
-const MAX_TOKEN_RESPONSE = 64 * 1024;
-const LEASE_MS = 30_000;
-
-/** A secret as an OAuth connection keeps it. */
-function secretOf(tokens: Record<string, unknown>, previous: Readonly<Record<string, string>> | null, now: number): Record<string, string> {
-  const out: Record<string, string> = { accessToken: String(tokens.access_token) };
-  const refresh = typeof tokens.refresh_token === "string" ? tokens.refresh_token : previous?.refreshToken;
-  if (refresh) out.refreshToken = refresh;
-  if (typeof tokens.expires_in === "number" && Number.isFinite(tokens.expires_in)) out.expiresAt = String(now + tokens.expires_in * 1000);
-  return out;
-}
-
-export function createOAuth(options: { config: OAuthOptions; store: ConnectStore; oauthStore: OAuthStore; vault: Vault; admin: RawAdmin; fetch: FetchLike; scopesOf: (connectorId: string) => readonly string[]; now?: () => number }) {
+export function createOAuth(options: {
+  config: OAuthOptions;
+  store: ConnectStore;
+  oauthStore: OAuthStore;
+  vault: Vault;
+  admin: RawAdmin;
+  fetch: FetchLike;
+  scopesOf: (connectorId: string) => readonly string[];
+  now?: () => number;
+  report?: (error: unknown, where: string) => void;
+}) {
   const { config, oauthStore, vault } = options;
   const now = options.now ?? Date.now;
   const ttl = config.attemptTtlMs ?? 10 * 60_000;
   const callback = new URL(config.redirectUri);
   const startUrl = new URL("/oauth/start", callback.origin);
-  const holder = randomBytes(9).toString("base64url");
-  const inFlight = new Map<string, Promise<Readonly<Record<string, string>>>>();
+  const report = options.report ?? (() => undefined);
 
   const appOf = (connectorId: string) => {
     const app = config.apps[connectorId];
@@ -84,44 +89,52 @@ export function createOAuth(options: { config: OAuthOptions; store: ConnectStore
     return app;
   };
 
-  /** Calls a provider endpoint and reads its JSON answer (bounded). */
-  async function post(app: { provider: OAuthProvider; clientId: string; clientSecret: string }, url: string, fields: Record<string, string>, signal?: AbortSignal) {
-    const p = app.provider;
-    const headers: Record<string, string> = { accept: "application/json" };
-    const body = { ...fields, ...(p.clientAuth === "body" ? { client_id: app.clientId, client_secret: app.clientSecret } : {}) };
-    if (p.clientAuth === "basic") headers.authorization = `Basic ${Buffer.from(`${encodeURIComponent(app.clientId)}:${encodeURIComponent(app.clientSecret)}`).toString("base64")}`;
-    headers["content-type"] = p.tokenBody === "json" && url === p.tokenUrl ? "application/json" : "application/x-www-form-urlencoded";
-    const res = await options.fetch(url, {
-      method: "POST",
-      headers,
-      body: headers["content-type"] === "application/json" ? JSON.stringify(body) : new URLSearchParams(body).toString(),
-      redirect: "manual",
-      signal: signal ?? AbortSignal.timeout(10_000),
-    });
-    const text = (await res.text()).slice(0, MAX_TOKEN_RESPONSE);
-    let json: Record<string, unknown> = {};
+  /** Trades the code, checks the account, and saves the connection. */
+  async function finish(r: Record<string, any>, app: OAuthApp, code: string, verifier: string, back: (result: Record<string, string>) => OAuthAnswer): Promise<OAuthAnswer> {
+    let tokens: Record<string, unknown>;
+    let account: { id: string; name?: string; email?: string };
     try {
-      const parsed: unknown = JSON.parse(text);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) json = parsed as Record<string, unknown>;
-    } catch {
-      // Not JSON: the status decides.
+      const res = await providerPost(options.fetch, app, app.provider.tokenUrl, { grant_type: "authorization_code", code, redirect_uri: config.redirectUri, code_verifier: verifier });
+      if (res.status !== 200 || typeof res.json.access_token !== "string" || !res.json.access_token) return back({ connect: "error", reason: "token-exchange" });
+      tokens = res.json;
+      account = await identify(options.fetch, app, tokens);
+    } catch (error) {
+      report(error, "oauth.exchange");
+      return back({ connect: "error", reason: "provider-unreachable" });
     }
-    return { status: res.status, json };
-  }
+    if (typeof r.expectAccount === "string" && account.email?.toLowerCase() !== r.expectAccount.toLowerCase()) return back({ connect: "error", reason: "different-account" });
+    const asked = options.scopesOf(r.connectorId as string);
+    // A provider that names no scopes granted what was asked (RFC 6749 5.1); one that names them may have had some unticked.
+    const granted = typeof tokens.scope === "string" ? tokens.scope.split(/[\s,]+/).filter(Boolean) : [...asked];
+    if (asked.some((s) => !granted.includes(s))) return back({ connect: "error", reason: "scopes-declined" });
+    const secret = tokenSecret(tokens, null, now());
+    const scope = r.scope as Scope;
+    const owner = r.owner as ConnectionOwner;
+    const kind = r.environmentKind as EnvironmentKind;
+    const admin = loggedAdmin(options.admin, options.store, r.actor as JsonObject);
+    const accountJson: JsonObject = { provider: app.provider.id, id: account.id, ...(account.name ? { name: account.name } : {}) };
 
-  /** The account a fresh token belongs to. */
-  async function identify(app: { provider: OAuthProvider }, tokens: Record<string, unknown>): Promise<{ id: string; name?: string }> {
-    const spec = app.provider.identity;
-    let source: Record<string, unknown> = tokens;
-    if ("url" in spec) {
-      const res = await options.fetch(spec.url, { method: "GET", headers: { authorization: `Bearer ${String(tokens.access_token)}`, accept: "application/json" }, redirect: "manual", signal: AbortSignal.timeout(10_000) });
-      if (res.status !== 200) throw new Error(`identity answered ${res.status}`);
-      source = JSON.parse((await res.text()).slice(0, MAX_TOKEN_RESPONSE)) as Record<string, unknown>;
+    // The same account again: its connection gets the new tokens. Another account: refused.
+    const existing = async (): Promise<Connection | undefined> => {
+      if (r.reconnect) return (await options.admin.connection(scope.tenantId, r.reconnect as string)) ?? undefined;
+      const person = "person" in owner ? owner.person : undefined;
+      const all = await options.admin.connections(scope, { connectorId: r.connectorId as string, ...(person ? { ownerSubject: person } : {}) });
+      return all.find((c) => c.status !== "revoked" && c.environmentKind === kind && (person ? c.ownerSubject === person : c.ownerSubject === null && c.role === ("role" in owner && owner.role ? owner.role : "default")));
+    };
+    try {
+      const current = await existing();
+      if (current && current.status !== "revoked") {
+        if ((current.account as Record<string, unknown>).id !== account.id) return back({ connect: "error", reason: "different-account" });
+        const updated = await admin.updateConnection(scope.tenantId, current.id, current.version, { secret, grantedScopes: granted, account: accountJson, status: "active" });
+        return back({ connect: "ok", connection: updated.id });
+      }
+      if (r.reconnect) return back({ connect: "error", reason: "connection-gone" });
+      const made = await admin.createConnection({ scope, connectorId: r.connectorId as string, owner, environmentKind: kind, grantedScopes: granted, account: accountJson, secret });
+      return back({ connect: "ok", connection: made.id });
+    } catch (error) {
+      if (error instanceof StoreConflict) return back({ connect: "error", reason: "changed-meanwhile" });
+      throw error;
     }
-    const id = source[spec.id];
-    if (typeof id !== "string" && typeof id !== "number") throw new Error("the provider did not say which account this is");
-    const name = spec.name ? source[spec.name] : undefined;
-    return { id: String(id), ...(typeof name === "string" ? { name } : {}) };
   }
 
   return {
@@ -136,6 +149,7 @@ export function createOAuth(options: { config: OAuthOptions; store: ConnectStore
       }
       if (!config.returnOrigins.includes(back.origin)) throw new AdminError("admin/invalid", `returnTo must be on ${config.returnOrigins.join(", ")}`);
       void app;
+      if (input.expectAccount !== undefined && (typeof input.expectAccount !== "string" || !/^[^\s@]{1,64}@[^\s@]{1,253}$/.test(input.expectAccount))) throw new AdminError("admin/invalid", "expectAccount is an email address");
       const id = newId("oauth");
       const request: JsonObject = {
         scope: { ...input.scope },
@@ -145,6 +159,7 @@ export function createOAuth(options: { config: OAuthOptions; store: ConnectStore
         actor,
         returnTo: back.toString(),
         ...(input.reconnect ? { reconnect: input.reconnect } : {}),
+        ...(input.expectAccount ? { expectAccount: input.expectAccount } : {}),
       };
       await oauthStore.createAttempt(id, input.scope.tenantId, request, randomBytes(48).toString("base64url"), ttl);
       const url = new URL(startUrl);
@@ -171,6 +186,7 @@ export function createOAuth(options: { config: OAuthOptions; store: ConnectStore
       const all = [...new Set([...options.scopesOf(attempt.request.connectorId as string), ...(p.identityScopes ?? [])])];
       if (all.length > 0) url.searchParams.set("scope", all.join(" "));
       for (const [k, v] of Object.entries(p.authorizeParams ?? {})) url.searchParams.set(k, v);
+      if (p.loginHint && typeof attempt.request.expectAccount === "string") url.searchParams.set(p.loginHint, attempt.request.expectAccount);
       return { redirect: url.toString(), setCookie: `${COOKIE}${attemptId}=${nonce}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${Math.ceil(ttl / 1000)}` };
     },
 
@@ -195,44 +211,12 @@ export function createOAuth(options: { config: OAuthOptions; store: ConnectStore
       const code = query.get("code");
       if (!code) return back({ connect: "error", reason: "provider-error" });
 
-      let tokens: Record<string, unknown>;
-      let account: { id: string; name?: string };
       try {
-        const res = await post(app, app.provider.tokenUrl, { grant_type: "authorization_code", code, redirect_uri: config.redirectUri, code_verifier: attempt.verifier });
-        if (res.status !== 200 || typeof res.json.access_token !== "string") return back({ connect: "error", reason: "token-exchange" });
-        tokens = res.json;
-        account = await identify(app, tokens);
-      } catch {
-        return back({ connect: "error", reason: "provider-unreachable" });
-      }
-      const granted = typeof tokens.scope === "string" ? tokens.scope.split(/[\s,]+/).filter(Boolean) : [];
-      const secret = secretOf(tokens, null, now());
-      const scope = r.scope as Scope;
-      const owner = r.owner as ConnectionOwner;
-      const kind = r.environmentKind as EnvironmentKind;
-      const admin = loggedAdmin(options.admin, options.store, r.actor as JsonObject);
-      const accountJson: JsonObject = { provider: app.provider.id, id: account.id, ...(account.name ? { name: account.name } : {}) };
-
-      // The same account again: its connection gets the new tokens. Another account: refused.
-      const existing = async (): Promise<Connection | undefined> => {
-        if (r.reconnect) return (await options.admin.connection(scope.tenantId, r.reconnect as string)) ?? undefined;
-        const person = "person" in owner ? owner.person : undefined;
-        const all = await options.admin.connections(scope, { connectorId: r.connectorId as string, ...(person ? { ownerSubject: person } : {}) });
-        return all.find((c) => c.status !== "revoked" && c.environmentKind === kind && (person ? c.ownerSubject === person : c.ownerSubject === null && c.role === ("role" in owner && owner.role ? owner.role : "default")));
-      };
-      try {
-        const current = await existing();
-        if (current && current.status !== "revoked") {
-          if ((current.account as Record<string, unknown>).id !== account.id) return back({ connect: "error", reason: "different-account" });
-          const updated = await admin.updateConnection(scope.tenantId, current.id, current.version, { secret, grantedScopes: granted, account: accountJson, status: "active" });
-          return back({ connect: "ok", connection: updated.id });
-        }
-        if (r.reconnect) return back({ connect: "error", reason: "connection-gone" });
-        const made = await admin.createConnection({ scope, connectorId: r.connectorId as string, owner, environmentKind: kind, grantedScopes: granted, account: accountJson, secret });
-        return back({ connect: "ok", connection: made.id });
+        return await finish(r, app, code, attempt.verifier, back);
       } catch (error) {
-        if (error instanceof StoreConflict) return back({ connect: "error", reason: "changed-meanwhile" });
-        throw error;
+        // The attempt is used up either way: the person goes back with a reason, never to a bare error page.
+        report(error, "oauth.callback");
+        return back({ connect: "error", reason: "failed" });
       }
     },
 
@@ -242,8 +226,9 @@ export function createOAuth(options: { config: OAuthOptions; store: ConnectStore
       const token = secret?.refreshToken ?? secret?.accessToken;
       if (!app?.provider.revokeUrl || !token) return false;
       try {
-        return (await post(app, app.provider.revokeUrl, { token }, AbortSignal.timeout(5_000))).status === 200;
-      } catch {
+        return (await providerPost(options.fetch, app, app.provider.revokeUrl, { token })).status === 200;
+      } catch (error) {
+        report(error, "oauth.revoke");
         return false;
       }
     },
@@ -258,73 +243,19 @@ export function createOAuth(options: { config: OAuthOptions; store: ConnectStore
     serves: (connectorId: string) => config.apps[connectorId] !== undefined,
 
     refresher(connectorOf: (tenantId: string, connectionId: string) => Promise<string | null>): TokenRefresher {
-      const openCurrent = async (tenantId: string, connectionId: string) => {
-        const c = await oauthStore.current(tenantId, connectionId);
-        if (!c || c.status !== "active" || !c.secret) throw new ConnectorError("final", "connect/reconsent", "This account needs to be connected again.");
-        return { version: c.version, secret: await vault.open(tenantId, connectionId, c.secret.sealed, c.secret.dataKey) };
-      };
-
-      async function refresh(request: Parameters<TokenRefresher["refresh"]>[0]): Promise<Readonly<Record<string, string>>> {
-        const { tenantId, connectionId, signal } = request;
-        if (!(await oauthStore.takeLease(tenantId, connectionId, holder, LEASE_MS))) {
-          // Another instance is refreshing: wait for its new version, a while.
-          const until = Math.min(now() + 5_000, now() + LEASE_MS);
-          while (now() < until && !signal.aborted) {
-            await new Promise((resolve) => setTimeout(resolve, 100));
-            const c = await openCurrent(tenantId, connectionId);
-            if (c.version > request.version) return c.secret;
-          }
-          throw new ConnectorError("retryable", "connect/refresh-busy", "The account's sign-in is being renewed; try again.");
-        }
-        try {
-          // Someone may have refreshed between the call reading the secret and this lease.
-          const c = await openCurrent(tenantId, connectionId);
-          if (c.version > request.version) return c.secret;
+      return createRefresher({
+        oauthStore,
+        vault,
+        admin: options.admin,
+        fetch: options.fetch,
+        appOf: async (tenantId, connectionId) => {
           const connectorId = await connectorOf(tenantId, connectionId);
-          const app = connectorId ? config.apps[connectorId] : undefined;
-          if (!app || !c.secret.refreshToken) {
-            await options.admin.updateConnection(tenantId, connectionId, c.version, { status: "reauth" }).catch(() => undefined);
-            throw new ConnectorError("final", "connect/reconsent", "This account needs to be connected again.");
-          }
-          let res: Awaited<ReturnType<typeof post>>;
-          try {
-            res = await post(app, app.provider.tokenUrl, { grant_type: "refresh_token", refresh_token: c.secret.refreshToken }, signal);
-          } catch {
-            throw new ConnectorError("retryable", "connect/refresh-failed", "The account's sign-in could not be renewed right now.");
-          }
-          if (res.status !== 200 || typeof res.json.access_token !== "string") {
-            if (res.json.error === "invalid_grant" || res.status === 401) {
-              // The grant is gone (revoked, expired, or a refresh token used twice): only the person can fix it.
-              await options.admin.updateConnection(tenantId, connectionId, c.version, { status: "reauth" }).catch(() => undefined);
-              throw new ConnectorError("final", "connect/reconsent", "This account needs to be connected again.");
-            }
-            throw new ConnectorError("retryable", "connect/refresh-failed", "The account's sign-in could not be renewed right now.");
-          }
-          const next = secretOf(res.json, c.secret, now());
-          // Saved before the lease is released: a rotated refresh token is never lost.
-          try {
-            await options.admin.updateConnection(tenantId, connectionId, c.version, { secret: next });
-          } catch (error) {
-            if (!(error instanceof StoreConflict)) throw error;
-            return (await openCurrent(tenantId, connectionId)).secret;
-          }
-          return next;
-        } finally {
-          await oauthStore.releaseLease(tenantId, connectionId, holder).catch(() => undefined);
-        }
-      }
-
-      return {
-        refresh(request) {
-          // One refresh per connection in this process; every caller gets its result.
-          const key = `${request.tenantId}/${request.connectionId}`;
-          const pending = inFlight.get(key);
-          if (pending) return pending;
-          const run = refresh(request).finally(() => inFlight.delete(key));
-          inFlight.set(key, run);
-          return run;
+          return connectorId ? config.apps[connectorId] : undefined;
         },
-      };
+        holder: randomBytes(9).toString("base64url"),
+        now,
+        report,
+      });
     },
   };
 }

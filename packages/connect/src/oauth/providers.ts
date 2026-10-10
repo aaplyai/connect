@@ -21,10 +21,13 @@ export interface OAuthProvider {
   identityScopes?: readonly string[];
   /**
    * Which account was connected: from a JSON endpoint called with the new
-   * access token, or from fields of the token response itself. `id` is the
-   * stable account id (a reconnect must match it); `name` is for people.
+   * access token, or from fields of the token response itself, each a
+   * dotted path. `id` is the stable account id (a reconnect must match it);
+   * `name` is for people; `email` is checked against `expectAccount`.
    */
-  identity: { url: string; id: string; name?: string } | { fromToken: true; id: string; name?: string };
+  identity: { url: string; id: string; name?: string; email?: string } | { fromToken: true; id: string; name?: string; email?: string };
+  /** The authorization parameter that suggests which account to sign in with (Google: `login_hint`). */
+  loginHint?: string;
 }
 
 export const oauthProviders = {
@@ -35,9 +38,11 @@ export const oauthProviders = {
     revokeUrl: "https://oauth2.googleapis.com/revoke",
     clientAuth: "body",
     // Offline access for a refresh token; consent each time so Google issues one again on a reconnect.
-    authorizeParams: { access_type: "offline", prompt: "consent", include_granted_scopes: "true" },
+    // No incremental grants: a connection's token carries only the scopes its connector asked for.
+    authorizeParams: { access_type: "offline", prompt: "consent" },
     identityScopes: ["openid", "email"],
-    identity: { url: "https://openidconnect.googleapis.com/v1/userinfo", id: "sub", name: "email" },
+    identity: { url: "https://openidconnect.googleapis.com/v1/userinfo", id: "sub", name: "email", email: "email" },
+    loginHint: "login_hint",
   },
   notion: {
     id: "notion",
@@ -46,6 +51,7 @@ export const oauthProviders = {
     clientAuth: "basic",
     tokenBody: "json",
     authorizeParams: { owner: "user" },
-    identity: { fromToken: true, id: "workspace_id", name: "workspace_name" },
+    // The person who authorized, not the workspace: anyone in a workspace could otherwise reconnect as it.
+    identity: { fromToken: true, id: "owner.user.id", name: "workspace_name", email: "owner.user.person.email" },
   },
 } as const satisfies Record<string, OAuthProvider>;

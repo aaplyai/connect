@@ -159,11 +159,11 @@ export function createPerformer(options: PerformerOptions): Performer {
   };
 
   /** Renews the call's OAuth token (once per connection across instances: the refresher's) and answers the new headers. */
-  const refreshed = async (s: CallState, signal: AbortSignal): Promise<Record<string, string>> => {
+  const refreshed = async (s: CallState, signal: AbortSignal, wait = true): Promise<Record<string, string>> => {
     const c = s.resolution.connection;
     const secret = await secretOf(s);
     if (!c || !secret || s.connector?.auth.kind !== "oauth2") throw new ConnectorError("final", "connect/reconsent", "This account needs to be connected again.");
-    s.secret = await whileOpen(s.signal, options.refresher!.refresh({ tenantId: s.tenantId, connectionId: c.id, version: c.version, secret, signal: AbortSignal.any([signal, s.signal]) }));
+    s.secret = await whileOpen(s.signal, options.refresher!.refresh({ tenantId: s.tenantId, connectionId: c.id, version: c.version, secret, signal: AbortSignal.any([signal, s.signal]), wait }));
     return headersOf(s.connector.auth, s.secret);
   };
 
@@ -196,7 +196,7 @@ export function createPerformer(options: PerformerOptions): Performer {
           // A token about to run out is renewed first, so a long call does not fail half way; until it has run out, the old one still serves.
           if (options.refresher && s.connector.auth.kind === "oauth2" && nearExpiry(secret, now())) {
             try {
-              return await refreshed(s, s.signal);
+              return await refreshed(s, s.signal, !(Number(secret?.expiresAt) > now()));
             } catch (error) {
               if (!(error instanceof ConnectorError && error.kind === "retryable" && Number(secret?.expiresAt) > now())) throw error;
             }

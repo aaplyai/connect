@@ -28,7 +28,8 @@ function headerValue(name: string, value: string): string {
 
 function addresses(name: string, list: readonly string[]): string {
   for (const a of list) if (!emailPattern.test(a)) throw ConnectorError.final("gmail/invalid-address", `${name} has an address that is not name@domain.`);
-  return list.join(", ");
+  // One address per folded line: 50 of them stay within the 998-character line limit (RFC 5322 2.1.1).
+  return list.join(`,${CRLF} `);
 }
 
 /** A subject as ASCII: as is, or as RFC 2047 encoded words of at most 45 bytes each (whole characters). */

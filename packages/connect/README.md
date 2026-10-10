@@ -87,22 +87,27 @@ the business's audit needs.
 Providers are data (`oauthProviders.google`, `oauthProviders.notion`); a connector names only the scopes
 it needs, and `ConnectOptions.oauth.apps` gives Aaply's client at the provider per OAuth connector.
 
-1. The backend calls `startOAuth({ scope, connectorId, owner, returnTo, reconnect? })` as the person
-   (checked like creating the connection, or changing it for `reconnect`) and sends their browser to
-   the link it answers. `returnTo` must be on one of `returnOrigins`.
-2. `GET /oauth/start` works once: it binds the attempt to that browser with a `__Host-` cookie and
-   sends it to the provider with PKCE (S256).
+1. The backend calls `startOAuth({ scope, connectorId, owner, returnTo, reconnect?, expectAccount? })`
+   as the person (checked like creating the connection, or changing it for `reconnect`) and redirects
+   their browser to the link at once, never showing it. `returnTo` must be on one of `returnOrigins`.
+2. `GET /oauth/start` works once, within two minutes: it binds the attempt to that browser with a
+   `__Host-` cookie and sends it to the provider with PKCE (S256). Which browser opens the link
+   cannot be proved, so for a person's own connection the backend gives `expectAccount` (the email
+   it knows them by): any other account is refused when they come back.
 3. `GET /oauth/callback` takes the attempt once, only with that cookie, trades the code, learns which
    account it is, and saves the connection: a new one, or the same account's again (another account
    where one is connected is refused). The change is logged as the person's. The browser lands on
    `returnTo` with `connect=ok&connection=<id>` or `connect=error&reason=<code>`.
 
-A connection holds one account per connector, owner and environment kind. Tokens are renewed when they
-have under a minute left or the service refuses them: once per connection at a time (in a process,
-and across instances with a lease row), saved before the lease is released so a rotated refresh token
-is never lost. A grant the provider no longer takes marks the connection `reauth`, and calls answer
-`connect/reconsent` until the person connects again. Removing a connection revokes the grant at the
-provider too, as far as the provider allows. Attempts live in a table only Connect's own SQL functions
+A connection holds one account per connector, owner and environment kind, with only the scopes its
+connector asks for (a sign-in that unticked one is refused). Tokens are renewed when they have under a
+minute left or the service refuses them: once per connection at a time (in a process, and across
+instances with a lease row), on the renewal's own clock rather than any caller's, and saved before the
+lease is released, so a rotated refresh token is never lost. Only the provider saying the grant is gone
+(`invalid_grant`) marks the connection `reauth` (calls answer `connect/reconsent` until the person
+connects again); a refused client secret or an outage is retryable and reported to the `observer`.
+Removing a connection revokes the grant at the provider, unless another connection in the same scope
+uses that account (a provider revokes the account's whole grant to Aaply's client). Attempts live in a table only Connect's own SQL functions
 touch, and `purgeExpired` removes old ones.
 
 ## Databases
