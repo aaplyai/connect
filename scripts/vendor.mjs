@@ -67,7 +67,8 @@ function sync(target, checkout, commit) {
   const source = join(checkout, pin.path);
   const head = commit ?? execFileSync("git", ["-C", checkout, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
   const keep = readFileSync(pinPath);
-  rmSync(join(ROOT, target), { recursive: true, force: true });
+  // Everything but node_modules (pnpm's links) is replaced.
+  for (const name of readdirSync(join(ROOT, target))) if (name !== "node_modules") rmSync(join(ROOT, target, name), { recursive: true, force: true });
   cpSync(source, join(ROOT, target), { recursive: true, filter: (src) => !src.split(sep).some((part) => part === "node_modules" || part === "dist") });
   writeFileSync(pinPath, keep);
   const next = { ...pin, commit: head, digest: treeDigest(join(ROOT, target)) };

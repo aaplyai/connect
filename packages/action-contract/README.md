@@ -88,9 +88,13 @@ const checked = await verifyApprovedAction(value, { now: Date.now(), audience: "
 ```
 
 The HMAC pair shares one secret (at least 32 bytes), so it suits an engine and a performer
-in one trust domain. Across trust domains, implement the ports with an asymmetric key, so
-the performer can verify but never sign. The key is the engine's own; never a service's
-credential.
+in one trust domain. Across trust domains, `ed25519ActionSigner` and `ed25519ActionVerifier`
+(Web Crypto; `generateEd25519KeyPair` makes a pair) let the performer verify but never sign.
+The key is the engine's own; never a service's credential.
+
+An operation contract may carry an `implementation` digest: an operation whose behaviour is
+declared data (a SQL statement, a request template) sets it, so a flow's pin covers that exact
+text. It enters `operationDigest` only when present.
 
 ### Checking
 
@@ -234,6 +238,8 @@ The suite checks that:
   same attempt is sent again in a version the port serves, as the engine sends it: the read,
   and with `performedWrite` (best a write that does not de-duplicate) that write too, so a port
   that claims its replay guard before it checks the version fails;
+- with `performedWrite` marked `idempotent: false` (its operation does not de-duplicate), the
+  same signed envelope sent twice is performed once and the second answer is `connect/replayed`;
 - nothing was sent before any refusal (`performed`).
 
 ## Versioning

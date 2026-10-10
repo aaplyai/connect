@@ -217,7 +217,10 @@ export interface ActionPortConformanceOptions {
    * A write the port performs and answers `ok`, best one whose operation does
    * not de-duplicate, so the port claims each attempt in its replay guard.
    * The case that sends an attempt again after refusing it for its contract
-   * version sends it as well as the read; without it, only the read.
+   * version sends it as well as the read; without it, only the read. When it
+   * says `idempotent: false` (its operation does not de-duplicate), a case
+   * also sends the same envelope twice and expects the second refused
+   * (`connect/replayed`); left out, that case does not run.
    */
   performedWrite?: ConformanceCall;
   /**
@@ -469,6 +472,21 @@ export function actionPortConformance(port: ActionPort, options: ActionPortConfo
       },
     },
   ];
+
+  // A write that does not de-duplicate is performed once per attempt, however often its envelope arrives.
+  const once = options.performedWrite;
+  if (once && once.idempotent === false) {
+    cases.push({
+      name: "performs a write that does not de-duplicate once, when the same envelope arrives again",
+      async run() {
+        // A transport retry after a lost answer delivers the same signed attempt twice; sending it twice could charge or mail twice.
+        const sealed = await envelope(once, "write");
+        const first = await send(sealed);
+        assert(first.status === "ok", `${once.action}: expected ok, got ${describe(first)}`);
+        await refused(`${once.action} delivered again`, sealed, ["connect/replayed"]);
+      },
+    });
+  }
 
   // A port that describes itself must describe what it does.
   if (typeof port.describe === "function") {

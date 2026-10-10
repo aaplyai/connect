@@ -7,9 +7,9 @@
  * {@link ApprovedActionSigner}, the performer an {@link ApprovedActionVerifier}.
  * The reference {@link hmacActionSigner} and {@link hmacActionVerifier} share
  * one secret, so they suit an engine and performer in one trust domain;
- * across trust domains, implement the same ports with an asymmetric key
- * (Ed25519 through Web Crypto, or a KMS), so the performer can verify but
- * never sign. The key signs envelopes only: it is the engine's own, never a
+ * across trust domains, use {@link ed25519ActionSigner} and
+ * {@link ed25519ActionVerifier} (or the same ports over a KMS), so the
+ * performer can verify but never sign. The key signs envelopes only: it is the engine's own, never a
  * third party's credential.
  */
 
@@ -20,7 +20,7 @@ import type { Scope } from "./scope.js";
 
 /** A signature over an approved action's {@link approvedActionSigningBytes}. */
 export interface ActionProof {
-  /** The algorithm, such as `HS256` or `EdDSA`. `none` marks an unsigned envelope, which every verifier refuses. */
+  /** The algorithm, such as `HS256` or `Ed25519`. `none` marks an unsigned envelope, which every verifier refuses. */
   alg: string;
   /** Which key signed it, so keys can rotate. */
   keyId: string;

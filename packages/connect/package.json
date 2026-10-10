@@ -1,7 +1,7 @@
 {
   "name": "@aaply/connect",
-  "version": "0.0.0",
-  "description": "Aaply Connect: holds credentials and performs the actions the Flow Engine approves.",
+  "version": "0.1.0",
+  "description": "Aaply Connect: holds credentials and performs the actions the Flow Engine approves: the performer, policy, connections, vault, safe egress, the PostgreSQL store and the HTTP routes.",
   "type": "module",
   "license": "UNLICENSED",
   "private": true,
@@ -12,6 +12,21 @@
       "source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./postgres": {
+      "source": "./src/postgres.ts",
+      "types": "./dist/postgres.d.ts",
+      "default": "./dist/postgres.js"
+    },
+    "./http": {
+      "source": "./src/http.ts",
+      "types": "./dist/http.d.ts",
+      "default": "./dist/http.js"
+    },
+    "./testing": {
+      "source": "./src/testing.ts",
+      "types": "./dist/testing.d.ts",
+      "default": "./dist/testing.js"
     }
   },
   "files": [
@@ -23,6 +38,11 @@
   },
   "dependencies": {
     "@aaply/action-contract": "workspace:*",
-    "@aaply/connector-sdk": "workspace:*"
+    "@aaply/connector-sdk": "workspace:*",
+    "pg": "^8.23.1",
+    "undici": "7.29.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1"
   }
 }

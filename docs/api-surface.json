@@ -1,12 +1,15 @@
 {
   "$comment": "The public surface of every package entry. budgets: the most names an entry may export. entries: what each exports, as name:v (a value) or name:t (a type only). Checked by test/api-surface.test.ts; UPDATE_API=1 rewrites entries, never budgets.",
   "budgets": {
-    "@aaply/action-contract": 162,
+    "@aaply/action-contract": 169,
     "@aaply/action-contract/conformance": 17,
     "@aaply/action-contract/internal": 9,
     "@aaply/connector-sdk": 79,
     "@aaply/connector-sdk/testing": 15,
-    "@aaply/connect": 60
+    "@aaply/connect": 60,
+    "@aaply/connect/postgres": 10,
+    "@aaply/connect/http": 8,
+    "@aaply/connect/testing": 12
   },
   "entries": {
     "@aaply/action-contract": [
@@ -53,7 +56,10 @@
       "Diagnostic:t",
       "DiagnosticBag:v",
       "DiagnosticsError:v",
+      "ED25519_PROOF_ALG:v",
       "ENVIRONMENT_KINDS:v",
+      "Ed25519KeyPair:t",
+      "Ed25519PublicKey:t",
       "EnvironmentKind:t",
       "FixedPattern:t",
       "FoundBlobRef:t",
@@ -119,10 +125,14 @@
       "dateMs:v",
       "dateTimeMs:v",
       "describeType:v",
+      "ed25519ActionSigner:v",
+      "ed25519ActionVerifier:v",
       "environmentAllows:v",
       "findBlobRefs:v",
       "fingerprint:v",
       "formatPath:v",
+      "fromBase64Url:v",
+      "generateEd25519KeyPair:v",
       "getPath:v",
       "hasBlobRefs:v",
       "hasOwn:v",
@@ -204,7 +214,46 @@
       "patternMatches:v"
     ],
     "@aaply/connect": [
-      "CONNECT_VERSION:v"
+      "CONNECT_VERSION:v",
+      "Connect:t",
+      "ConnectAdmin:t",
+      "ConnectOptions:t",
+      "Connection:t",
+      "ConnectionOwner:t",
+      "ConnectionStatus:t",
+      "DEFAULT_ROLE:v",
+      "EgressOptions:t",
+      "EgressPolicy:t",
+      "KeyProvider:t",
+      "NewConnectionInput:t",
+      "TokenRefresher:t",
+      "createConnect:v",
+      "egressPolicy:v",
+      "localKeyProvider:v"
+    ],
+    "@aaply/connect/postgres": [
+      "APP_ROLE:v",
+      "ConnectStore:t",
+      "Installation:t",
+      "Resolution:t",
+      "SCHEMA_VERSION:v",
+      "StoreConflict:v",
+      "createPgStore:v",
+      "migrate:v"
+    ],
+    "@aaply/connect/http": [
+      "ConnectHandler:t",
+      "ConnectHttpOptions:t",
+      "ServedConnect:t",
+      "createConnectHandler:v",
+      "serveConnect:v"
+    ],
+    "@aaply/connect/testing": [
+      "TestDatabase:t",
+      "postgresUnavailable:v",
+      "startTestDatabase:v",
+      "testEngineKeys:v",
+      "testKeyProvider:v"
     ],
     "@aaply/connector-sdk": [
       "AuthSpec:t",
