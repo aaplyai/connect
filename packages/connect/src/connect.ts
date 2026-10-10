@@ -10,9 +10,10 @@
 import type pg from "pg";
 import { ed25519ActionVerifier, type ActionOutcome, type ActionPortDescription, type Ed25519PublicKey, type EnvironmentKind, type JsonObject, type OperationContract, type Scope } from "@aaply/action-contract";
 import { operationContractOf, type Connector, type ConnectorLogSink, type FetchLike } from "@aaply/connector-sdk";
-import { adminAs, AdminError, loggedAdmin, type ActorAdmin, type AdminActor } from "./admin.js";
+import { adminAs, AdminError, loggedAdmin, type ActorAdmin, type AdminActor, type RawAdmin } from "./admin.js";
 import { createAdminRoutes, type AdminAnswer, type AdminRequest } from "./admin-http.js";
 import { secretProblem, type TokenRefresher } from "./credentials.js";
+import { createOAuth, type OAuth, type OAuthAnswer, type OAuthOptions, type StartOAuthInput } from "./oauth/oauth.js";
 import { egressPolicy, safeFetch, type EgressOptions } from "./egress.js";
 import { newId } from "./ids.js";
 import { compareVersions } from "./semver.js";
@@ -20,6 +21,7 @@ import { createPerformer, DEFAULT_ROLE } from "./performer.js";
 import { sqlConnector } from "./sql/connector.js";
 import { definitionDigest, sqlDefinitionProblems, type SqlConnectorDefinition } from "./sql/definition.js";
 import { createSqlExecutor, sqlTargetProblem, type SqlExecutor } from "./sql/executor.js";
+import { createOAuthStore } from "./store/oauth-store.js";
 import { createPgStore, type Connection } from "./store/store.js";
 import { createVault, type KeyProvider } from "./vault.js";
 
@@ -44,8 +46,14 @@ export interface ConnectOptions {
   /** Wraps tenants' data keys (`localKeyProvider`, or a KMS). */
   keys: KeyProvider;
   egress?: EgressOptions;
-  /** The OAuth module's token refresh. Without it, a refused token answers `http/401`. */
-  refresher?: TokenRefresher;
+  /**
+   * OAuth: Connect's callback, the app origins people return to, and Aaply's
+   * client at each provider per OAuth connector. Connect then connects
+   * accounts (`admin.startOAuth`, `/oauth/*`) and renews their tokens.
+   * Without it, OAuth connectors cannot be connected, and a refused token
+   * answers `http/401`.
+   */
+  oauth?: OAuthOptions;
   /** Longest a call may run, in ms. Default 55 000. */
   ceilingMs?: number;
   /**
@@ -99,6 +107,13 @@ export interface ConnectAdmin {
   connection(tenantId: string, id: string): Promise<Connection | null>;
   connections(scope: Scope, filter?: { connectorId?: string; ownerSubject?: string }): Promise<Connection[]>;
   /**
+   * Starts connecting an account with OAuth (`ConnectOptions.oauth`): answers
+   * the link to send the person's browser to, valid for one use until
+   * `expiresAt`. The person lands on `returnTo` afterwards, with
+   * `connect=ok&connection=<id>` or `connect=error&reason=<code>`.
+   */
+  startOAuth(input: StartOAuthInput): Promise<{ url: string; expiresAt: number }>;
+  /**
    * The operation contracts of the connectors installed for a scope (their
    * newest version), as the engine's `pinActionContracts` takes them when a
    * host publishes a flow. A pin is `operationDigest(contract)`.
@@ -116,11 +131,25 @@ export interface Connect {
   adminAs(actor: AdminActor): ActorAdmin;
   /** One signed admin request (`@aaply/connect/http` routes `/admin/*` here). */
   adminRequest(request: AdminRequest): Promise<AdminAnswer>;
+  /** `GET /oauth/start` and `GET /oauth/callback` (`@aaply/connect/http` routes them here). */
+  oauthRequest(request: { path: string; query: URLSearchParams; cookie: string | undefined }): Promise<OAuthAnswer>;
   /** Whether the store answers. */
   ready(): Promise<boolean>;
   /** Deletes expired replay claims; run it every minute from any instance (several at once is safe). */
   purgeExpired(): Promise<number>;
   close(): Promise<void>;
+}
+
+/** A Cookie header's pairs (the first of a repeated name wins). */
+function parseCookies(header: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const part of (header ?? "").split(";")) {
+    const i = part.indexOf("=");
+    if (i <= 0) continue;
+    const name = part.slice(0, i).trim();
+    if (!(name in out)) out[name] = part.slice(i + 1).trim();
+  }
+  return out;
 }
 
 function newest(connectors: readonly Connector[], id: string): Connector | undefined {
@@ -135,6 +164,9 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
   const vault = createVault({ keys: options.keys, store, ...(options.now ? { now: options.now } : {}) });
   const policy = egressPolicy(options.egress);
   const egress = safeFetch(policy, { connections: options.egress?.connectionsPerOrigin ?? 64 });
+  // The OAuth module needs the admin API, which needs the performer: the performer's refresher reaches it once built.
+  let oauth: OAuth | undefined;
+  let refresher: TokenRefresher | undefined;
   const sql = createSqlExecutor({ egress: policy, ...(options.egress?.sqlPrivateTenants ? { privateTenants: options.egress.sqlPrivateTenants } : {}) });
   const performer = createPerformer({
     audience: options.audience,
@@ -144,7 +176,7 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
     vault,
     fetch: options.fetch ?? egress.fetch,
     sql,
-    ...(options.refresher ? { refresher: options.refresher } : {}),
+    ...(options.oauth ? { refresher: { refresh: (request) => refresher!.refresh(request) } satisfies TokenRefresher } : {}),
     ...(options.now ? { now: options.now } : {}),
     ...(options.ceilingMs !== undefined ? { ceilingMs: options.ceilingMs } : {}),
     ...(options.log ? { log: options.log } : {}),
@@ -175,7 +207,7 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
     return null;
   };
 
-  const raw: ConnectAdmin = {
+  const raw: RawAdmin = {
     async install(scope, connectorId) {
       connectorOf(connectorId);
       const id = newId("inst");
@@ -231,9 +263,30 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
       }
       return store.updateConnection(tenantId, id, expectedVersion, fields, secret ? (version) => vault.seal(tenantId, id, version, secret) : undefined);
     },
-    revokeConnection: (tenantId, id) => store.revokeConnection(tenantId, id),
+    async revokeConnection(tenantId, id) {
+      // An OAuth grant is revoked at its provider too, as far as the provider allows: the secret is read before it is deleted.
+      const before = oauth ? await store.connection(tenantId, id) : null;
+      const secret = before && oauth?.serves(before.connectorId) && before.status !== "revoked" ? await oauth.secretOf(tenantId, id).catch(() => null) : null;
+      const revoked = await store.revokeConnection(tenantId, id);
+      if (revoked && secret) await oauth!.revokeAtProvider(before!.connectorId, secret);
+      return revoked;
+    },
     connection: (tenantId, id) => store.connection(tenantId, id),
     connections: (scope, filter) => store.connections(scope, filter),
+    async startOAuth(input, actor) {
+      if (!oauth) throw new AdminError("admin/invalid", "OAuth is not configured here");
+      const connector = newest(options.connectors, input.connectorId);
+      if (connector?.auth.kind !== "oauth2" || !oauth.serves(input.connectorId)) throw new AdminError("admin/invalid", `${input.connectorId} is not an OAuth connector served here`);
+      if (input.reconnect !== undefined) {
+        const c = await store.connection(input.scope.tenantId, input.reconnect);
+        const owner = "person" in input.owner ? input.owner.person : null;
+        const role = "business" in input.owner ? (input.owner.role ?? DEFAULT_ROLE) : null;
+        if (!c || c.status === "revoked") throw new AdminError("admin/not-found", `no connection ${input.reconnect}`);
+        if (c.connectorId !== input.connectorId || c.scope.appId !== input.scope.appId || c.scope.environmentId !== input.scope.environmentId || c.ownerSubject !== owner || (owner === null && c.role !== role) || c.environmentKind !== (input.environmentKind ?? "production"))
+          throw new AdminError("admin/invalid", "reconnect names a connection with another connector, scope, owner or environment");
+      }
+      return oauth.start(input, actor);
+    },
     async operations(scope) {
       const out: Record<string, OperationContract> = {};
       for (const inst of await store.installations(scope)) {
@@ -254,6 +307,13 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
     admin: loggedAdmin(raw, store, { operator: true }),
     adminAs: (actor) => adminAs(raw, store, actor),
     adminRequest: (request) => adminRoutes(request),
+    async oauthRequest(request) {
+      if (!oauth) return { status: 404, text: "Not found." };
+      const cookies = parseCookies(request.cookie);
+      if (request.path === "/oauth/start") return oauth.begin(request.query.get("attempt") ?? "");
+      if (request.path === "/oauth/callback") return oauth.complete(request.query, cookies);
+      return { status: 404, text: "Not found." };
+    },
     async ready() {
       try {
         await options.pool.query("SELECT 1");
@@ -267,6 +327,23 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
       await Promise.all([egress.close(), sql.close()]);
     },
   };
+  if (options.oauth) {
+    const oauthStore = createOAuthStore(options.pool);
+    oauth = createOAuth({
+      config: options.oauth,
+      store,
+      oauthStore,
+      vault,
+      admin: raw,
+      fetch: options.fetch ?? egress.fetch,
+      scopesOf: (connectorId) => {
+        const auth = newest(options.connectors, connectorId)?.auth;
+        return auth?.kind === "oauth2" ? auth.scopes : [];
+      },
+      ...(options.now ? { now: options.now } : {}),
+    });
+    refresher = oauth.refresher(async (tenantId, connectionId) => (await store.connection(tenantId, connectionId))?.connectorId ?? null);
+  }
   const adminRoutes = options.adminKeys
     ? createAdminRoutes(connect, { audience: options.audience, verifier: ed25519ActionVerifier(options.adminKeys, options.now ? { now: options.now } : {}), store, ...(options.now ? { now: options.now } : {}) })
     : async (): Promise<AdminAnswer> => ({ status: 404, body: { error: { code: "admin/not-found", message: "the admin API is not enabled" } } });

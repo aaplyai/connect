@@ -1,13 +1,26 @@
 {
   "name": "@aaply/connectors",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "First-party connectors for Aaply Connect, one subpath each.",
   "type": "module",
   "license": "UNLICENSED",
   "private": true,
-  "exports": {},
-  "files": [],
+  "exports": {
+    "./gmail": {
+      "source": "./src/gmail.ts",
+      "types": "./dist/gmail.d.ts",
+      "default": "./dist/gmail.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
   "dependencies": {
+    "@aaply/action-contract": "workspace:*",
     "@aaply/connector-sdk": "workspace:*"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   }
 }

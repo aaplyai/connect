@@ -41,7 +41,7 @@ import {
   type ConnectorLogSink,
   type FetchLike,
 } from "@aaply/connector-sdk";
-import { headersOf, type TokenRefresher } from "./credentials.js";
+import { headersOf, nearExpiry, type TokenRefresher } from "./credentials.js";
 import { compareVersions } from "./semver.js";
 import { sqlConnector } from "./sql/connector.js";
 import { definitionDigest, type SqlConnectorDefinition } from "./sql/definition.js";
@@ -158,6 +158,15 @@ export function createPerformer(options: PerformerOptions): Performer {
     },
   };
 
+  /** Renews the call's OAuth token (once per connection across instances: the refresher's) and answers the new headers. */
+  const refreshed = async (s: CallState, signal: AbortSignal): Promise<Record<string, string>> => {
+    const c = s.resolution.connection;
+    const secret = await secretOf(s);
+    if (!c || !secret || s.connector?.auth.kind !== "oauth2") throw new ConnectorError("final", "connect/reconsent", "This account needs to be connected again.");
+    s.secret = await whileOpen(s.signal, options.refresher!.refresh({ tenantId: s.tenantId, connectionId: c.id, version: c.version, secret, signal: AbortSignal.any([signal, s.signal]) }));
+    return headersOf(s.connector.auth, s.secret);
+  };
+
   const portFor = (connector: Connector): ConnectorActionPort =>
     createConnectorActionPort({
       audience: options.audience,
@@ -182,20 +191,19 @@ export function createPerformer(options: PerformerOptions): Performer {
       credentials: {
         headers: async () => {
           const s = state();
-          return s.connector ? headersOf(s.connector.auth, await secretOf(s)) : {};
-        },
-        ...(options.refresher
-          ? {
-              refresh: async (request) => {
-                const s = state();
-                const c = s.resolution.connection;
-                const secret = await secretOf(s);
-                if (!c || !secret || s.connector?.auth.kind !== "oauth2") throw new ConnectorError("final", "connect/reconsent", "This account needs to be connected again.");
-                s.secret = await whileOpen(s.signal, options.refresher!.refresh({ tenantId: s.tenantId, connectionId: c.id, version: c.version, secret, signal: AbortSignal.any([request.signal, s.signal]) }));
-                return headersOf(s.connector.auth, s.secret);
-              },
+          if (!s.connector) return {};
+          const secret = await secretOf(s);
+          // A token about to run out is renewed first, so a long call does not fail half way; until it has run out, the old one still serves.
+          if (options.refresher && s.connector.auth.kind === "oauth2" && nearExpiry(secret, now())) {
+            try {
+              return await refreshed(s, s.signal);
+            } catch (error) {
+              if (!(error instanceof ConnectorError && error.kind === "retryable" && Number(secret?.expiresAt) > now())) throw error;
             }
-          : {}),
+          }
+          return headersOf(s.connector.auth, secret);
+        },
+        ...(options.refresher ? { refresh: (request: { signal: AbortSignal }) => refreshed(state(), request.signal) } : {}),
       },
     });
 

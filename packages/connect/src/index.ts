@@ -11,6 +11,9 @@
  *   change is in the admin log.
  * - Declared SQL connectors are data (`SqlConnectorDefinition`), installed per
  *   scope with `admin.installSql` and checked by `sqlDefinitionProblems`.
+ * - OAuth connectors are connected by the person's browser
+ *   (`admin.startOAuth`, `ConnectOptions.oauth`); `oauthProviders` are the
+ *   providers Aaply knows (Google, Notion), as data.
  * - `localKeyProvider` wraps tenants' data keys with one local key.
  * - `egressPolicy` is the network check under every socket Connect opens.
  *
@@ -28,7 +31,8 @@ export {
 } from "./connect.js";
 export { ADMIN_ROLE, AdminError, type ActorAdmin, type AdminActor, type AdminErrorCode } from "./admin.js";
 export type { AdminAnswer, AdminRequest } from "./admin-http.js";
-export type { TokenRefresher } from "./credentials.js";
+export type { OAuthAnswer, OAuthOptions, StartOAuthInput } from "./oauth/oauth.js";
+export { oauthProviders, type OAuthProvider } from "./oauth/providers.js";
 export { egressPolicy, type EgressOptions, type EgressPolicy } from "./egress.js";
 export { DEFAULT_ROLE } from "./performer.js";
 export { sqlDefinitionProblems, type SqlConnectorDefinition, type SqlOperation, type SqlRows, type SqlStatement } from "./sql/definition.js";

@@ -9,7 +9,8 @@
     "@aaply/connect": 60,
     "@aaply/connect/postgres": 10,
     "@aaply/connect/http": 8,
-    "@aaply/connect/testing": 12
+    "@aaply/connect/testing": 12,
+    "@aaply/connectors/gmail": 6
   },
   "entries": {
     "@aaply/action-contract": [
@@ -234,15 +235,19 @@
       "EgressPolicy:t",
       "KeyProvider:t",
       "NewConnectionInput:t",
+      "OAuthAnswer:t",
+      "OAuthOptions:t",
+      "OAuthProvider:t",
       "SqlConnectorDefinition:t",
       "SqlOperation:t",
       "SqlRows:t",
       "SqlStatement:t",
       "SqlTarget:t",
-      "TokenRefresher:t",
+      "StartOAuthInput:t",
       "createConnect:v",
       "egressPolicy:v",
       "localKeyProvider:v",
+      "oauthProviders:v",
       "sqlDefinitionProblems:v"
     ],
     "@aaply/connect/postgres": [
@@ -368,6 +373,12 @@
       "connectorConformanceCases:v",
       "mockFetch:v",
       "testConnector:v"
+    ],
+    "@aaply/connectors/gmail": [
+      "GMAIL_SEND_SCOPE:v",
+      "GMAIL_SEND_URL:v",
+      "GmailSendInput:t",
+      "gmail:v"
     ]
   }
 }

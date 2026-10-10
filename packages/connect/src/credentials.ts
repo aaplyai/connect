@@ -48,3 +48,9 @@ export interface TokenRefresher {
   /** Answers the refreshed secret (already saved), or throws a `ConnectorError` (`final` `connect/reconsent` when the grant is gone). */
   refresh(request: { tenantId: string; connectionId: string; version: number; secret: Readonly<Record<string, string>>; signal: AbortSignal }): Promise<Readonly<Record<string, string>>>;
 }
+
+/** Whether an OAuth secret's access token runs out within a minute, so it is renewed before use. */
+export function nearExpiry(secret: Readonly<Record<string, string>> | null, now: number): boolean {
+  const at = Number(secret?.expiresAt);
+  return Number.isFinite(at) && at - now < 60_000;
+}

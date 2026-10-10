@@ -11,14 +11,14 @@
  */
 
 /** The schema this build writes and reads. A database with another is refused. */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /** The role the service's login role is a member of. */
 export const APP_ROLE = "aaply_connect_app";
 
 const TENANT = "current_setting('aaply_connect.tenant', true)";
 
-const TENANT_TABLES = ["data_keys", "policy", "installations", "connections", "secrets", "replay_claims", "admin_log"] as const;
+const TENANT_TABLES = ["data_keys", "policy", "installations", "connections", "secrets", "replay_claims", "admin_log", "refresh_leases"] as const;
 
 /** Tables the app role may change; the admin log is append-only to it. */
 const WRITABLE_TABLES = TENANT_TABLES.filter((t) => t !== "admin_log");
@@ -137,6 +137,49 @@ CREATE TABLE aaply_connect.admin_log (
 );
 CREATE INDEX admin_log_tenant_at ON aaply_connect.admin_log (tenant_id, at DESC, id DESC);
 
+-- Who is refreshing a connection's OAuth token: one instance at a time, until the lease runs out.
+CREATE TABLE aaply_connect.refresh_leases (
+  connection_id text PRIMARY KEY,
+  tenant_id text NOT NULL,
+  holder text NOT NULL,
+  until timestamptz NOT NULL
+);
+
+-- OAuth connection attempts: single use, short-lived, bound to the browser that began them. The app role
+-- cannot read or write this table; only the functions below touch it (an attempt is found by its random id).
+CREATE TABLE aaply_connect.oauth_states (
+  id text PRIMARY KEY,
+  tenant_id text NOT NULL,
+  -- What to connect, for whom, and where to send the person back: { scope, connectorId, owner, environmentKind, actor, returnTo, reconnect }.
+  request jsonb NOT NULL,
+  -- The PKCE verifier: useless without the authorization code, which only the provider and the person's browser see.
+  verifier text NOT NULL,
+  -- SHA-256 of the browser's cookie nonce, set once when the browser opens the attempt.
+  nonce_hash text,
+  expires_at timestamptz NOT NULL
+);
+CREATE INDEX oauth_states_expires ON aaply_connect.oauth_states (expires_at);
+
+CREATE FUNCTION aaply_connect.oauth_state_create(p_id text, p_tenant text, p_request jsonb, p_verifier text, p_ttl_ms integer)
+RETURNS void LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  INSERT INTO aaply_connect.oauth_states (id, tenant_id, request, verifier, expires_at)
+  VALUES (p_id, p_tenant, p_request, p_verifier, now() + make_interval(secs => p_ttl_ms / 1000.0))
+$$;
+
+-- Binds an attempt to the browser that opens it, once.
+CREATE FUNCTION aaply_connect.oauth_state_begin(p_id text, p_nonce_hash text)
+RETURNS jsonb LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  UPDATE aaply_connect.oauth_states SET nonce_hash = p_nonce_hash WHERE id = p_id AND nonce_hash IS NULL AND expires_at > now()
+  RETURNING jsonb_build_object('tenantId', tenant_id, 'request', request, 'verifier', verifier)
+$$;
+
+-- Takes an attempt (once), for the browser that began it.
+CREATE FUNCTION aaply_connect.oauth_state_take(p_id text, p_nonce_hash text)
+RETURNS jsonb LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  DELETE FROM aaply_connect.oauth_states WHERE id = p_id AND nonce_hash = p_nonce_hash AND expires_at > now()
+  RETURNING jsonb_build_object('tenantId', tenant_id, 'request', request, 'verifier', verifier)
+$$;
+
 ${TENANT_TABLES.map(
   (t) => `ALTER TABLE aaply_connect.${t} ENABLE ROW LEVEL SECURITY;
 ALTER TABLE aaply_connect.${t} FORCE ROW LEVEL SECURITY;
@@ -199,7 +242,9 @@ CREATE FUNCTION aaply_connect.purge_expired(p_limit integer)
 RETURNS integer LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
   WITH gone AS (
     DELETE FROM aaply_connect.replay_claims WHERE ctid IN (SELECT ctid FROM aaply_connect.replay_claims WHERE until < now() LIMIT p_limit) RETURNING 1
-  ) SELECT count(*)::integer FROM gone
+  ), attempts AS (
+    DELETE FROM aaply_connect.oauth_states WHERE ctid IN (SELECT ctid FROM aaply_connect.oauth_states WHERE expires_at < now() LIMIT p_limit) RETURNING 1
+  ) SELECT ((SELECT count(*) FROM gone) + (SELECT count(*) FROM attempts))::integer
 $$;
 
 DO $$ BEGIN
@@ -210,6 +255,7 @@ GRANT SELECT ON aaply_connect.meta TO ${APP_ROLE};
 GRANT SELECT, UPDATE ON aaply_connect.global_policy TO ${APP_ROLE};
 GRANT SELECT, INSERT, UPDATE, DELETE ON ${WRITABLE_TABLES.map((t) => `aaply_connect.${t}`).join(", ")} TO ${APP_ROLE};
 GRANT SELECT, INSERT ON aaply_connect.admin_log TO ${APP_ROLE};
-REVOKE ALL ON FUNCTION aaply_connect.resolve, aaply_connect.claim, aaply_connect.purge_expired FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION aaply_connect.resolve, aaply_connect.claim, aaply_connect.purge_expired TO ${APP_ROLE};
+REVOKE ALL ON aaply_connect.oauth_states FROM PUBLIC;
+REVOKE ALL ON FUNCTION aaply_connect.resolve, aaply_connect.claim, aaply_connect.purge_expired, aaply_connect.oauth_state_create, aaply_connect.oauth_state_begin, aaply_connect.oauth_state_take FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION aaply_connect.resolve, aaply_connect.claim, aaply_connect.purge_expired, aaply_connect.oauth_state_create, aaply_connect.oauth_state_begin, aaply_connect.oauth_state_take TO ${APP_ROLE};
 `;

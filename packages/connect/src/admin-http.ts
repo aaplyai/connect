@@ -27,7 +27,7 @@ const WINDOW_MS = 60_000;
 const H = { key: "x-aaply-key", sig: "x-aaply-signature", time: "x-aaply-time", nonce: "x-aaply-nonce" } as const;
 
 /** The operations served, by path name. The global kill switch is not among them: it is the operator's. */
-const OPERATIONS = ["install", "installSql", "uninstall", "setPolicy", "createConnection", "updateConnection", "revokeConnection", "connection", "connections", "operations", "log"] as const;
+const OPERATIONS = ["install", "installSql", "uninstall", "setPolicy", "createConnection", "updateConnection", "revokeConnection", "connection", "connections", "operations", "log", "startOAuth"] as const;
 type Operation = (typeof OPERATIONS)[number];
 
 function signingBytes(r: { audience: string; method: string; path: string; time: string; nonce: string; body: string }): Uint8Array {
@@ -145,6 +145,9 @@ function run(admin: ActorAdmin, op: Operation, b: Record<string, any>): Promise<
     case "log":
       need("tenantId");
       return admin.log(b.tenantId, b.page ?? {});
+    case "startOAuth":
+      need("input");
+      return admin.startOAuth(b.input);
   }
 }
 
@@ -194,6 +197,7 @@ export function createAdminClient(options: AdminClientOptions): { as(actor: Admi
         connections: (scope, filter) => call(actor, "connections", { scope, ...(filter ? { filter } : {}) }),
         operations: (scope) => call(actor, "operations", { scope }),
         log: (tenantId, page) => call(actor, "log", { tenantId, ...(page ? { page } : {}) }),
+        startOAuth: (input) => call(actor, "startOAuth", { input }),
       };
     },
   };
