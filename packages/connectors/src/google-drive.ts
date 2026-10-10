@@ -13,7 +13,8 @@
  * - `files.get`, `files.list` (paged) and `files.download` read.
  * - `files.trash` moves a file to Drive's trash and needs at least a
  *   person's confirmation.
- * - `files.removeCreated` trashes a file only if this connector uploaded it.
+ * - `files.removeCreated` trashes only the file one upload made: the flow
+ *   passes the upload's `id` and `mark`, and the file must carry that mark.
  *
  * Downloads larger than 16 MiB need the deployment to raise the kit's
  * `maxTotalResponseBytes` (`ConnectOptions.httpLimits`); a file is at most
@@ -50,7 +51,7 @@ export const googleDrive = defineConnector({
         properties: { file: BLOB_REF_SCHEMA, name: plainText(255), parentId: fileId, description: { type: "string", maxLength: 2000 } },
         additionalProperties: false,
       },
-      output: fileSchema,
+      output: { ...fileSchema, required: [...(fileSchema.required ?? []), "mark"], properties: { ...fileSchema.properties, mark: { type: "string" } } },
       // A file reference is plain JSON; its interface type has no index signature.
       handler: (input, ctx) => upload(ctx, input as unknown as UploadInput),
     },
@@ -104,12 +105,12 @@ export const googleDrive = defineConnector({
     },
     "files.removeCreated": {
       title: "Remove an uploaded file",
-      description: "The undo of an upload: moves the file to the trash, only if this connector uploaded it.",
+      description: "The undo of an upload: moves the file to the trash, only the file that upload made (its id and mark).",
       effect: "write",
       idempotent: true,
-      input: byId,
+      input: { type: "object", required: ["fileId", "mark"], properties: { fileId, mark: { type: "string", pattern: "^[0-9a-f]{40}$" } }, additionalProperties: false },
       output: { type: "object", required: ["fileId", "trashed"], properties: { fileId: { type: "string" }, trashed: { const: true } }, additionalProperties: false },
-      handler: (input: { fileId: string }, ctx) => removeCreated(ctx, input.fileId),
+      handler: (input: { fileId: string; mark: string }, ctx) => removeCreated(ctx, input.fileId, input.mark),
     },
   },
 });

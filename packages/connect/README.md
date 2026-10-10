@@ -48,7 +48,8 @@ await serveConnect(connect, { port: 8080, host: "0.0.0.0", performToken: process
    envelope reaching two instances is performed once.
 
 Each call is cut off 2 s before its deadline and at 55 s, and `serveConnect` lets calls in flight finish
-when it shuts down.
+when it shuts down. Shut down with `await served.close()` and then `await connect.close()`, which also
+waits (up to 10 s) for the deletes of files calls stored and did not answer.
 
 ## Files
 
@@ -58,6 +59,12 @@ from, scoped by tenant, app and environment. A handler reads only a file named i
 one it stored itself; what a call stores and does not answer is deleted when the call ends. The
 backend deletes the rest when runs release them (the engine's blob ledger); Connect never deletes a
 file a run still names. Without `files`, those operations answer `connect/blob-no-store`.
+
+A file is held in memory while a call moves it (a 25 MiB download peaks near three copies), so size
+Connect's instances for the calls they run at once. `httpLimits` applies to every connector: raising
+`maxTotalResponseBytes` for Drive raises it for all. A Docs, Sheets or Slides export arrives in one
+response, so it is bounded by `maxResponseBytes` (5 MiB by default), and binary downloads by
+`maxTotalResponseBytes` (16 MiB by default) as well as the file store's 25 MiB.
 
 ## The database
 

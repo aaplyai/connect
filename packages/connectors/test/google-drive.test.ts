@@ -14,7 +14,7 @@ type Stored = { id: string; name: string; mimeType: string; bytes: Uint8Array; p
 /** A Drive that keeps files in memory and speaks the parts of the API the connector uses. */
 function fakeDrive(options: { chunkKeep?: (offset: number, length: number) => number; rateLimit?: number } = {}) {
   const files = new Map<string, Stored>();
-  const sessions = new Map<string, { meta: Record<string, any>; total: number; got: Uint8Array[]; held: number }>();
+  const sessions = new Map<string, { meta: Record<string, any>; total: number; got: Uint8Array[]; held: number; done?: string }>();
   const log: string[] = [];
   let next = 1;
   let rateLimit = options.rateLimit ?? 0;
@@ -38,6 +38,7 @@ function fakeDrive(options: { chunkKeep?: (offset: number, length: number) => nu
         return new Response(null, { status: 200, headers: { location: `${UPLOAD}?uploadType=resumable&upload_id=${id}` } });
       }
       const s = sessions.get(url.searchParams.get("upload_id")!)!;
+      if (s.done) return json({ id: s.done });
       const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(headers.get("content-range") ?? "");
       if (range) {
         if (Number(range[1]) !== s.held) return json({ error: "bad offset" }, 400);
@@ -47,12 +48,15 @@ function fakeDrive(options: { chunkKeep?: (offset: number, length: number) => nu
       }
       if (s.held < s.total) return new Response(null, { status: 308, headers: s.held > 0 ? { range: `bytes=0-${s.held - 1}` } : {} });
       const id = `f${next++}`;
+      s.done = id;
       const all = new Uint8Array(Buffer.concat(s.got));
       files.set(id, { id, name: s.meta.name, mimeType: s.meta.mimeType, bytes: all, ...(s.meta.parents ? { parents: s.meta.parents } : {}), appProperties: s.meta.appProperties, trashed: false });
       return json({ id, kind: "drive#file" });
     }
     const path = url.pathname.slice("/drive/v3/files".length);
     if (path === "" && method === "GET") {
+      // Shared drives' files are listed only when asked for.
+      if (url.searchParams.get("includeItemsFromAllDrives") !== "true" || url.searchParams.get("supportsAllDrives") !== "true") return json({ files: [] });
       const q = url.searchParams.get("q") ?? "";
       const mark = /value='([0-9a-f]+)'/.exec(q)?.[1];
       const named = /name contains '((?:[^'\\]|\\.)*)'/.exec(q)?.[1]?.replace(/\\(.)/g, "$1");
@@ -113,6 +117,34 @@ describe("google-drive files.upload", () => {
     const content = bytesOf(3 * 1024 * 1024);
     const out = (await t.run("files.upload", { file: await stored(blobs, content) })) as { id: string };
     expect(Buffer.compare(drive.files.get(out.id)!.bytes, content)).toBe(0);
+  });
+
+  it("asks the same session what it holds after a part fails, and finishes there instead of starting over", async () => {
+    let failNext = 2;
+    const drive = fakeDrive();
+    const blobs = memoryBlobStore();
+    // The second PUT is applied but its answer is a 503: the status query shows the file is complete.
+    const flaky: FetchLike = async (input, init) => {
+      const res = await drive.fetch(input, init);
+      if ((init.method ?? "GET") === "PUT" && new Headers(init.headers).get("content-range")?.startsWith("bytes 4194304") && --failNext === 1) return new Response("{}", { status: 503 });
+      return res;
+    };
+    const t = testConnector(googleDrive, { fetch: flaky, blobs });
+    const content = bytesOf(6 * 1024 * 1024);
+    const out = (await t.run("files.upload", { file: await stored(blobs, content) })) as { id: string };
+    expect(Buffer.compare(drive.files.get(out.id)!.bytes, content)).toBe(0);
+    expect(drive.files.size).toBe(1);
+    expect(drive.log.filter((l) => l === `POST ${UPLOAD}`).length).toBe(1);
+    // Two parts and one status query.
+    expect(drive.log.filter((l) => l === `PUT ${UPLOAD}?session`).length).toBe(3);
+  });
+
+  it("answers retryable when the upload session is gone, so the action starts over", async () => {
+    const drive = fakeDrive();
+    const blobs = memoryBlobStore();
+    const gone: FetchLike = async (input, init) => ((init.method ?? "GET") === "PUT" ? new Response("Not Found", { status: 404 }) : drive.fetch(input, init));
+    const t = testConnector(googleDrive, { fetch: gone, blobs });
+    expect(await t.call("files.upload", { file: await stored(blobs, bytesOf(10)) })).toMatchObject({ status: "retryable", error: { code: "drive/upload-expired" } });
   });
 
   it("uploads an empty file", async () => {
@@ -182,14 +214,18 @@ describe("google-drive trash and undo", () => {
     const blobs = memoryBlobStore();
     drive.put({ id: "theirs", name: "Theirs", mimeType: "text/plain", bytes: bytesOf(1) });
     const t = testConnector(googleDrive, { fetch: drive.fetch, blobs });
-    expect(await t.call("files.removeCreated", { fileId: "theirs" })).toMatchObject({ status: "final", error: { code: "drive/not-created-here" } });
+    const mark = "a".repeat(40);
+    expect(await t.call("files.removeCreated", { fileId: "theirs", mark })).toMatchObject({ status: "final", error: { code: "drive/not-created-here" } });
     expect(drive.files.get("theirs")!.trashed).toBe(false);
 
-    const up = (await t.run("files.upload", { file: await stored(blobs, bytesOf(100)) })) as { id: string };
-    expect(await t.run("files.removeCreated", { fileId: up.id })).toEqual({ fileId: up.id, trashed: true });
+    const up = (await t.run("files.upload", { file: await stored(blobs, bytesOf(100)) }, { idempotencyKey: "u1" })) as { id: string; mark: string };
+    const other = (await t.run("files.upload", { file: await stored(blobs, bytesOf(100)) }, { idempotencyKey: "u2" })) as { id: string; mark: string };
+    // Another upload's mark does not undo this one.
+    expect(await t.call("files.removeCreated", { fileId: up.id, mark: other.mark })).toMatchObject({ status: "final", error: { code: "drive/not-created-here" } });
+    expect(await t.run("files.removeCreated", { fileId: up.id, mark: up.mark })).toEqual({ fileId: up.id, trashed: true });
     expect(drive.files.get(up.id)!.trashed).toBe(true);
-    expect(await t.run("files.removeCreated", { fileId: up.id })).toEqual({ fileId: up.id, trashed: true });
-    expect(await t.run("files.removeCreated", { fileId: "gone" })).toEqual({ fileId: "gone", trashed: true });
+    expect(await t.run("files.removeCreated", { fileId: up.id, mark: up.mark })).toEqual({ fileId: up.id, trashed: true });
+    expect(await t.run("files.removeCreated", { fileId: "gone", mark })).toEqual({ fileId: "gone", trashed: true });
 
     expect(await t.run("files.trash", { fileId: "theirs" })).toMatchObject({ id: "theirs", trashed: true });
   });

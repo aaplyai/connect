@@ -82,8 +82,20 @@ describe("notion", () => {
     t.mock!.on(`GET ${NOTION_API}/pages/${PAGE}`, { json: page({ created_by: { object: "user", id: "a-person" } }) });
     expect(await t.call("pages.removeCreated", { pageId: PAGE })).toMatchObject({ status: "final", error: { code: "notion/not-created-here" } });
 
+    // Not shared any more: a person must look, it is not counted as removed.
     t.mock!.on(`GET ${NOTION_API}/pages/${PAGE}`, { status: 404, json: { object: "error", code: "object_not_found" } });
-    expect(await t.run("pages.removeCreated", { pageId: PAGE })).toEqual({ pageId: PAGE, inTrash: true });
+    expect(await t.call("pages.removeCreated", { pageId: PAGE })).toMatchObject({ status: "final", error: { code: "notion/not-accessible" } });
+  });
+
+  it("answers unknown for a create Notion answered 503, since it may have been saved, and retryable for an overload", async () => {
+    const t = testConnector(notion, { routes: { [`POST ${NOTION_API}/pages`]: { status: 503, json: { code: "service_unavailable" } }, [`GET ${NOTION_API}/pages/${PAGE}`]: { status: 529, headers: { "retry-after": "2" }, json: { code: "service_overload" } } } });
+    expect(await t.call("pages.create", { parent: { pageId: PAGE }, properties: {} })).toMatchObject({ status: "unknown", error: { code: "http/503" } });
+    expect(await t.call("pages.get", { pageId: PAGE })).toMatchObject({ status: "retryable", retryAfterMs: 2000 });
+  });
+
+  it("answers only pages from a wiki's data source, which lists child data sources too", async () => {
+    const t = testConnector(notion, { routes: { [`POST ${NOTION_API}/data_sources/${DS}/query`]: { json: { results: [{ object: "data_source", id: DS }, page()], has_more: false, next_cursor: null } } } });
+    expect(await t.run("dataSources.query", { dataSourceId: DS })).toMatchObject({ results: [{ id: PAGE }] });
   });
 
   it("answers a conflict as retryable and rate limits with Notion's wait", async () => {

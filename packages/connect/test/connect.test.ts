@@ -301,7 +301,7 @@ describe.skipIf(postgresUnavailable())("Connect", () => {
       version: "1.0.0",
       title: "Copier",
       auth: { kind: "none" },
-      egress: [],
+      egress: ["GET notes.example.com/v1/notes/*"],
       operations: {
         upper: {
           title: "Upper-case a text file",
@@ -310,14 +310,24 @@ describe.skipIf(postgresUnavailable())("Connect", () => {
           output: { type: "object", required: ["file"], properties: { file: BLOB_REF_SCHEMA }, additionalProperties: false },
           async handler(input, ctx) {
             const text = new TextDecoder().decode(await ctx.blobs.get(input.file as unknown as BlobRef));
-            return { file: (await ctx.blobs.put(new TextEncoder().encode(text.toUpperCase()), { mediaType: "text/plain" })) as never };
+            const made = await ctx.blobs.put(new TextEncoder().encode(text.toUpperCase()), { mediaType: "text/plain" });
+            if (text === "fail") throw new Error("the handler failed after storing a file");
+            return { file: made as never };
           },
+        },
+        fetch: {
+          title: "Fetch",
+          effect: "read",
+          input: { type: "object" },
+          output: { type: "object" },
+          handler: async (_input, ctx) => (await ctx.http({ url: "https://notes.example.com/v1/notes/n1" })).ensureOk().json() as never,
         },
       },
     });
     const store = memoryBlobStore();
     const files = await make({ connectors: [v1, copier], files: { store } });
     const none = await make({ connectors: [v1, copier] });
+    const tight = await make({ connectors: [v1, copier], files: { store, limits: { maxBlobBytes: 4 } }, httpLimits: { maxResponseBytes: 8 } });
     try {
       const s = { ...scope, tenantId: "tenant-files" };
       await files.admin.install(s, "copier");
@@ -334,10 +344,26 @@ describe.skipIf(postgresUnavailable())("Connect", () => {
 
       const foreign = await store.put(scope, { bytes, digest: await blobDigest(bytes), size: 5, mediaType: "text/plain" }, context);
       expect(await files.perform(await action({ file: foreign }))).toMatchObject({ status: "final", error: { code: "connect/invalid-input" } });
+      const otherApp = await store.put({ ...s, appId: "another-app" }, { bytes, digest: await blobDigest(bytes), size: 5, mediaType: "text/plain" }, context);
+      expect(await files.perform(await action({ file: otherApp }))).toMatchObject({ status: "final", error: { code: "connect/invalid-input" } });
       expect(await none.perform(await action({ file }))).toMatchObject({ status: "final", error: { code: "connect/blob-no-store" } });
+
+      // The limits reach the kit: a 5-byte file is over 4, and a response over 8 bytes is refused.
+      expect(await tight.perform(await action({ file }))).toMatchObject({ status: "final", error: { code: "connect/blob-too-large" } });
+      expect(await tight.perform(await sign({ scope: s, action: "copier.fetch", effect: "read", input: {}, effectId: `e-${++seq}` }))).toMatchObject({ status: "final", error: { code: "connect/response-too-large" } });
+
+      // A file stored by a call that then failed is deleted, and close waits for the delete.
+      const failing = new TextEncoder().encode("fail");
+      const input = await store.put(s, { bytes: failing, digest: await blobDigest(failing), size: 4, mediaType: "text/plain" }, context);
+      const held = store.count;
+      expect((await files.perform(await action({ file: input }))).status).not.toBe("ok");
+      await files.close();
+      expect(store.count).toBe(held);
+      expect(store.deletes.length).toBeGreaterThan(0);
     } finally {
       await files.close();
       await none.close();
+      await tight.close();
     }
   });
 

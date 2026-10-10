@@ -83,6 +83,8 @@ export interface PerformerOptions {
 export interface Performer {
   perform(value: unknown, signal?: AbortSignal): Promise<ActionOutcome>;
   describe(): ActionPortDescription;
+  /** Waits, up to `ms`, for the work calls left after answering (deletes of files no answer names). */
+  settle(ms: number): Promise<void>;
 }
 
 /** One version of a code connector, with its own kit port and its operations' digests. */
@@ -174,6 +176,13 @@ export function createPerformer(options: PerformerOptions): Performer {
     return headersOf(s.connector.auth, s.secret);
   };
 
+  // Deletes of files a call stored and did not answer run after the answer; shutdown waits for them.
+  const after = new Set<Promise<void>>();
+  const waitUntil = (work: Promise<void>): void => {
+    const tracked = work.catch(() => undefined).finally(() => after.delete(tracked));
+    after.add(tracked);
+  };
+
   const portFor = (connector: Connector): ConnectorActionPort =>
     createConnectorActionPort({
       audience: options.audience,
@@ -181,7 +190,7 @@ export function createPerformer(options: PerformerOptions): Performer {
       connectors: [connector],
       fetch: options.fetch,
       clock: { now },
-      ...(options.files ? { blobs: options.files.store, ...(options.files.limits ? { blobLimits: options.files.limits } : {}) } : {}),
+      ...(options.files ? { blobs: options.files.store, waitUntil, ...(options.files.limits ? { blobLimits: options.files.limits } : {}) } : {}),
       ...(options.httpLimits ? { limits: options.httpLimits } : {}),
       ...(options.log ? { log: options.log } : {}),
       ...(options.observer ? { observer: options.observer } : {}),
@@ -356,5 +365,11 @@ export function createPerformer(options: PerformerOptions): Performer {
       }
     },
     describe: () => ({ contracts: [...ACTION_CONTRACT_VERSIONS] }),
+    settle: async (ms) => {
+      if (after.size === 0) return;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([Promise.all(after), new Promise((resolve) => (timer = setTimeout(resolve, ms)))]);
+      clearTimeout(timer);
+    },
   };
 }

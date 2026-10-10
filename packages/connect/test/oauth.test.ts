@@ -44,6 +44,8 @@ describe.skipIf(postgresUnavailable())("OAuth connections", () => {
     const f = form(r);
     if (f.get("client_id") !== "aaply-client" || f.get("client_secret") !== "aaply-secret") return { status: 401, json: { error: "invalid_client" } };
     if (f.get("grant_type") === "refresh_token" && f.get("refresh_token") === "revoked-refresh") return { status: 400, json: { error: "invalid_grant" } };
+    // Notion's API errors name the error in `code`.
+    if (f.get("grant_type") === "refresh_token" && f.get("refresh_token") === "revoked-code") return { status: 400, json: { object: "error", status: 400, code: "invalid_grant" } };
     issued++;
     return { json: { access_token: `access-${issued}`, refresh_token: `refresh-${issued}`, expires_in: expiresIn, scope: `openid email ${GMAIL_SEND_SCOPE}`, token_type: "Bearer" } };
   };
@@ -335,6 +337,13 @@ describe.skipIf(postgresUnavailable())("OAuth connections", () => {
     setTimeout(() => void db.pool("postgres").query("DELETE FROM aaply_connect.refresh_leases WHERE holder = 'elsewhere'"), 300);
     expect(await connect.perform(await sign())).toMatchObject({ status: "ok" });
     expect(google.callsTo(TOKEN_URL).length).toBe(1);
+  });
+
+  it("reads a refused grant from `code` too, as Notion answers it", async () => {
+    const c = await connect.admin.createConnection({ scope: { ...scope, appId: "app-code" }, connectorId: "gmail", owner: { business: true }, grantedScopes: [GMAIL_SEND_SCOPE], secret: { accessToken: "old", refreshToken: "revoked-code", expiresAt: String(clock + 1000) } });
+    await connect.admin.install({ ...scope, appId: "app-code" }, "gmail");
+    expect(await connect.perform(await sign({ scope: { ...scope, appId: "app-code" } }))).toMatchObject({ status: "final", error: { code: "connect/reconsent" } });
+    expect((await connect.admin.connection(scope.tenantId, c.id))!.status).toBe("reauth");
   });
 
   it("lets a start link go unused for two minutes at most", async () => {

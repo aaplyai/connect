@@ -83,6 +83,9 @@ export interface ConnectOptions {
   observer?: { error?(error: unknown, where: string): void };
 }
 
+/** How long `close` waits for deletes of files calls stored and did not answer. */
+const CLOSE_SETTLE_MS = 10_000;
+
 /** Whose account a new connection is. */
 export type ConnectionOwner = { business: true; role?: string } | { person: string };
 
@@ -154,6 +157,7 @@ export interface Connect {
   ready(): Promise<boolean>;
   /** Deletes expired replay claims, OAuth attempts and dead refresh leases; run it every minute from any instance (several at once is safe). */
   purgeExpired(): Promise<number>;
+  /** Waits (up to 10 s) for deletes of files calls stored and did not answer, then closes the pools; once, however often called. Call it after `serveConnect`'s `close`. */
   close(): Promise<void>;
 }
 
@@ -201,6 +205,8 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
     ...(options.log ? { log: options.log } : {}),
     ...(options.observer ? { observer: options.observer } : {}),
   });
+
+  let closing: Promise<void> | undefined;
 
   const connectorOf = (id: string): Connector => {
     const c = newest(options.connectors, id);
@@ -346,9 +352,12 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
       }
     },
     purgeExpired: () => store.purgeExpired(),
-    close: async () => {
-      await Promise.all([egress.close(), sql.close()]);
-    },
+    close: () =>
+      (closing ??= (async () => {
+        // Deletes of files calls stored and did not answer, so none is left behind; then the pools.
+        await performer.settle(CLOSE_SETTLE_MS);
+        await Promise.all([egress.close(), sql.close()]);
+      })()),
   };
   if (options.oauth) {
     const oauthStore = createOAuthStore(options.pool);

@@ -2,8 +2,8 @@
 
 import { createHash } from "node:crypto";
 import { normalizeMediaType, type BlobRef, type JsonObject, type JsonSchema } from "@aaply/action-contract";
-import { ConnectorError, type OperationContext } from "@aaply/connector-sdk";
-import { googleOk } from "../google/errors.js";
+import { ConnectorError, type ConnectorResponse, type OperationContext } from "@aaply/connector-sdk";
+import { googleOk, retryableGoogle } from "../google/errors.js";
 
 export const DRIVE_API = "https://www.googleapis.com/drive/v3/files";
 export const DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3/files";
@@ -13,6 +13,11 @@ export const CREATED_BY_KEY = "aaplyKey";
 
 /** Every request and response stays under the kit's 5 MiB; Drive wants chunks in multiples of 256 KiB. */
 const CHUNK = 4 * 1024 * 1024;
+/** How many times one call asks an interrupted upload session what it holds. */
+const MAX_RESUMES = 3;
+
+/** Lists include shared drives, where a folder the person picked may be. */
+const ALL_DRIVES = { supportsAllDrives: true, includeItemsFromAllDrives: true } as const;
 
 const FIELDS = "id,name,mimeType,size,parents,webViewLink,createdTime,modifiedTime,trashed";
 
@@ -91,7 +96,7 @@ export function listQuery(input: ListInput): string {
 
 export async function listFiles(ctx: OperationContext, input: ListInput): Promise<{ files: DriveFile[]; nextPageToken?: string }> {
   const res = googleOk(
-    await ctx.http({ url: DRIVE_API, query: { q: listQuery(input), pageSize: input.pageSize ?? 50, pageToken: input.pageToken, fields: `nextPageToken,files(${FIELDS})`, spaces: "drive" } }),
+    await ctx.http({ url: DRIVE_API, query: { q: listQuery(input), pageSize: input.pageSize ?? 50, pageToken: input.pageToken, fields: `nextPageToken,files(${FIELDS})`, spaces: "drive", ...ALL_DRIVES } }),
     "drive",
   );
   const body = res.json() as { files?: unknown; nextPageToken?: unknown };
@@ -106,7 +111,7 @@ export function createdMark(idempotencyKey: string): string {
 
 async function findCreated(ctx: OperationContext, mark: string): Promise<DriveFile | null> {
   const res = googleOk(
-    await ctx.http({ url: DRIVE_API, query: { q: `appProperties has { key=${quoted(CREATED_BY_KEY)} and value=${quoted(mark)} } and trashed = false`, pageSize: 1, fields: `files(${FIELDS})`, spaces: "drive" } }),
+    await ctx.http({ url: DRIVE_API, query: { q: `appProperties has { key=${quoted(CREATED_BY_KEY)} and value=${quoted(mark)} } and trashed = false`, pageSize: 1, fields: `files(${FIELDS})`, spaces: "drive", ...ALL_DRIVES } }),
     "drive",
   );
   const files = (res.json() as { files?: unknown }).files;
@@ -122,10 +127,10 @@ export type UploadInput = { file: BlobRef; name?: string; parentId?: string; des
  * resumable, in 4 MiB chunks, so files larger than one request fit; Drive
  * creates the file only when the last chunk arrives.
  */
-export async function upload(ctx: OperationContext, input: UploadInput): Promise<DriveFile> {
+export async function upload(ctx: OperationContext, input: UploadInput): Promise<DriveFile & { mark: string }> {
   const mark = createdMark(ctx.idempotencyKey);
   const existing = await findCreated(ctx, mark);
-  if (existing) return existing;
+  if (existing) return { ...existing, mark };
   const bytes = await ctx.blobs.get(input.file);
   const name = input.name ?? input.file.name ?? "Untitled";
   const metadata: JsonObject = {
@@ -149,21 +154,34 @@ export async function upload(ctx: OperationContext, input: UploadInput): Promise
   if (!session || !session.startsWith(`${DRIVE_UPLOAD}?`)) throw ConnectorError.final("drive/bad-response", "Drive did not answer where to send the file.");
 
   let offset = 0;
+  let resumes = 0;
   for (;;) {
     const end = Math.min(offset + CHUNK, bytes.length);
     const range = bytes.length === 0 ? "bytes */0" : `bytes ${offset}-${end - 1}/${bytes.length}`;
-    const res = await ctx.http({ method: "PUT", url: session, headers: { "content-range": range }, body: bytes.subarray(offset, end) });
+    let res: ConnectorResponse;
+    let queried = false;
+    try {
+      res = await ctx.http({ method: "PUT", url: session, headers: { "content-range": range }, body: bytes.subarray(offset, end) });
+      if (res.status >= 500 || retryableGoogle(res)) throw ConnectorError.retryable(`http/${res.status}`, "Drive could not take the part right now.");
+    } catch (error) {
+      // An interrupted part (lost connection, 5xx, rate limit): ask the same session what it holds, as Google's guide says, instead of starting over.
+      if (!ConnectorError.is(error) || error.kind !== "retryable" || error.code === "connect/timeout" || error.code === "connect/cancelled" || ++resumes > MAX_RESUMES) throw error;
+      res = await ctx.http({ method: "PUT", url: session, headers: { "content-range": `bytes */${bytes.length}` } });
+      queried = true;
+    }
     if (res.status === 308) {
       // Drive says how much it holds: carry on from there (it may hold less than was sent).
       const held = /^bytes=0-(\d+)$/.exec(res.headers.get("range") ?? "");
       const next = held ? Number(held[1]) + 1 : 0;
-      if (next <= offset && end > offset) throw ConnectorError.retryable("drive/upload-stalled", "Drive kept none of the last part of the file.");
+      if (!queried && next <= offset && end > offset) throw ConnectorError.retryable("drive/upload-stalled", "Drive kept none of the last part of the file.");
       offset = next;
       continue;
     }
+    // The session is gone (expired, or Drive dropped it): nothing was created, so the action may start over.
+    if (res.status === 404 || res.status === 410) throw ConnectorError.retryable("drive/upload-expired", "Drive's upload session ended before the file was complete.");
     const done = googleOk(res, "drive").json() as { id?: unknown };
     if (typeof done.id !== "string") throw ConnectorError.unknown("drive/bad-response", "Drive answered the upload without the file's id.");
-    return (await getFile(ctx, done.id)).file;
+    return { ...(await getFile(ctx, done.id)).file, mark };
   }
 }
 
@@ -191,7 +209,15 @@ export async function download(ctx: OperationContext, input: DownloadInput): Pro
   let mediaType: string;
   if (file.mimeType.startsWith("application/vnd.google-apps.")) {
     if (input.exportAs === undefined) throw ConnectorError.final("drive/export-needed", "This is a Google Docs, Sheets or Slides file: say which format to export it to (exportAs).");
-    bytes = googleOk(await ctx.http({ url: `${DRIVE_API}/${checkId(file.id)}/export`, query: { mimeType: input.exportAs } }), "drive").body;
+    let exported: ConnectorResponse;
+    try {
+      exported = await ctx.http({ url: `${DRIVE_API}/${checkId(file.id)}/export`, query: { mimeType: input.exportAs } });
+    } catch (error) {
+      // An export comes in one response, so it is bounded by the deployment's largest response (5 MiB by default).
+      if (ConnectorError.is(error) && error.code === "connect/response-too-large") throw ConnectorError.final("drive/export-too-large", "The exported file is larger than this deployment reads in one response.");
+      throw error;
+    }
+    bytes = googleOk(exported, "drive").body;
     mediaType = input.exportAs;
   } else {
     const size = file.size ?? 0;
@@ -226,10 +252,11 @@ export async function trash(ctx: OperationContext, id: string): Promise<DriveFil
 }
 
 /**
- * The undo of an upload: trashes the file, but only one this connector
- * uploaded (it carries the mark). A file already gone or trashed is done.
+ * The undo of an upload: trashes the file, but only the one that upload
+ * made (it carries the mark the upload answered). A file already gone or
+ * trashed is done.
  */
-export async function removeCreated(ctx: OperationContext, id: string): Promise<{ fileId: string; trashed: true }> {
+export async function removeCreated(ctx: OperationContext, id: string, mark: string): Promise<{ fileId: string; trashed: true }> {
   let found: { file: DriveFile; raw: Record<string, unknown> };
   try {
     found = await getFile(ctx, id, "appProperties");
@@ -238,7 +265,7 @@ export async function removeCreated(ctx: OperationContext, id: string): Promise<
     throw error;
   }
   const props = found.raw.appProperties as Record<string, unknown> | undefined;
-  if (typeof props?.[CREATED_BY_KEY] !== "string") throw ConnectorError.final("drive/not-created-here", "Only a file this connector uploaded can be removed this way.");
+  if (props?.[CREATED_BY_KEY] !== mark) throw ConnectorError.final("drive/not-created-here", "Only the file an upload made can be removed this way.");
   if (found.file.trashed !== true) await trash(ctx, id);
   return { fileId: id, trashed: true };
 }

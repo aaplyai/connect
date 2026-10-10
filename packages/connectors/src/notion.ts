@@ -13,7 +13,9 @@
  * - `pages.update` changes a page's properties and needs at least a
  *   person's confirmation.
  * - `pages.removeCreated` moves a page to the trash, only if this
- *   integration created it.
+ *   integration created it (the page's creator is the integration's bot
+ *   user). A page no longer shared with Aaply is refused, for a person to
+ *   check, rather than counted as removed.
  *
  * Notion's access tokens do not expire; Connect renews one only when Notion
  * refuses it (401).
@@ -62,9 +64,18 @@ function pageOf(value: unknown): Page {
   return page;
 }
 
-/** Notion's answer when 2xx; otherwise the error it means (404 and a conflict get their own codes). */
-function notionOk(res: ConnectorResponse): ConnectorResponse {
+/**
+ * Notion's answer when 2xx; otherwise the error it means. 404 and a conflict
+ * get their own codes, an overload (529) is retryable, and a 503 on a create
+ * is `unknown`: Notion says a write may have been saved when it answers 503.
+ */
+function notionOk(res: ConnectorResponse, creates: boolean): ConnectorResponse {
   if (res.ok) return res;
+  if (res.status === 503 && creates) throw ConnectorError.unknown("http/503", "Notion was unavailable; the page may have been created.");
+  if (res.status === 529) {
+    const seconds = Number(res.headers.get("retry-after") ?? "");
+    throw ConnectorError.retryable("http/529", "Notion is overloaded.", { retryAfterMs: Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 5_000 });
+  }
   if (res.status === 404) throw ConnectorError.final("notion/not-found", "Notion found no such page, or it was not shared with Aaply.");
   // Notion's conflict_error: a concurrent edit; the same request may succeed again.
   if (res.status === 409) throw ConnectorError.retryable("notion/conflict", "Notion was changing the same page; try again.", { retryAfterMs: 1_000 });
@@ -73,7 +84,8 @@ function notionOk(res: ConnectorResponse): ConnectorResponse {
 
 async function call(ctx: OperationContext, request: Omit<HttpRequest, "headers" | "url"> & { path: string }): Promise<JsonValue> {
   const { path, ...rest } = request;
-  return notionOk(await ctx.http({ ...rest, url: `${NOTION_API}${path}`, headers: { "notion-version": NOTION_VERSION } })).json();
+  const creates = rest.method === "POST" && path === "/pages";
+  return notionOk(await ctx.http({ ...rest, url: `${NOTION_API}${path}`, headers: { "notion-version": NOTION_VERSION } }), creates).json();
 }
 
 function list(body: JsonValue, item: (value: unknown) => JsonValue): { results: JsonValue[]; nextCursor?: string } {
@@ -172,7 +184,10 @@ export const notion = defineConnector({
         if (input.filter) json.filter = input.filter;
         if (input.sorts) json.sorts = input.sorts;
         if (input.startCursor) json.start_cursor = input.startCursor;
-        return list(await call(ctx, { method: "POST", path: `/data_sources/${input.dataSourceId}/query`, json }), pageOf);
+        // A wiki's data source lists its child data sources too: only pages are answered.
+        const body = await call(ctx, { method: "POST", path: `/data_sources/${input.dataSourceId}/query`, json });
+        const results = isObject(body) && Array.isArray(body.results) ? body.results.filter((r) => isObject(r) && r.object === "page") : [];
+        return list({ ...(isObject(body) ? body : {}), results }, pageOf);
       },
     },
     search: {
@@ -210,7 +225,8 @@ export const notion = defineConnector({
         try {
           page = await call(ctx, { path: `/pages/${input.pageId}` });
         } catch (error) {
-          if (ConnectorError.is(error) && error.code === "notion/not-found") return { pageId: input.pageId, inTrash: true };
+          // Notion answers a trashed page with in_trash; a 404 means it is not shared with Aaply any more, so a person must look.
+          if (ConnectorError.is(error) && error.code === "notion/not-found") throw ConnectorError.final("notion/not-accessible", "The page is no longer shared with Aaply, so it could not be removed.");
           throw error;
         }
         const me = await call(ctx, { path: "/users/me" });

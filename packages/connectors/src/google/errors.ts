@@ -21,12 +21,16 @@ function reasonOf(res: ConnectorResponse): string | null {
  * `<prefix>/not-found` (final), and anything else is the kit's mapping by
  * status.
  */
+/** True for a 403 that is one of Google's rate limits. */
+export function retryableGoogle(res: ConnectorResponse): boolean {
+  if (res.status !== 403) return false;
+  const reason = reasonOf(res);
+  return reason !== null && RATE_LIMITED.has(reason);
+}
+
 export function googleOk(res: ConnectorResponse, prefix: string): ConnectorResponse {
   if (res.ok) return res;
-  if (res.status === 403) {
-    const reason = reasonOf(res);
-    if (reason !== null && RATE_LIMITED.has(reason)) throw ConnectorError.retryable("http/403", "Google is rate limiting requests.", { retryAfterMs: 5_000 });
-  }
+  if (retryableGoogle(res)) throw ConnectorError.retryable("http/403", "Google is rate limiting requests.", { retryAfterMs: 5_000 });
   if (res.status === 404) throw ConnectorError.final(`${prefix}/not-found`, "Google found no such file, or this connection may not open it.");
   return res.ensureOk();
 }
