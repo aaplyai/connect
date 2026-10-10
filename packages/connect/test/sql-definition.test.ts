@@ -12,6 +12,11 @@ describe("declared statements", () => {
     expect(statementProblem("select 1;", "read", 0)).toBeNull();
     expect(statementProblem("select 1; -- done\n", "read", 0)).toBeNull();
     expect(statementProblem("select 1;;", "read", 0)).toMatch(/';'/);
+    expect(statementProblem("select 1; /* a */ delete from t /* b */", "read", 0)).toMatch(/';'/);
+    // Linear, whatever follows the ';'.
+    const started = Date.now();
+    expect(statementProblem(`select 1;${"/**/ ".repeat(3_000)}x`, "read", 0)).toMatch(/';'/);
+    expect(Date.now() - started).toBeLessThan(200);
   });
 
   it("refuse a second statement, unclosed quoting, an empty statement and wrong first keywords", () => {

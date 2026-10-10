@@ -228,7 +228,10 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
         i.kind === "sql"
           ? `ON CONFLICT (tenant_id, app_id, environment_id, connector_id) DO UPDATE SET definition = EXCLUDED.definition, digest = EXCLUDED.digest,
                previous = CASE WHEN i.digest = EXCLUDED.digest THEN i.previous ELSE (
-                 SELECT coalesce(jsonb_agg(e ORDER BY n), '[]') FROM jsonb_array_elements(jsonb_build_array(jsonb_build_object('definition', i.definition, 'digest', i.digest)) || i.previous) WITH ORDINALITY AS t(e, n) WHERE n <= 4
+                 SELECT coalesce(jsonb_agg(e ORDER BY n), '[]') FROM (
+                   SELECT e, n FROM jsonb_array_elements(jsonb_build_array(jsonb_build_object('definition', i.definition, 'digest', i.digest)) || i.previous) WITH ORDINALITY AS t(e, n)
+                   WHERE e->>'digest' <> EXCLUDED.digest ORDER BY n LIMIT 4
+                 ) kept
                ) END
              WHERE i.kind = 'sql'`
           : "";

@@ -85,6 +85,8 @@ export interface SqlCall {
   now: number;
   /** Called just before COMMIT of a write is sent: from then on, the write may have applied. */
   onCommit?(): void;
+  /** Called when a failed COMMIT certainly rolled back (a serialization or deferred constraint failure). */
+  onRolledBack?(): void;
 }
 
 export interface SqlExecutor {
@@ -93,8 +95,6 @@ export interface SqlExecutor {
 }
 
 const RETRYABLE_STATES = new Set(["40001", "40P01", "55P03", "57014", "57P01", "57P02", "57P03", "53000", "53100", "53200", "53300", "53400"]);
-/** A plan the server cached went stale (a table changed): the socket is dropped and the call may be tried again. */
-const STALE_STATES = new Set(["0A000", "26000"]);
 const FINAL_STATES: Readonly<Record<string, [string, string]>> = {
   "28P01": ["sql/auth-failed", "The database refused the connection's credentials."],
   "28000": ["sql/auth-failed", "The database refused the connection's credentials."],
@@ -113,7 +113,6 @@ function beforeCommit(error: unknown, op: SqlOperation): ConnectorError {
   const declared = state ? op.errors?.[state] : undefined;
   if (declared) return new ConnectorError("final", declared, "The database refused this.", { detail: `SQLSTATE ${state}` });
   if (state === null) return new ConnectorError("retryable", "sql/connection-lost", "The database could not be reached.");
-  if (STALE_STATES.has(state)) return new ConnectorError("retryable", "sql/stale-plan", "The database's tables changed; try again.", { detail: `SQLSTATE ${state}` });
   if (RETRYABLE_STATES.has(state) || state.startsWith("08")) return new ConnectorError("retryable", state === "57014" ? "sql/timeout" : "sql/busy", "The database is busy; try again.", { detail: `SQLSTATE ${state}` });
   const known = FINAL_STATES[state];
   if (known) return new ConnectorError("final", known[0], known[1], { detail: `SQLSTATE ${state}` });
@@ -198,6 +197,7 @@ export function createSqlExecutor(options: SqlExecutorOptions): SqlExecutor {
       return existing.pool;
     }
     const ip = await address(call.target);
+    if (closed) throw new ConnectorError("retryable", "sql/closing", "Connect is shutting down.");
     const priv = isPrivate(ip);
     if (priv && !privateTenants.has(call.tenantId)) throw denied(`${ip} is private; this tenant may not reach private addresses`);
     const tls = call.target.tls ?? "verify-full";
@@ -226,9 +226,12 @@ export function createSqlExecutor(options: SqlExecutorOptions): SqlExecutor {
     }
     const held: Held = { pool, tenantId: call.tenantId };
     // A pool whose last socket closed (idle) is dropped, so old keys do not pile up.
-    pool.on("remove", () => {
-      if (pool.totalCount === 0) drop(call.poolKey, held);
-    });
+    // Checked a tick later: pg-pool serves waiting callers after it reports the removal.
+    pool.on("remove", () =>
+      setImmediate(() => {
+        if (pool.totalCount === 0 && pool.waitingCount === 0) drop(call.poolKey, held);
+      }),
+    );
     pools.set(call.poolKey, held);
     const mine = [...pools].filter(([, h]) => h.tenantId === call.tenantId);
     if (mine.length > perTenant) drop(mine[0]![0], mine[0]![1]);
@@ -322,16 +325,13 @@ export function createSqlExecutor(options: SqlExecutorOptions): SqlExecutor {
         committing = true;
         if (op.effect === "write") call.onCommit?.();
         await client.query("COMMIT");
-        if (call.target.pooler !== "transaction") {
-          // Locks, settings and temporary tables a statement left behind do not reach the next call.
-          await client.query("DISCARD ALL").catch(() => (broken = true));
-        }
         if (op.rows === "one") return plain(rows[0]!);
         if (op.rows === "optional") return { row: rows[0] ? plain(rows[0]) : null };
         if (op.rows === "many") return { rows: rows.map(plain) };
         return { rowCount: result.rowCount ?? 0 };
       } catch (error) {
-        broken = broken || stopped || tooLarge || stateOf(error) === null || STALE_STATES.has(stateOf(error) ?? "");
+        // A socket error, or one this call cut off, leaves the socket unusable; a database's refusal or the call's own answer does not.
+        broken = broken || stopped || tooLarge || (!(error instanceof ConnectorError) && stateOf(error) === null);
         if (!committing) {
           if (!stopped && !tooLarge) await client.query("ROLLBACK").catch(() => (broken = true));
           if (tooLarge) throw new ConnectorError("final", "sql/result-too-large", `The database answered more than ${maxBytes} bytes.`);
@@ -339,10 +339,16 @@ export function createSqlExecutor(options: SqlExecutorOptions): SqlExecutor {
           throw beforeCommit(error, op);
         }
         broken = true;
-        throw atCommit(error, op);
+        const outcome = atCommit(error, op);
+        if (outcome.kind !== "unknown") call.onRolledBack?.();
+        throw outcome;
       } finally {
         socket.removeListener("data", count);
         call.signal.removeEventListener("abort", stop);
+        if (!broken && call.target.pooler !== "transaction") {
+          // Locks, settings and temporary tables a statement left behind, whether it succeeded or not, do not reach the next call.
+          await client.query("DISCARD ALL").catch(() => (broken = true));
+        }
         client.release(broken);
       }
     },

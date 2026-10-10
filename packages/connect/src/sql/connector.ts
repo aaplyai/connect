@@ -12,7 +12,7 @@ import { implementationDigest, type SqlConnectorDefinition } from "./definition.
 import type { SqlExecutor, SqlTarget } from "./executor.js";
 
 /** What a SQL handler needs from the call in progress: the connection, its password, the caller's own deadline and its commit hook. */
-export type SqlConnectionContext = () => Promise<{ tenantId: string; poolKey: string; target: SqlTarget; password: string; deadline: number; onCommit(): void }>;
+export type SqlConnectionContext = () => Promise<{ tenantId: string; poolKey: string; target: SqlTarget; password: string; deadline: number; onCommit(): void; onRolledBack(): void }>;
 
 export function sqlConnector(definition: SqlConnectorDefinition, executor: SqlExecutor, connection: SqlConnectionContext): Connector {
   const operations: Record<string, OperationDefinition> = {};

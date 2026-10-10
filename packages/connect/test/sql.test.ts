@@ -128,6 +128,7 @@ describe.skipIf(postgresUnavailable())("declared SQL connectors", () => {
 
   it("leaves no session state for the next call", async () => {
     expect((await connect.perform(await sign({ action: "booking-db.holdLock", effect: "read", input: {} }))).status).toBe("ok");
+    expect(await connect.perform(await sign({ action: "booking-db.lockThenFail", effect: "read", input: {} }))).toMatchObject({ status: "final", error: { code: "sql/22012" } });
     const { rows } = await db.pool("postgres", "booking").query("SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory'");
     expect(rows[0].n).toBe(0);
   });

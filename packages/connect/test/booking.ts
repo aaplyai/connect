@@ -118,6 +118,15 @@ export function bookingConnector(version = "1.0.0", findOrder = "starts_at", can
         input: { type: "object" },
         output: { type: "object" },
       },
+      lockThenFail: {
+        title: "Takes a session lock, then fails",
+        effect: "read",
+        statement: "select case when pg_advisory_lock(44) is null then 1 else 1 / (random() * 0)::int end as x",
+        params: [],
+        rows: "one",
+        input: { type: "object" },
+        output: { type: "object" },
+      },
       slotDay: {
         title: "A slot's day",
         effect: "read",

@@ -231,7 +231,7 @@ export function createPerformer(options: PerformerOptions): Performer {
       if (problem) throw new ConnectorError("final", "sql/bad-config", "The database connection is not set up correctly.", { detail: problem });
       const password = (await secretOf(s))?.password;
       if (!password) throw new ConnectorError("final", "sql/no-credentials", "The database connection has no password.");
-      return { tenantId: s.tenantId, poolKey: `${c.id}:${c.version}`, target: c.config as unknown as SqlTarget, password, deadline: s.budgetEnd, onCommit: () => void (s.commitSent = true) };
+      return { tenantId: s.tenantId, poolKey: `${c.id}:${c.version}`, target: c.config as unknown as SqlTarget, password, deadline: s.budgetEnd, onCommit: () => void (s.commitSent = true), onRolledBack: () => void (s.commitSent = false) };
     });
     const digests = new Map<string, Sha256Digest>();
     for (const name of Object.keys(connector.operations)) digests.set(name, operationDigest(operationContractOf(connector, name)!));

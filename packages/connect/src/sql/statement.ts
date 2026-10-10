@@ -29,10 +29,13 @@ export function scanStatement(text: string): StatementShape | string {
   const placeholders = new Set<number>();
   let first = "";
   let i = 0;
+  let ended = false;
   const n = text.length;
   while (i < n) {
     const c = text[i]!;
     const next = text[i + 1];
+    // After a ';' only space and comments may follow: anything else would be a second statement.
+    if (ended && !/\s/.test(c) && !(c === "-" && next === "-") && !(c === "/" && next === "*")) return "a statement may not contain ';': one statement per operation";
     if (c === "-" && next === "-") {
       const end = text.indexOf("\n", i);
       i = end === -1 ? n : end + 1;
@@ -78,8 +81,8 @@ export function scanStatement(text: string): StatementShape | string {
       if (end === -1) return "a dollar-quoted string is not closed";
       i = end + m[0].length;
     } else if (c === ";") {
-      // A trailing ';' is allowed (with only space and comments after it); one in the middle stacks statements.
-      if (!/^(\s|--[^\n]*(\n|$)|\/\*[^]*?\*\/)*$/.test(text.slice(i + 1))) return "a statement may not contain ';': one statement per operation";
+      // A trailing ';' is allowed; the check above refuses anything but space and comments after it.
+      ended = true;
       i++;
     } else if (/[A-Za-z_]/.test(c)) {
       let j = i;
