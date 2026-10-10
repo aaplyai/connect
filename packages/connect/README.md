@@ -7,7 +7,8 @@ The engine never holds a credential.
 
 ```ts
 import pg from "pg";
-import { createConnect, localKeyProvider } from "@aaply/connect";
+import { createConnect, localKeyProvider, oauthProviders } from "@aaply/connect";
+import { gmail } from "@aaply/connectors/gmail";
 import { serveConnect } from "@aaply/connect/http";
 
 const connect = await createConnect({
@@ -18,6 +19,11 @@ const connect = await createConnect({
   keys: localKeyProvider({ keyId: "local-1", key: Buffer.from(process.env.CONNECT_WRAPPING_KEY!, "base64") }),
   adminKeys: { "backend-2026-10": process.env.BACKEND_PUBLIC_KEY! }, // the Aaply backend's public key, for /admin
   egress: { allowPrivate: ["db.internal.aaply.ai"] },                // operator config, never tenant data
+  oauth: {
+    redirectUri: "https://connect.aaply.ai/oauth/callback",            // registered with each provider
+    returnOrigins: ["https://app.aaply.ai"],
+    apps: { gmail: { provider: oauthProviders.google, clientId: process.env.GOOGLE_CLIENT_ID!, clientSecret: process.env.GOOGLE_CLIENT_SECRET! } },
+  },
 });
 await serveConnect(connect, { port: 8080, host: "0.0.0.0", performToken: process.env.CONNECT_PERFORM_TOKEN });
 ```
@@ -75,6 +81,34 @@ the change's own transaction (the service's role can only add to it), without se
 through `connect.admin` in the deployment's code are logged as the operator's. The log is kept until
 the deployment removes old entries itself (the service's role cannot): set a retention that suits
 the business's audit needs.
+
+## Connecting accounts with OAuth
+
+Providers are data (`oauthProviders.google`, `oauthProviders.notion`); a connector names only the scopes
+it needs, and `ConnectOptions.oauth.apps` gives Aaply's client at the provider per OAuth connector.
+
+1. The backend calls `startOAuth({ scope, connectorId, owner, returnTo, reconnect?, expectAccount? })`
+   as the person (checked like creating the connection, or changing it for `reconnect`) and redirects
+   their browser to the link at once, never showing it. `returnTo` must be on one of `returnOrigins`.
+2. `GET /oauth/start` works once, within two minutes: it binds the attempt to that browser with a
+   `__Host-` cookie and sends it to the provider with PKCE (S256). Which browser opens the link
+   cannot be proved, so for a person's own connection the backend gives `expectAccount` (the email
+   it knows them by): any other account is refused when they come back.
+3. `GET /oauth/callback` takes the attempt once, only with that cookie, trades the code, learns which
+   account it is, and saves the connection: a new one, or the same account's again (another account
+   where one is connected is refused). The change is logged as the person's. The browser lands on
+   `returnTo` with `connect=ok&connection=<id>` or `connect=error&reason=<code>`.
+
+A connection holds one account per connector, owner and environment kind, with only the scopes its
+connector asks for (a sign-in that unticked one is refused). Tokens are renewed when they have under a
+minute left or the service refuses them: once per connection at a time (in a process, and across
+instances with a lease row), on the renewal's own clock rather than any caller's, and saved before the
+lease is released, so a rotated refresh token is never lost. Only the provider saying the grant is gone
+(`invalid_grant`) marks the connection `reauth` (calls answer `connect/reconsent` until the person
+connects again); a refused client secret or an outage is retryable and reported to the `observer`.
+Removing a connection revokes the grant at the provider, unless another connection in the same scope
+uses that account (a provider revokes the account's whole grant to Aaply's client). Attempts live in a table only Connect's own SQL functions
+touch, and `purgeExpired` removes old ones.
 
 ## Databases
 

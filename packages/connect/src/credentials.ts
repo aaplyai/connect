@@ -46,5 +46,21 @@ export function headersOf(auth: AuthSpec, secret: Readonly<Record<string, string
 /** What the OAuth module plugs in: a fresh secret for a connection whose token was refused or is about to expire. */
 export interface TokenRefresher {
   /** Answers the refreshed secret (already saved), or throws a `ConnectorError` (`final` `connect/reconsent` when the grant is gone). */
-  refresh(request: { tenantId: string; connectionId: string; version: number; secret: Readonly<Record<string, string>>; signal: AbortSignal }): Promise<Readonly<Record<string, string>>>;
+  refresh(request: {
+    tenantId: string;
+    connectionId: string;
+    version: number;
+    /** The secret the call used: a different one in the store means it was renewed already. */
+    secret: Readonly<Record<string, string>>;
+    /** The caller's budget: it stops waiting then (the refresh itself goes on and is saved). */
+    signal: AbortSignal;
+    /** Wait for another instance's refresh (default), or answer `connect/refresh-busy` at once (a token that still works). */
+    wait?: boolean;
+  }): Promise<Readonly<Record<string, string>>>;
+}
+
+/** Whether an OAuth secret's access token runs out within a minute, so it is renewed before use. */
+export function nearExpiry(secret: Readonly<Record<string, string>> | null, now: number): boolean {
+  const at = Number(secret?.expiresAt);
+  return Number.isFinite(at) && at - now < 60_000;
 }

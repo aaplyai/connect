@@ -5,6 +5,9 @@
  *   with an `ActionOutcome`: the engine records any other answer to a write
  *   as "unknown". A body that is too large or not JSON is refused as an
  *   invalid envelope (final), with 200.
+ * - `GET /oauth/start` and `GET /oauth/callback` are the person's browser
+ *   connecting an account (`ConnectOptions.oauth`): redirects, and short
+ *   plain-text pages for a link that expired or was used.
  * - `GET /describe` answers the contract versions served.
  * - `POST /admin/<operation>` is the admin API, each request signed by the
  *   Aaply backend (see admin-http.ts and `createAdminClient`).
@@ -113,6 +116,18 @@ export function createConnectHandler(connect: Connect, options: ConnectHttpOptio
         return send(res, answer.status, answer.body);
       }
       if (req.method !== "GET") return send(res, 405, { error: "method not allowed" });
+      if (path === "/oauth/start" || path === "/oauth/callback") {
+        const answer = await connect.oauthRequest({ path, query: new URL(req.url ?? "/", "http://connect").searchParams, cookie: req.headers.cookie });
+        // Nothing of this page is cached or framed, and the code in its URL is never sent on as a referrer.
+        const headers: Record<string, string | string[]> = { "cache-control": "no-store", "referrer-policy": "no-referrer", "x-frame-options": "DENY", "content-security-policy": "default-src 'none'; frame-ancestors 'none'" };
+        if (answer.setCookie) headers["set-cookie"] = answer.setCookie;
+        if ("redirect" in answer) {
+          res.writeHead(302, { ...headers, location: answer.redirect, "content-length": 0 });
+          return res.end();
+        }
+        res.writeHead(answer.status, { ...headers, "content-type": "text/plain; charset=utf-8", "content-length": Buffer.byteLength(answer.text) });
+        return res.end(answer.text);
+      }
       if (path === "/describe") return send(res, 200, connect.describe());
       if (path === "/health") return send(res, 200, { status: "ok", version: CONNECT_VERSION });
       if (path === "/ready") return (await connect.ready()) ? send(res, 200, { status: "ready" }) : send(res, 503, { status: "unavailable" });

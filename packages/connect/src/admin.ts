@@ -14,6 +14,7 @@
 
 import type { JsonObject, Scope } from "@aaply/action-contract";
 import type { ConnectAdmin } from "./connect.js";
+import type { StartOAuthInput } from "./oauth/oauth.js";
 import type { AdminLogEntry, ConnectStore, Connection } from "./store/store.js";
 
 /** The role in a tenant that may administer Connect for it. */
@@ -42,6 +43,9 @@ export class AdminError extends Error {
     super(message, options);
   }
 }
+
+/** The unchecked, unlogged admin API: a new OAuth attempt also records who started it, so the connection it makes is logged as theirs. */
+export type RawAdmin = Omit<ConnectAdmin, "startOAuth"> & { startOAuth(input: StartOAuthInput, actor: JsonObject): ReturnType<ConnectAdmin["startOAuth"]> };
 
 /** What a person may do as admin: the operator's `ConnectAdmin`, less the global switch, plus the log. */
 export type ActorAdmin = Omit<ConnectAdmin, "setGlobalDisabled"> & {
@@ -87,7 +91,7 @@ export function adminActorProblem(value: unknown): string | null {
  * `raw` with each change written to the admin log as `who`'s, in the
  * change's own transaction.
  */
-export function loggedAdmin(raw: ConnectAdmin, store: ConnectStore, who: JsonObject): ConnectAdmin {
+export function loggedAdmin(raw: RawAdmin, store: ConnectStore, who: JsonObject): ConnectAdmin {
   const audited = <T>(action: string, target: string | null, detail: JsonObject, work: () => Promise<T>) => store.audited({ actor: who, action, target, detail }, work);
   const scopeDetail = (scope: Scope): JsonObject => ({ appId: scope.appId, environmentId: scope.environmentId });
   return {
@@ -114,6 +118,8 @@ export function loggedAdmin(raw: ConnectAdmin, store: ConnectStore, who: JsonObj
     connection: (tenantId, id) => raw.connection(tenantId, id),
     connections: (scope, filter) => raw.connections(scope, filter),
     operations: (scope) => raw.operations(scope),
+    // Starting changes nothing yet: the connection it makes is logged, as `who`'s, when the person comes back.
+    startOAuth: (input) => raw.startOAuth(input, who),
   };
 }
 
@@ -121,7 +127,7 @@ export function loggedAdmin(raw: ConnectAdmin, store: ConnectStore, who: JsonObj
  * The admin API as `actor`: every call checked against their permission,
  * every change logged as theirs. `raw` is the unchecked, unlogged API.
  */
-export function adminAs(raw: ConnectAdmin, store: ConnectStore, actor: AdminActor): ActorAdmin {
+export function adminAs(raw: RawAdmin, store: ConnectStore, actor: AdminActor): ActorAdmin {
   const isAdmin = actor.roles.includes(ADMIN_ROLE);
   const admin = loggedAdmin(raw, store, { tenantId: actor.tenantId, domain: actor.domain, id: actor.id, roles: [...actor.roles] });
   const requireAdmin = (what: string) => {
@@ -213,6 +219,19 @@ export function adminAs(raw: ConnectAdmin, store: ConnectStore, actor: AdminActo
       scoped(scope);
       requireAdmin("reading operation contracts");
       return admin.operations(scope);
+    },
+    async startOAuth(input) {
+      if (typeof input !== "object" || input === null || typeof input.owner !== "object" || input.owner === null) throw new AdminError("admin/invalid", "input is { scope, connectorId, owner, returnTo, … }");
+      scoped(input.scope);
+      if (input.reconnect !== undefined) {
+        // Connecting an account again is changing its connection.
+        const c = await visible(input.scope.tenantId, input.reconnect);
+        if (c.ownerSubject === null) requireAdmin("connecting the business's account");
+        else if (c.ownerSubject !== personOf(actor)) throw new AdminError("admin/forbidden", "only its owner connects a person's account again");
+      } else if ("person" in input.owner) {
+        if (input.owner.person !== personOf(actor)) throw new AdminError("admin/forbidden", "a person connects only their own account");
+      } else requireAdmin("connecting the business's account");
+      return admin.startOAuth(input);
     },
     log(tenantId, page) {
       own(tenantId);
