@@ -164,7 +164,8 @@ export function createOAuth(options: {
       await oauthStore.createAttempt(id, input.scope.tenantId, request, randomBytes(48).toString("base64url"), ttl);
       const url = new URL(startUrl);
       url.searchParams.set("attempt", id);
-      return { url: url.toString(), expiresAt: now() + ttl };
+      // The link itself must be opened within two minutes (oauth_state_begin); the sign-in then has the attempt's whole lifetime.
+      return { url: url.toString(), expiresAt: now() + Math.min(ttl, 2 * 60_000) };
     },
 
     /** `GET /oauth/start?attempt=…`: binds the attempt to this browser, once, and sends it to the provider. */

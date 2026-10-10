@@ -22,7 +22,7 @@ import { PROVIDER_TIMEOUT_MS, providerPost, type OAuthApp } from "./provider-htt
 
 /** Longer than a provider call can take, so a live holder never loses its lease mid-refresh. */
 const LEASE_MS = PROVIDER_TIMEOUT_MS * 3;
-const POLL_MS = 200;
+const POLL_MS = 250;
 
 type Secret = Readonly<Record<string, string>>;
 
@@ -49,7 +49,8 @@ export function createRefresher(options: {
   report: (error: unknown, where: string) => void;
 }): TokenRefresher {
   const { oauthStore, vault, admin, now } = options;
-  const inFlight = new Map<string, Promise<Secret>>();
+  /** Per connection and kind of call: the shared refresh, how many callers still wait on it, and a switch that stops a refresh nobody waits for any more. */
+  const inFlight = new Map<string, { run: Promise<Secret>; waiting: number; unwanted: AbortController }>();
 
   const current = async (tenantId: string, connectionId: string) => {
     const c = await oauthStore.current(tenantId, connectionId);
@@ -61,34 +62,36 @@ export function createRefresher(options: {
     await admin.updateConnection(tenantId, connectionId, version, { status: "reauth" }).catch((error: unknown) => options.report(error, "oauth.reauth"));
   };
 
-  /** Saves the new secret on the connection as it is now, however often it changed meanwhile. */
-  async function save(tenantId: string, connectionId: string, version: number, next: Secret): Promise<void> {
+  /**
+   * Saves the new secret on the connection as it is now, however often it
+   * changed meanwhile, unless the account was connected again meanwhile
+   * (new tokens, perhaps for more scopes): those win, and are answered.
+   */
+  async function save(tenantId: string, connectionId: string, version: number, used: Secret, next: Secret): Promise<Secret> {
     let at = version;
     for (let i = 0; i < 5; i++) {
       try {
         await admin.updateConnection(tenantId, connectionId, at, { secret: next });
-        return;
+        return next;
       } catch (error) {
         if (!(error instanceof StoreConflict)) throw error;
-        const c = await oauthStore.current(tenantId, connectionId);
-        if (!c || c.status === "revoked") return;
+        const c = await current(tenantId, connectionId);
+        if (c.secret.refreshToken !== used.refreshToken) return c.secret;
         at = c.version;
       }
     }
     throw failed();
   }
 
-  async function refresh(tenantId: string, connectionId: string, used: Secret, wait: boolean): Promise<Secret> {
-    if (!(await oauthStore.takeLease(tenantId, connectionId, options.holder, LEASE_MS))) {
-      // Another instance is refreshing. A call whose token still works does not wait; the others watch for the new token.
-      if (!wait) throw new ConnectorError("retryable", "connect/refresh-busy", "The account's sign-in is being renewed; try again.");
-      const until = now() + LEASE_MS;
-      while (now() < until) {
-        await new Promise((resolve) => setTimeout(resolve, POLL_MS));
-        const c = await current(tenantId, connectionId);
-        if (c.secret.accessToken !== used.accessToken) return c.secret;
-      }
-      throw new ConnectorError("retryable", "connect/refresh-busy", "The account's sign-in is being renewed; try again.");
+  async function refresh(tenantId: string, connectionId: string, used: Secret, wait: boolean, unwanted: AbortSignal): Promise<Secret> {
+    const until = now() + LEASE_MS;
+    // Another instance is refreshing. A call whose token still works does not wait; the others watch for the new
+    // token, and take the lease themselves if it comes free without one (that instance failed).
+    while (!(await oauthStore.takeLease(tenantId, connectionId, options.holder, LEASE_MS))) {
+      if (!wait || unwanted.aborted || now() >= until) throw new ConnectorError("retryable", "connect/refresh-busy", "The account's sign-in is being renewed; try again.");
+      await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+      const c = await current(tenantId, connectionId);
+      if (c.secret.accessToken !== used.accessToken) return c.secret;
     }
     try {
       // Someone may have renewed it between the call reading the secret and this lease.
@@ -116,9 +119,7 @@ export function createRefresher(options: {
         options.report(new Error(`the token endpoint answered ${res.status}${typeof res.json.error === "string" ? ` ${res.json.error}` : ""}`), "oauth.refresh");
         throw failed();
       }
-      const next = tokenSecret(res.json, c.secret, now());
-      await save(tenantId, connectionId, c.version, next);
-      return next;
+      return await save(tenantId, connectionId, c.version, c.secret, tokenSecret(res.json, c.secret, now()));
     } finally {
       await oauthStore.releaseLease(tenantId, connectionId, options.holder).catch(() => undefined);
     }
@@ -126,21 +127,30 @@ export function createRefresher(options: {
 
   return {
     refresh(request) {
-      // One refresh per connection in this process; every caller gets its result, each waiting only within its own budget.
-      const key = `${request.tenantId}/${request.connectionId}`;
-      let run = inFlight.get(key);
-      if (!run) {
-        run = refresh(request.tenantId, request.connectionId, request.secret, request.wait !== false).finally(() => inFlight.delete(key));
-        inFlight.set(key, run);
+      // One refresh per connection (and kind of call) in this process; every caller gets its result, each waiting only within its own budget.
+      const wait = request.wait !== false;
+      const key = `${request.tenantId}/${request.connectionId}/${wait ? "wait" : "now"}`;
+      let entry = inFlight.get(key);
+      if (!entry) {
+        const unwanted = new AbortController();
+        const run = refresh(request.tenantId, request.connectionId, request.secret, wait, unwanted.signal).finally(() => inFlight.delete(key));
+        entry = { run, waiting: 0, unwanted };
+        inFlight.set(key, entry);
       }
-      const shared = run;
+      const shared = entry;
+      shared.waiting++;
       return new Promise<Secret>((resolve, reject) => {
-        if (request.signal.aborted) return reject(request.signal.reason);
-        const stop = () => reject(request.signal.reason);
+        const done = () => {
+          request.signal.removeEventListener("abort", stop);
+          // Nobody waits any more: a refresh still waiting on another instance stops (one already at the provider finishes and saves).
+          if (--shared.waiting === 0) shared.unwanted.abort();
+        };
+        const stop = () => (done(), reject(request.signal.reason));
+        if (request.signal.aborted) return stop();
         request.signal.addEventListener("abort", stop, { once: true });
-        shared.then(
-          (value) => (request.signal.removeEventListener("abort", stop), resolve(value)),
-          (error: unknown) => (request.signal.removeEventListener("abort", stop), reject(error)),
+        shared.run.then(
+          (value) => (done(), resolve(value)),
+          (error: unknown) => (done(), reject(error)),
         );
       });
     },

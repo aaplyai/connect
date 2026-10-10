@@ -86,6 +86,8 @@ export async function identify(fetch: FetchLike, app: OAuthApp, tokens: Record<s
   const id = pick(source, spec.id);
   if ((typeof id !== "string" || id.length === 0) && typeof id !== "number") throw new Error("the provider did not say which account this is");
   const name = spec.name ? pick(source, spec.name) : undefined;
-  const email = spec.email ? pick(source, spec.email) : undefined;
+  // An email the provider has not verified names nobody (`expectAccount` cannot match it).
+  const verified = spec.emailVerified ? pick(source, spec.emailVerified) === true : true;
+  const email = spec.email && verified ? pick(source, spec.email) : undefined;
   return { id: String(id), ...(typeof name === "string" ? { name } : {}), ...(typeof email === "string" ? { email } : {}) };
 }

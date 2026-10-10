@@ -23,9 +23,10 @@ export interface OAuthProvider {
    * Which account was connected: from a JSON endpoint called with the new
    * access token, or from fields of the token response itself, each a
    * dotted path. `id` is the stable account id (a reconnect must match it);
-   * `name` is for people; `email` is checked against `expectAccount`.
+   * `name` is for people; `email` is checked against `expectAccount`, and
+   * only when `emailVerified` (if given) is true.
    */
-  identity: { url: string; id: string; name?: string; email?: string } | { fromToken: true; id: string; name?: string; email?: string };
+  identity: ({ url: string } | { fromToken: true }) & { id: string; name?: string; email?: string; emailVerified?: string };
   /** The authorization parameter that suggests which account to sign in with (Google: `login_hint`). */
   loginHint?: string;
 }
@@ -41,7 +42,7 @@ export const oauthProviders = {
     // No incremental grants: a connection's token carries only the scopes its connector asked for.
     authorizeParams: { access_type: "offline", prompt: "consent" },
     identityScopes: ["openid", "email"],
-    identity: { url: "https://openidconnect.googleapis.com/v1/userinfo", id: "sub", name: "email", email: "email" },
+    identity: { url: "https://openidconnect.googleapis.com/v1/userinfo", id: "sub", name: "email", email: "email", emailVerified: "email_verified" },
     loginHint: "login_hint",
   },
   notion: {

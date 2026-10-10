@@ -83,7 +83,7 @@ describe.skipIf(postgresUnavailable())("OAuth connections", () => {
     db = await startTestDatabase();
     google = mockFetch({
       [TOKEN_URL]: tokens,
-      [USERINFO]: () => ({ json: { ...account } }),
+      [USERINFO]: () => ({ json: { ...account, email_verified: true } }),
       [REVOKE]: { status: 200 },
       [`POST ${GMAIL_SEND_URL}`]: { json: { id: "m1", threadId: "t1" } },
     });
@@ -311,6 +311,30 @@ describe.skipIf(postgresUnavailable())("OAuth connections", () => {
     account = { sub: "g-ana", email: "Ana@Clinic.example" };
     expect((await connectInBrowser(ana, { owner: { person: "member:ana" }, expectAccount: "ana@clinic.example" })).landed!.searchParams.get("connect")).toBe("ok");
     account = { sub: "g-111", email: "desk@clinic.example" };
+  });
+
+  it("lets a reconnect made during a renewal win, and takes over a lease its holder let go", async () => {
+    const c = await nearlyExpired(-1000);
+    google.on(TOKEN_URL, async (r) => {
+      if (form(r).get("grant_type") === "refresh_token") {
+        // The person connects the account again while this renewal is out at Google.
+        google.on(TOKEN_URL, tokens);
+        await connectInBrowser(boss);
+      }
+      return tokens(r);
+    });
+    expect(await connect.perform(await sign())).toMatchObject({ status: "ok" });
+    const reconnected = issued - 1; // the reconnect's tokens were issued before the renewal's answer
+    google.calls.splice(0);
+    expect(await connect.perform(await sign())).toMatchObject({ status: "ok" });
+    expect(sentWith()).toEqual([`Bearer access-${reconnected}`]);
+
+    // A lease another instance let go without renewing: a call whose token has run out takes it and renews.
+    await nearlyExpired(-1000);
+    await db.pool("postgres").query("INSERT INTO aaply_connect.refresh_leases (connection_id, tenant_id, holder, until) VALUES ($1, $2, 'elsewhere', now() + interval '30 seconds')", [c.id, scope.tenantId]);
+    setTimeout(() => void db.pool("postgres").query("DELETE FROM aaply_connect.refresh_leases WHERE holder = 'elsewhere'"), 300);
+    expect(await connect.perform(await sign())).toMatchObject({ status: "ok" });
+    expect(google.callsTo(TOKEN_URL).length).toBe(1);
   });
 
   it("lets a start link go unused for two minutes at most", async () => {
