@@ -57,6 +57,8 @@ function scopeProblem(scope: unknown): string | null {
   return null;
 }
 
+const isStrings = (v: unknown, max: number) => Array.isArray(v) && v.length <= max && v.every((x) => typeof x === "string" && x.length > 0 && x.length <= 256);
+
 const CHANGE_KEYS = new Set(["secret", "status", "grantedScopes", "account", "config"]);
 
 /** A connection change: known fields only, and a status that is not a revoke (revoking deletes the secret too: `revokeConnection`). */
@@ -65,7 +67,7 @@ function changeProblem(change: unknown): string | null {
   const c = change as Record<string, unknown>;
   for (const k of Object.keys(c)) if (!CHANGE_KEYS.has(k)) return `change has an unknown field ${k}`;
   if (c.status !== undefined && c.status !== "active" && c.status !== "reauth") return "change.status is active or reauth (revoke with revokeConnection)";
-  if (c.grantedScopes !== undefined && (!Array.isArray(c.grantedScopes) || !c.grantedScopes.every((x) => typeof x === "string"))) return "change.grantedScopes is a list of scopes";
+  if (c.grantedScopes !== undefined && !isStrings(c.grantedScopes, 200)) return "change.grantedScopes is a list of scopes";
   for (const k of ["secret", "account", "config"]) if (c[k] !== undefined && (typeof c[k] !== "object" || c[k] === null || Array.isArray(c[k]))) return `change.${k} is an object`;
   return null;
 }
@@ -163,11 +165,13 @@ export function adminAs(raw: ConnectAdmin, store: ConnectStore, actor: AdminActo
       scoped(scope);
       requireAdmin("changing policy");
       if (typeof change !== "object" || change === null || Object.keys(change).some((k) => k !== "disabled" && k !== "denied")) throw new AdminError("admin/invalid", "a policy change is { disabled?, denied? }");
+      if ((change.disabled !== undefined && typeof change.disabled !== "boolean") || (change.denied !== undefined && !isStrings(change.denied, 1000))) throw new AdminError("admin/invalid", "disabled is a boolean and denied a list of action ids");
       return admin.setPolicy(scope, change);
     },
     createConnection(input) {
       if (typeof input !== "object" || input === null || typeof input.owner !== "object" || input.owner === null) throw new AdminError("admin/invalid", "input is { scope, connectorId, owner, … }");
       scoped(input.scope);
+      if (input.grantedScopes !== undefined && !isStrings(input.grantedScopes, 200)) throw new AdminError("admin/invalid", "grantedScopes is a list of scopes");
       if ("person" in input.owner) {
         if (input.owner.person !== personOf(actor)) throw new AdminError("admin/forbidden", "a person connects only their own account");
         // Where a connection points, and what it may do, are the business's to set.
@@ -178,6 +182,7 @@ export function adminAs(raw: ConnectAdmin, store: ConnectStore, actor: AdminActo
     async updateConnection(tenantId, id, expectedVersion, change) {
       const problem = changeProblem(change);
       if (problem) throw new AdminError("admin/invalid", problem);
+      if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) throw new AdminError("admin/invalid", "expectedVersion is the connection's version");
       const c = await visible(tenantId, id);
       if (c.ownerSubject === null) requireAdmin("changing the business's connection");
       else if (c.ownerSubject !== personOf(actor)) throw new AdminError("admin/forbidden", "only its owner changes a person's connection");
@@ -212,6 +217,8 @@ export function adminAs(raw: ConnectAdmin, store: ConnectStore, actor: AdminActo
     log(tenantId, page) {
       own(tenantId);
       requireAdmin("reading the admin log");
+      if (page !== undefined && (typeof page !== "object" || page === null || (page.limit !== undefined && (!Number.isSafeInteger(page.limit) || page.limit < 1 || page.limit > 1000)) || (page.before !== undefined && typeof page.before !== "string")))
+        throw new AdminError("admin/invalid", "page is { limit?: 1-1000, before?: string }");
       return store.adminLog(tenantId, page);
     },
   };

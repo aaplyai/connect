@@ -374,7 +374,7 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
       return tx(tenantId, async (client) => {
         await client.query("DELETE FROM aaply_connect.secrets WHERE tenant_id = $1 AND connection_id = $2", [tenantId, id]);
         const { rows } = await client.query(
-          `UPDATE aaply_connect.connections SET status = 'revoked', version = version + 1, updated_at = now() WHERE tenant_id = $1 AND id = $2 RETURNING ${COLUMNS}`,
+          `UPDATE aaply_connect.connections SET status = 'revoked', version = version + 1, updated_at = now() WHERE tenant_id = $1 AND id = $2 AND status <> 'revoked' RETURNING ${COLUMNS}`,
           [tenantId, id],
         );
         return rows[0] ? connectionOf(rows[0]) : null;

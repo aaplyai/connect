@@ -100,13 +100,29 @@ describe.skipIf(postgresUnavailable())("the signed admin API", () => {
     await expect(as(bo).updateConnection(scope.tenantId, mine.id, mine.version, { owner: "x" } as never)).rejects.toMatchObject({ code: "admin/invalid" });
     await expect(as(bo).createConnection({ scope, connectorId: "notes", owner: { person: "member:bo" }, config: { host: "10.0.0.1" }, secret: KEY })).rejects.toMatchObject({ code: "admin/forbidden" });
     await expect(as(bo).connections({ tenantId: scope.tenantId } as never)).rejects.toMatchObject({ code: "admin/invalid" });
+    await expect(as(bo).updateConnection(scope.tenantId, mine.id, mine.version, { config: { host: "10.0.0.1" } })).rejects.toMatchObject({ code: "admin/forbidden" });
     expect(await as(bo).revokeConnection(scope.tenantId, mine.id)).toMatchObject({ status: "revoked" });
+  });
+
+  it("answers a malformed request as invalid, not as a failure", async () => {
+    const mine = await as(bo).createConnection({ scope, connectorId: "notes", owner: { person: "member:bo" }, secret: KEY });
+    await expect(as(bo).updateConnection(scope.tenantId, mine.id, "1" as never, { status: "reauth" })).rejects.toMatchObject({ code: "admin/invalid" });
+    await expect(as(boss).log(scope.tenantId, { limit: "x" } as never)).rejects.toMatchObject({ code: "admin/invalid" });
+    await expect(as(boss).setPolicy(scope, { denied: 5 } as never)).rejects.toMatchObject({ code: "admin/invalid" });
+    await expect(as(boss).createConnection({ scope, connectorId: "notes", owner: { business: true, role: "x" }, grantedScopes: 5 as never, secret: KEY })).rejects.toMatchObject({ code: "admin/invalid" });
+    await as(bo).updateConnection(scope.tenantId, mine.id, mine.version, { status: "reauth" });
+    expect((await as(boss).log(scope.tenantId))[0]).toMatchObject({ action: "updateConnection", target: mine.id, detail: { status: "reauth" } });
   });
 
   it("logs nothing for a removal that removed nothing", async () => {
     const before = (await as(boss).log(scope.tenantId)).length;
     expect(await as(boss).uninstall(scope, "never-installed")).toBe(false);
-    expect((await as(boss).log(scope.tenantId)).length).toBe(before);
+    const gone = await as(boss).createConnection({ scope, connectorId: "notes", owner: { business: true, role: "gone" }, secret: KEY });
+    await as(boss).revokeConnection(scope.tenantId, gone.id);
+    const after = (await as(boss).log(scope.tenantId)).length;
+    expect(after).toBe(before + 2);
+    expect(await as(boss).revokeConnection(scope.tenantId, gone.id)).toBeNull();
+    expect((await as(boss).log(scope.tenantId)).length).toBe(after);
   });
 
   it("pages the log, newest first", async () => {
