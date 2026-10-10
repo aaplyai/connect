@@ -17,7 +17,7 @@ const CHUNK = 4 * 1024 * 1024;
 const MAX_RESUMES = 3;
 
 /** Lists include shared drives, where a folder the person picked may be. */
-const ALL_DRIVES = { supportsAllDrives: true, includeItemsFromAllDrives: true } as const;
+const ALL_DRIVES = { supportsAllDrives: true, includeItemsFromAllDrives: true, corpora: "allDrives" } as const;
 
 const FIELDS = "id,name,mimeType,size,parents,webViewLink,createdTime,modifiedTime,trashed";
 
@@ -162,7 +162,7 @@ export async function upload(ctx: OperationContext, input: UploadInput): Promise
     let queried = false;
     try {
       res = await ctx.http({ method: "PUT", url: session, headers: { "content-range": range }, body: bytes.subarray(offset, end) });
-      if (res.status >= 500 || retryableGoogle(res)) throw ConnectorError.retryable(`http/${res.status}`, "Drive could not take the part right now.");
+      if (res.status >= 500 || res.status === 429 || retryableGoogle(res)) throw ConnectorError.retryable(`http/${res.status}`, "Drive could not take the part right now.");
     } catch (error) {
       // An interrupted part (lost connection, 5xx, rate limit): ask the same session what it holds, as Google's guide says, instead of starting over.
       if (!ConnectorError.is(error) || error.kind !== "retryable" || error.code === "connect/timeout" || error.code === "connect/cancelled" || ++resumes > MAX_RESUMES) throw error;
