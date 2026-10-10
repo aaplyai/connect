@@ -6,6 +6,8 @@
  *   as "unknown". A body that is too large or not JSON is refused as an
  *   invalid envelope (final), with 200.
  * - `GET /describe` answers the contract versions served.
+ * - `POST /admin/<operation>` is the admin API, each request signed by the
+ *   Aaply backend (see admin-http.ts and `createAdminClient`).
  * - `GET /health` answers while the process runs; `GET /ready` while the
  *   store answers too (503 otherwise).
  *
@@ -24,6 +26,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { refuse } from "@aaply/action-contract";
 import type { Connect } from "./connect.js";
 import { CONNECT_VERSION } from "./version.js";
+
+export { createAdminClient, type AdminClientOptions } from "./admin-http.js";
 
 export interface ConnectHttpOptions {
   /** The bearer token the engine's host sends (at least 32 characters). Required unless `noPerformToken` says otherwise. */
@@ -82,7 +86,7 @@ export function createConnectHandler(connect: Connect, options: ConnectHttpOptio
   if (options.performToken !== undefined && options.performToken.length < 32) throw new Error("performToken must be at least 32 characters");
   return (req, res) => {
     void (async () => {
-      const path = (req.url ?? "/").split("?")[0];
+      const path = (req.url ?? "/").split("?")[0] ?? "/";
       if (path === "/perform") {
         if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
         if (options.performToken !== undefined && !bearerMatches(req.headers.authorization, options.performToken)) return send(res, 401, { error: "unauthorized" });
@@ -100,6 +104,13 @@ export function createConnectHandler(connect: Connect, options: ConnectHttpOptio
           if (!res.writableFinished) gone.abort();
         });
         return send(res, 200, await connect.perform(value, gone.signal));
+      }
+      if (path.startsWith("/admin/")) {
+        // A SQL definition is at most 256 KiB of JSON; nothing an admin sends needs more than twice that.
+        const body = await readBody(req, Math.min(max, 512 * 1024));
+        if (body === null) return send(res, 413, { error: { code: "admin/invalid", message: "the request was too large" } });
+        const answer = await connect.adminRequest({ method: req.method ?? "", path, headers: req.headers, body: body.toString("utf8") });
+        return send(res, answer.status, answer.body);
       }
       if (req.method !== "GET") return send(res, 405, { error: "method not allowed" });
       if (path === "/describe") return send(res, 200, connect.describe());

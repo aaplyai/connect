@@ -10,6 +10,8 @@
 import type pg from "pg";
 import { ed25519ActionVerifier, type ActionOutcome, type ActionPortDescription, type Ed25519PublicKey, type EnvironmentKind, type JsonObject, type OperationContract, type Scope } from "@aaply/action-contract";
 import { operationContractOf, type Connector, type ConnectorLogSink, type FetchLike } from "@aaply/connector-sdk";
+import { adminAs, AdminError, loggedAdmin, type ActorAdmin, type AdminActor } from "./admin.js";
+import { createAdminRoutes, type AdminAnswer, type AdminRequest } from "./admin-http.js";
 import { secretProblem, type TokenRefresher } from "./credentials.js";
 import { egressPolicy, safeFetch, type EgressOptions } from "./egress.js";
 import { newId } from "./ids.js";
@@ -30,6 +32,11 @@ export interface ConnectOptions {
    * engine, then removing the old one once its longest deadline has passed.
    */
   engineKeys: Readonly<Record<string, Ed25519PublicKey>>;
+  /**
+   * The Aaply backend's Ed25519 public keys by key id, for signed admin
+   * requests (`/admin/*`). Without them, the admin routes answer 404.
+   */
+  adminKeys?: Readonly<Record<string, Ed25519PublicKey>>;
   /** Every code connector this build serves (several versions of one side by side during an upgrade). */
   connectors: readonly Connector[];
   /** A pool logged in as a member of `aaply_connect_app` (never the schema owner). */
@@ -67,7 +74,7 @@ export interface NewConnectionInput {
   secret: Readonly<Record<string, string>> | null;
 }
 
-/** What the admin API (and later the signed /admin routes) can do. Permission checks belong to the caller. */
+/** What the admin API can do. `Connect.admin` is the operator's (unchecked); `Connect.adminAs` checks a person's permission. Changes are logged either way. */
 export interface ConnectAdmin {
   /** Installs one of this build's code connectors for a scope. */
   install(scope: Scope, connectorId: string): Promise<string>;
@@ -103,7 +110,12 @@ export interface Connect {
   /** Performs one approved action. Never throws. */
   perform(value: unknown, signal?: AbortSignal): Promise<ActionOutcome>;
   describe(): ActionPortDescription;
+  /** The operator's admin API, for code in the deployment: unchecked, each change logged as the operator's. */
   admin: ConnectAdmin;
+  /** The admin API as a person the Aaply backend vouches for: each call checked against their permission, each change logged as theirs. */
+  adminAs(actor: AdminActor): ActorAdmin;
+  /** One signed admin request (`@aaply/connect/http` routes `/admin/*` here). */
+  adminRequest(request: AdminRequest): Promise<AdminAnswer>;
   /** Whether the store answers. */
   ready(): Promise<boolean>;
   /** Deletes expired replay claims; run it every minute from any instance (several at once is safe). */
@@ -141,7 +153,7 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
 
   const connectorOf = (id: string): Connector => {
     const c = newest(options.connectors, id);
-    if (!c) throw new Error(`no connector ${id} in this build`);
+    if (!c) throw new AdminError("admin/invalid", `no connector ${id} in this build`);
     return c;
   };
 
@@ -163,7 +175,7 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
     return null;
   };
 
-  const admin: ConnectAdmin = {
+  const raw: ConnectAdmin = {
     async install(scope, connectorId) {
       connectorOf(connectorId);
       const id = newId("inst");
@@ -172,9 +184,13 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
     },
     async installSql(scope, definition) {
       const problems = sqlDefinitionProblems(definition);
-      if (problems.length > 0) throw new Error(`the SQL connector is not valid: ${problems.join("; ")}`);
-      if (newest(options.connectors, definition.id)) throw new Error(`${definition.id} is the id of a code connector in this build`);
-      declared(definition); // the kit's own checks: schemas, undo pairing, risk floors
+      if (problems.length > 0) throw new AdminError("admin/invalid", `the SQL connector is not valid: ${problems.join("; ")}`);
+      if (newest(options.connectors, definition.id)) throw new AdminError("admin/invalid", `${definition.id} is the id of a code connector in this build`);
+      try {
+        declared(definition); // the kit's own checks: schemas, undo pairing, risk floors
+      } catch (error) {
+        throw new AdminError("admin/invalid", `the SQL connector is not valid: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+      }
       const id = newId("inst");
       await store.install(scope, { id, connectorId: definition.id, kind: "sql", definition: definition as unknown as JsonObject, digest: definitionDigest(definition) });
       return id;
@@ -184,10 +200,10 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
     setGlobalDisabled: (disabled) => store.setGlobalDisabled(disabled),
     async createConnection(input) {
       const problem = await connectionProblem(input.scope, input.connectorId, input.secret, input.config ?? {}, true);
-      if (problem) throw new Error(`${input.connectorId}: ${problem}`);
+      if (problem) throw new AdminError("admin/invalid", `${input.connectorId}: ${problem}`);
       const id = newId("conn");
       const person = "person" in input.owner ? input.owner.person : null;
-      if (person !== null && !/^[^:\s]{1,64}:\S{1,256}$/.test(person)) throw new Error("a person is named domain:id");
+      if (person !== null && !/^[^:\s]{1,64}:\S{1,256}$/.test(person)) throw new AdminError("admin/invalid", "a person is named domain:id");
       const role = "business" in input.owner ? (input.owner.role ?? DEFAULT_ROLE) : null;
       const sealed = input.secret && Object.keys(input.secret).length > 0 ? await vault.seal(input.scope.tenantId, id, 1, input.secret) : null;
       return store.insertConnection(
@@ -209,9 +225,9 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
       const { secret, ...fields } = change;
       if (secret || fields.config) {
         const current = await store.connection(tenantId, id);
-        if (!current) throw new Error(`no connection ${id}`);
+        if (!current) throw new AdminError("admin/not-found", `no connection ${id}`);
         const problem = await connectionProblem(current.scope, current.connectorId, secret ?? null, fields.config);
-        if (problem) throw new Error(`${current.connectorId}: ${problem}`);
+        if (problem) throw new AdminError("admin/invalid", `${current.connectorId}: ${problem}`);
       }
       return store.updateConnection(tenantId, id, expectedVersion, fields, secret ? (version) => vault.seal(tenantId, id, version, secret) : undefined);
     },
@@ -232,10 +248,12 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
     },
   };
 
-  return {
+  const connect: Connect = {
     perform: performer.perform,
     describe: performer.describe,
-    admin,
+    admin: loggedAdmin(raw, store, { operator: true }),
+    adminAs: (actor) => adminAs(raw, store, actor),
+    adminRequest: (request) => adminRoutes(request),
     async ready() {
       try {
         await options.pool.query("SELECT 1");
@@ -249,4 +267,8 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
       await Promise.all([egress.close(), sql.close()]);
     },
   };
+  const adminRoutes = options.adminKeys
+    ? createAdminRoutes(connect, { audience: options.audience, verifier: ed25519ActionVerifier(options.adminKeys, options.now ? { now: options.now } : {}), store, ...(options.now ? { now: options.now } : {}) })
+    : async (): Promise<AdminAnswer> => ({ status: 404, body: { error: { code: "admin/not-found", message: "the admin API is not enabled" } } });
+  return connect;
 }

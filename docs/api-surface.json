@@ -214,6 +214,14 @@
       "patternMatches:v"
     ],
     "@aaply/connect": [
+      "ADMIN_ROLE:v",
+      "ActorAdmin:t",
+      "AdminActor:t",
+      "AdminAnswer:t",
+      "AdminError:v",
+      "AdminErrorCode:t",
+      "AdminLogEntry:t",
+      "AdminRequest:t",
       "CONNECT_VERSION:v",
       "Connect:t",
       "ConnectAdmin:t",
@@ -248,9 +256,11 @@
       "migrate:v"
     ],
     "@aaply/connect/http": [
+      "AdminClientOptions:t",
       "ConnectHandler:t",
       "ConnectHttpOptions:t",
       "ServedConnect:t",
+      "createAdminClient:v",
       "createConnectHandler:v",
       "serveConnect:v"
     ],
