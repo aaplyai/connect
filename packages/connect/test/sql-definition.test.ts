@@ -8,6 +8,12 @@ describe("declared statements", () => {
     expect(shape).toEqual({ first: "select", placeholders: new Set([1, 2]) });
   });
 
+  it("allow one trailing ';'", () => {
+    expect(statementProblem("select 1;", "read", 0)).toBeNull();
+    expect(statementProblem("select 1; -- done\n", "read", 0)).toBeNull();
+    expect(statementProblem("select 1;;", "read", 0)).toMatch(/';'/);
+  });
+
   it("refuse a second statement, unclosed quoting, an empty statement and wrong first keywords", () => {
     expect(statementProblem("select 1; delete from t", "read", 0)).toMatch(/';'/);
     expect(statementProblem("select 'x", "read", 0)).toMatch(/not closed/);
@@ -56,5 +62,24 @@ describe("SQL connector definitions", () => {
     for (const expected of ["id is", 'engine is "postgres"', "unknown field extra", "param missing", "rows is one", "not a SQLSTATE", "not connect/ or flow/", "maxRows", "onConflictEmpty is for a write with rows \"one\""]) {
       expect(problems).toContain(expected);
     }
+  });
+
+  it("refuse a lookup by an optional value, errors outside the refusal classes, and an oversized definition", () => {
+    const put = {
+      title: "Put",
+      effect: "write",
+      statement: "insert into t (ref, note) values ($1, $2) on conflict do nothing returning ref",
+      params: ["ref", "note"],
+      rows: "one",
+      onConflictEmpty: { statement: "select ref from t where ref = $1 and note = $2", params: ["ref", "note"] },
+      errors: { "57P01": "x/shutdown" },
+      input: { type: "object", required: ["ref"], properties: { ref: { type: "string" }, note: { type: "string" } } },
+      output: { type: "object" },
+    };
+    const problems = sqlDefinitionProblems({ ...ok, operations: { put } }).join("\n");
+    expect(problems).toContain("param note must be required");
+    expect(problems).toContain("class 23, 22 or P0");
+    const many = Object.fromEntries(Array.from({ length: 101 }, (_, i) => [`op${i}`, ok.operations.find]));
+    expect(sqlDefinitionProblems({ ...ok, operations: many }).join("\n")).toContain("at most 100 operations");
   });
 });

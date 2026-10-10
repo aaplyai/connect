@@ -36,6 +36,8 @@ export interface Installation {
   kind: "code" | "sql";
   definition: JsonObject | null;
   digest: string | null;
+  /** For a SQL connector, the definitions this one replaced (newest first, at most 4). */
+  previous: Array<{ definition: JsonObject; digest: string }>;
 }
 
 /** What one call needs, read in one round trip. */
@@ -166,7 +168,9 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
       return {
         global: { disabled: r.global.disabled },
         policy: r.policy ? { disabled: r.policy.disabled, denied: r.policy.denied } : null,
-        installation: r.installation ? { id: r.installation.id, kind: r.installation.kind, definition: r.installation.definition ?? null, digest: r.installation.digest ?? null } : null,
+        installation: r.installation
+          ? { id: r.installation.id, kind: r.installation.kind, definition: r.installation.definition ?? null, digest: r.installation.digest ?? null, previous: r.installation.previous ?? [] }
+          : null,
         connection: c
           ? {
               id: c.id,
@@ -222,11 +226,15 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
     async install(scope, i) {
       const replace =
         i.kind === "sql"
-          ? "ON CONFLICT (tenant_id, app_id, environment_id, connector_id) DO UPDATE SET definition = EXCLUDED.definition, digest = EXCLUDED.digest WHERE aaply_connect.installations.kind = 'sql'"
+          ? `ON CONFLICT (tenant_id, app_id, environment_id, connector_id) DO UPDATE SET definition = EXCLUDED.definition, digest = EXCLUDED.digest,
+               previous = CASE WHEN i.digest = EXCLUDED.digest THEN i.previous ELSE (
+                 SELECT coalesce(jsonb_agg(e ORDER BY n), '[]') FROM jsonb_array_elements(jsonb_build_array(jsonb_build_object('definition', i.definition, 'digest', i.digest)) || i.previous) WITH ORDINALITY AS t(e, n) WHERE n <= 4
+               ) END
+             WHERE i.kind = 'sql'`
           : "";
       const { rowCount } = await tx(scope.tenantId, (client) =>
         client.query(
-          `INSERT INTO aaply_connect.installations (id, tenant_id, app_id, environment_id, connector_id, kind, definition, digest) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ${replace}`,
+          `INSERT INTO aaply_connect.installations AS i (id, tenant_id, app_id, environment_id, connector_id, kind, definition, digest) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ${replace}`,
           [i.id, ...scopeParams(scope), i.connectorId, i.kind, i.definition ?? null, i.digest ?? null],
         ),
       );
@@ -246,10 +254,10 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
     async installations(scope) {
       return tx(scope.tenantId, async (client) => {
         const { rows } = await client.query(
-          "SELECT id, connector_id, kind, definition, digest FROM aaply_connect.installations WHERE tenant_id = $1 AND app_id = $2 AND environment_id = $3 ORDER BY connector_id",
+          "SELECT id, connector_id, kind, definition, digest, previous FROM aaply_connect.installations WHERE tenant_id = $1 AND app_id = $2 AND environment_id = $3 ORDER BY connector_id",
           scopeParams(scope),
         );
-        return rows.map((r) => ({ id: r.id, connectorId: r.connector_id, kind: r.kind, definition: r.definition ?? null, digest: r.digest ?? null }));
+        return rows.map((r) => ({ id: r.id, connectorId: r.connector_id, kind: r.kind, definition: r.definition ?? null, digest: r.digest ?? null, previous: r.previous ?? [] }));
       });
     },
 

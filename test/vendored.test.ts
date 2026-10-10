@@ -27,8 +27,10 @@ describe("vendored packages", () => {
     expect(testOnly).toEqual(["@aaply/flow"]);
     const problems: string[] = [];
     for (const dir of packageDirs()) {
-      const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { name: string; dependencies?: Record<string, string> };
-      for (const name of testOnly) if (pkg.dependencies?.[name]) problems.push(`${pkg.name} depends on ${name}`);
+      const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as Record<string, unknown> & { name: string };
+      for (const field of ["dependencies", "peerDependencies", "optionalDependencies"]) {
+        for (const name of testOnly) if ((pkg[field] as Record<string, string> | undefined)?.[name]) problems.push(`${pkg.name} ${field} lists ${name}`);
+      }
       let files: string[] = [];
       try {
         files = sources(join(dir, "src"));
@@ -37,7 +39,10 @@ describe("vendored packages", () => {
       }
       for (const file of files) {
         const text = readFileSync(file, "utf8");
-        for (const name of testOnly) if (text.includes(`"${name}"`) || text.includes(`"${name}/`)) problems.push(`${file} imports ${name}`);
+        for (const name of testOnly) {
+          const escaped = name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+          if (new RegExp(`(from|import|import\\(|require\\()\\s*["'\`]${escaped}["'\`/]`).test(text)) problems.push(`${file} imports ${name}`);
+        }
       }
     }
     expect(problems).toEqual([]);

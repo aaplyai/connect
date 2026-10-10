@@ -95,6 +95,10 @@ interface CallState {
   verified: ActionProof;
   /** The call's budget: every store, vault or refresh step inside the kit stops when it runs out. */
   signal: AbortSignal;
+  /** When the budget runs out (epoch ms). */
+  budgetEnd: number;
+  /** A SQL write sent COMMIT: from then on it may have applied, whatever the kit answers. */
+  commitSent?: boolean;
   /** The opened secret, once a request asked for it. */
   secret?: Readonly<Record<string, string>> | null;
 }
@@ -209,8 +213,8 @@ export function createPerformer(options: PerformerOptions): Performer {
   }
 
   // Declared SQL connectors: one kit port per installed definition, built on first use (by its digest), at most 500 kept.
-  const sqlPorts = new Map<string, ConnectorActionPort>();
-  const sqlPortFor = (digest: string, definition: SqlConnectorDefinition): ConnectorActionPort | null => {
+  const sqlPorts = new Map<string, { port: ConnectorActionPort; digests: ReadonlyMap<string, Sha256Digest> }>();
+  const sqlPortFor = (digest: string, definition: SqlConnectorDefinition) => {
     const hit = sqlPorts.get(digest);
     if (hit) {
       sqlPorts.delete(digest);
@@ -219,20 +223,22 @@ export function createPerformer(options: PerformerOptions): Performer {
     }
     if (!options.sql || definitionDigest(definition) !== digest) return null;
     const executor = options.sql;
-    const port = portFor(
-      sqlConnector(definition, executor, async () => {
-        const s = state();
-        const c = s.resolution.connection;
-        if (!c) throw new ConnectorError("final", "sql/no-connection", "No database connection is set up.");
-        const problem = sqlTargetProblem(c.config);
-        if (problem) throw new ConnectorError("final", "sql/bad-config", "The database connection is not set up correctly.", { detail: problem });
-        const secret = await secretOf(s);
-        return { poolKey: `${c.id}:${c.version}`, target: c.config as unknown as SqlTarget, password: secret?.password ?? "" };
-      }),
-    );
-    sqlPorts.set(digest, port);
+    const connector = sqlConnector(definition, executor, async () => {
+      const s = state();
+      const c = s.resolution.connection;
+      if (!c) throw new ConnectorError("final", "sql/no-connection", "No database connection is set up.");
+      const problem = sqlTargetProblem(c.config);
+      if (problem) throw new ConnectorError("final", "sql/bad-config", "The database connection is not set up correctly.", { detail: problem });
+      const password = (await secretOf(s))?.password;
+      if (!password) throw new ConnectorError("final", "sql/no-credentials", "The database connection has no password.");
+      return { tenantId: s.tenantId, poolKey: `${c.id}:${c.version}`, target: c.config as unknown as SqlTarget, password, deadline: s.budgetEnd, onCommit: () => void (s.commitSent = true) };
+    });
+    const digests = new Map<string, Sha256Digest>();
+    for (const name of Object.keys(connector.operations)) digests.set(name, operationDigest(operationContractOf(connector, name)!));
+    const entry = { port: portFor(connector), digests };
+    sqlPorts.set(digest, entry);
     if (sqlPorts.size > 500) sqlPorts.delete(sqlPorts.keys().next().value as string);
-    return port;
+    return entry;
   };
 
   /** The newest version whose operation the flow pinned; else the newest, which refuses a pin it does not serve. */
@@ -278,12 +284,26 @@ export function createPerformer(options: PerformerOptions): Performer {
     let port: ConnectorActionPort;
     let connector: Connector | null = null;
     if (installation.kind === "sql") {
-      const sql = installation.definition && installation.digest ? sqlPortFor(installation.digest, installation.definition as unknown as SqlConnectorDefinition) : null;
-      if (!sql) {
+      // The current definition, then the ones it replaced: a run pinned to an operation of an earlier one (its undo, say) is still served.
+      let chosen: ConnectorActionPort | null = null;
+      try {
+        for (const d of [{ definition: installation.definition, digest: installation.digest }, ...installation.previous]) {
+          const sql = d.definition && d.digest ? sqlPortFor(d.digest, d.definition as unknown as SqlConnectorDefinition) : null;
+          if (sql && (chosen === null || (a.action.contract !== undefined && sql.digests.get(operation) === a.action.contract))) {
+            chosen = sql.port;
+            if (a.action.contract === undefined || sql.digests.get(operation) === a.action.contract) break;
+          }
+        }
+      } catch (error) {
+        // A stored definition this build's kit no longer accepts: no retry will change that.
+        report(error, "perform.sql");
+        return refuse("connect/unknown-action", "This action is not available here.", { detail: `${connectorId} cannot be built by this Connect` });
+      }
+      if (!chosen) {
         report(new Error(`SQL installation ${installation.id} cannot be served`), "perform.sql");
         return refuse("connect/unknown-action", "This action is not available here.", { detail: `${connectorId} cannot be served by this Connect` });
       }
-      port = sql;
+      port = chosen;
     } else {
       const list = versions.get(connectorId);
       if (!list) return refuse("connect/unknown-action", "This action is not available.", { detail: `no connector ${connectorId} in this build` });
@@ -295,7 +315,13 @@ export function createPerformer(options: PerformerOptions): Performer {
     if (resolution.connection?.status === "revoked") return refuse("connect/connection-revoked", "This account was disconnected.");
 
     try {
-      return await calls.run({ tenantId: a.scope.tenantId, resolution, connector, verified: a.proof, signal: capped }, () => port.run(a, capped));
+      const call: CallState = { tenantId: a.scope.tenantId, resolution, connector, verified: a.proof, signal: capped, budgetEnd: now() + budget };
+      const outcome = await calls.run(call, () => port.run(a, capped));
+      // The kit answers a stopped call as not applied, but a SQL write whose COMMIT was sent may have committed.
+      if (call.commitSent && a.action.effect === "write" && (outcome.status === "retryable" || outcome.status === "final")) {
+        return { status: "unknown", error: { code: "sql/commit-unknown", message: "The database did not confirm the change." } };
+      }
+      return outcome;
     } catch (error) {
       // The kit's port never throws; this is a last guard so /perform always answers an outcome.
       report(error, "perform");

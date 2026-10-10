@@ -5,9 +5,13 @@
  * quoting (strings, `E''` strings, quoted identifiers, dollar quotes) and
  * comments (nested block comments), so a `;` or `$1` inside them is text.
  *
- * Reads also run in a READ ONLY transaction, so the database itself refuses
- * a write hidden in a function; these checks keep obvious mistakes and
- * statement stacking out at install.
+ * These checks keep mistakes out at install; they are not the boundary.
+ * The executor sends every statement with the extended protocol, which runs
+ * exactly one command, with `standard_conforming_strings` on, and reads in a
+ * READ ONLY transaction, so the database itself refuses stacking and most
+ * hidden writes. (READ ONLY still allows side effects that are not table
+ * writes, such as dblink, pg_notify or advisory locks: give a read
+ * connection a database role that can only read.)
  */
 
 const READ_STARTS = new Set(["select", "with", "values", "table"]);
@@ -74,7 +78,9 @@ export function scanStatement(text: string): StatementShape | string {
       if (end === -1) return "a dollar-quoted string is not closed";
       i = end + m[0].length;
     } else if (c === ";") {
-      return "a statement may not contain ';': one statement per operation";
+      // A trailing ';' is allowed (with only space and comments after it); one in the middle stacks statements.
+      if (!/^(\s|--[^\n]*(\n|$)|\/\*[^]*?\*\/)*$/.test(text.slice(i + 1))) return "a statement may not contain ';': one statement per operation";
+      i++;
     } else if (/[A-Za-z_]/.test(c)) {
       let j = i;
       while (j < n && /[A-Za-z0-9_$]/.test(text[j]!)) j++;

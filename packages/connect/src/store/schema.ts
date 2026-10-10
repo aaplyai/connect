@@ -67,6 +67,8 @@ CREATE TABLE aaply_connect.installations (
   kind text NOT NULL CHECK (kind IN ('code', 'sql')),
   definition jsonb,
   digest text,
+  -- The definitions this one replaced, newest first (at most 4), as [{ definition, digest }]: runs pinned to them are still served.
+  previous jsonb NOT NULL DEFAULT '[]',
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (tenant_id, app_id, environment_id, connector_id),
   CHECK ((kind = 'code') = (definition IS NULL))
@@ -135,7 +137,7 @@ BEGIN
     'global', (SELECT jsonb_build_object('disabled', g.disabled) FROM aaply_connect.global_policy g),
     'policy', (SELECT jsonb_build_object('disabled', p.disabled, 'denied', to_jsonb(p.denied)) FROM aaply_connect.policy p
                WHERE p.tenant_id = p_tenant AND p.app_id = p_app AND p.environment_id = p_env),
-    'installation', (SELECT jsonb_build_object('id', i.id, 'kind', i.kind, 'definition', i.definition, 'digest', i.digest) FROM aaply_connect.installations i
+    'installation', (SELECT jsonb_build_object('id', i.id, 'kind', i.kind, 'definition', i.definition, 'digest', i.digest, 'previous', i.previous) FROM aaply_connect.installations i
                WHERE i.tenant_id = p_tenant AND i.app_id = p_app AND i.environment_id = p_env AND i.connector_id = p_connector),
     'connection', (SELECT jsonb_build_object(
                      'id', c.id, 'ownerSubject', c.owner_subject, 'role', c.role, 'environmentKind', c.environment_kind,

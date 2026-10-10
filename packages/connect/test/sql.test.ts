@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { signApprovedAction, type ApprovedAction, type ApprovedActionSigner, type Scope } from "@aaply/action-contract";
+import { operationDigest, signApprovedAction, type ApprovedAction, type ApprovedActionSigner, type Scope } from "@aaply/action-contract";
 import { CONFORMANCE_SCOPE, draftApprovedAction, type ApprovedActionDraft } from "@aaply/action-contract/conformance";
 import { createConnect, type Connect } from "@aaply/connect";
 import { postgresUnavailable, startTestDatabase, testEngineKeys, testKeyProvider, type TestDatabase } from "@aaply/connect/testing";
@@ -28,7 +28,7 @@ describe.skipIf(postgresUnavailable())("declared SQL connectors", () => {
     const admin = db.pool("postgres", "postgres");
     await admin.query("CREATE DATABASE booking");
     await db.pool("postgres", "booking").query(BOOKING_SCHEMA);
-    connect = await createConnect({ audience: AUDIENCE, engineKeys: engine.engineKeys, connectors: [], pool: db.app, keys, egress: { allowPrivate: ["127.0.0.1/32"] } });
+    connect = await createConnect({ audience: AUDIENCE, engineKeys: engine.engineKeys, connectors: [], pool: db.app, keys, egress: { allowPrivate: ["127.0.0.1/32"], sqlPrivateTenants: [scope.tenantId] } });
     await connect.admin.installSql(scope, bookingConnector());
     await connect.admin.createConnection({
       scope,
@@ -87,17 +87,53 @@ describe.skipIf(postgresUnavailable())("declared SQL connectors", () => {
     expect(Date.now() - started).toBeLessThan(3_000);
   });
 
-  it("pins the exact SQL: a changed statement refuses a flow pinned to the old one", async () => {
+  it("pins the exact SQL: a run pinned to a replaced statement is served by it, until four newer ones push it out", async () => {
     const s = { ...scope, appId: "pins" };
     await connect.admin.installSql(s, bookingConnector());
     await connect.admin.createConnection({ scope: s, connectorId: "booking-db", owner: { business: true }, config: { host: "127.0.0.1", port: db.port, database: "booking", user: "booking_app", tls: "disable" }, secret: { password: "booking-pw" } });
-    const pinned = (await connect.admin.operations(s))["booking-db.freeSlots"]!.digest;
+    const pinned = operationDigest((await connect.admin.operations(s))["booking-db.freeSlots"]!);
     expect((await connect.perform(await sign({ scope: s, action: "booking-db.freeSlots", effect: "read", input: {}, contract: pinned as never }))).status).toBe("ok");
     await connect.admin.installSql(s, bookingConnector("1.0.1", "starts_at desc"));
-    const repinned = (await connect.admin.operations(s))["booking-db.freeSlots"]!.digest;
+    const repinned = operationDigest((await connect.admin.operations(s))["booking-db.freeSlots"]!);
     expect(repinned).not.toBe(pinned);
-    expect(await connect.perform(await sign({ scope: s, action: "booking-db.freeSlots", effect: "read", input: {}, contract: pinned as never }))).toMatchObject({ status: "final", error: { code: "connect/contract-mismatch" } });
-    expect((await connect.perform(await sign({ scope: s, action: "booking-db.freeSlots", effect: "read", input: {}, contract: repinned as never }))).status).toBe("ok");
+    const ids = async (contract: string) => {
+      const outcome = await connect.perform(await sign({ scope: s, action: "booking-db.freeSlots", effect: "read", input: {}, contract: contract as never }));
+      return outcome.status === "ok" ? (outcome.output as { rows: Array<{ id: string }> }).rows.map((r) => r.id) : outcome;
+    };
+    expect(Array.isArray(await ids(pinned))).toBe(true);
+    expect(Array.isArray(await ids(repinned))).toBe(true);
+    for (const v of ["1.0.2", "1.0.3", "1.0.4", "1.0.5"]) await connect.admin.installSql(s, bookingConnector(v, `starts_at desc, id /* ${v} */`));
+    expect(await ids(pinned)).toMatchObject({ status: "final", error: { code: "connect/contract-mismatch" } });
+  });
+
+  it("answers a write stopped before COMMIT as not applied, and rolls it back", async () => {
+    const stop = new AbortController();
+    setTimeout(() => stop.abort(), 300);
+    const outcome = await connect.perform(await sign({ action: "booking-db.slowBooking", effect: "write", input: { slotId: "s3", customerRef: "late", reference: "ref-late-001" }, idempotent: true }), stop.signal);
+    expect(outcome.status).toBe("retryable");
+    await new Promise((r) => setTimeout(r, 1_800));
+    const { rows } = await db.pool("postgres", "booking").query("SELECT count(*)::int AS n FROM booking.bookings WHERE reference = 'ref-late-001'");
+    expect(rows[0].n).toBe(0);
+  });
+
+  it("runs exactly one command, whatever the database's string settings make of the text", async () => {
+    await connect.perform(await sign({ action: "booking-db.stacked", effect: "read", input: {} }));
+    const { rows } = await db.pool("postgres", "booking").query("SELECT count(*)::int AS n FROM booking.slots WHERE id = 's9'");
+    expect(rows[0].n).toBe(0);
+  });
+
+  it("stops reading an answer larger than its budget", async () => {
+    expect(await connect.perform(await sign({ action: "booking-db.huge", effect: "read", input: {} }))).toMatchObject({ status: "final", error: { code: "sql/result-too-large" } });
+  });
+
+  it("leaves no session state for the next call", async () => {
+    expect((await connect.perform(await sign({ action: "booking-db.holdLock", effect: "read", input: {} }))).status).toBe("ok");
+    const { rows } = await db.pool("postgres", "booking").query("SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory'");
+    expect(rows[0].n).toBe(0);
+  });
+
+  it("answers dates and zone-less timestamps as the database wrote them", async () => {
+    expect(await connect.perform(await sign({ action: "booking-db.slotDay", effect: "read", input: { id: "s1" } }))).toMatchObject({ status: "ok", output: { day: "2026-11-02", local: "2026-11-02 09:00:00" } });
   });
 
   it("refuses a database address the operator did not allow, and plain TCP to the internet", async () => {
@@ -108,6 +144,13 @@ describe.skipIf(postgresUnavailable())("declared SQL connectors", () => {
       const c = await strict.admin.createConnection({ scope: s, connectorId: "booking-db", owner: { business: true }, config: { host: "127.0.0.1", port: db.port, database: "booking", user: "booking_app", tls: "disable" }, secret: { password: "booking-pw" } });
       const read = () => sign({ scope: s, action: "booking-db.freeSlots", effect: "read", input: {} });
       expect(await strict.perform(await read())).toMatchObject({ status: "final", error: { code: "sql/egress-denied" } });
+      // The operator's allowlist is not every tenant's: only the tenants it names reach private addresses.
+      const other = await createConnect({ audience: AUDIENCE, engineKeys: engine.engineKeys, connectors: [], pool: db.app, keys, egress: { allowPrivate: ["127.0.0.1/32"] } });
+      try {
+        expect(await other.perform(await read())).toMatchObject({ status: "final", error: { code: "sql/egress-denied" } });
+      } finally {
+        await other.close();
+      }
       await strict.admin.updateConnection(s.tenantId, c.id, c.version, { config: { host: "8.8.8.8", database: "booking", user: "booking_app", tls: "disable" } });
       expect(await strict.perform(await read())).toMatchObject({ status: "final", error: { code: "sql/tls-required" } });
     } finally {

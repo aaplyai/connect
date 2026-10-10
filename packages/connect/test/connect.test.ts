@@ -268,7 +268,7 @@ describe.skipIf(postgresUnavailable())("Connect", () => {
   it("lists the operation contracts of what a scope has installed, for a host to pin", async () => {
     const ops = await connect.admin.operations(scope);
     expect(Object.keys(ops).sort()).toEqual(["notes.create", "notes.get", "notes.remove"]);
-    expect(ops["notes.create"]!.digest).toBe(operationDigest(operationContractOf(v2, "create")!));
+    expect(operationDigest(ops["notes.create"]!)).toBe(operationDigest(operationContractOf(v2, "create")!));
   });
 
   it("checks the engine's signature once per call", async () => {

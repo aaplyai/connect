@@ -9,7 +9,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Scope } from "@aaply/action-contract";
 import { CONFORMANCE_SCOPE } from "@aaply/action-contract/conformance";
-import { createFlowRuntime, createMemoryCatalog, createMemoryStore, e, hmacKeyMinter, type FlowDefinition, type FlowRuntime, type JsonSchema, type TrustedContext } from "@aaply/flow";
+import { createFlowRuntime, createMemoryCatalog, createMemoryStore, e, hmacKeyMinter, pinActionContracts, type ApprovedAction, type FlowDefinition, type FlowRuntime, type JsonSchema, type TrustedContext } from "@aaply/flow";
 import { createConnect, type Connect } from "@aaply/connect";
 import { serveConnect } from "@aaply/connect/http";
 import { postgresUnavailable, startTestDatabase, testEngineKeys, testKeyProvider, type TestDatabase } from "@aaply/connect/testing";
@@ -60,6 +60,7 @@ describe.skipIf(postgresUnavailable())("the engine runs a booking flow through C
   let close: () => Promise<void>;
   let runtime: FlowRuntime;
   let requests = 0;
+  const sent: ApprovedAction[] = [];
 
   const ctx = (person: string): TrustedContext => ({
     scope,
@@ -97,7 +98,7 @@ describe.skipIf(postgresUnavailable())("the engine runs a booking flow through C
 
     // Across trust domains: the engine holds the private key; Connect holds only the public one.
     const engine = await testEngineKeys();
-    connect = await createConnect({ audience: AUDIENCE, engineKeys: engine.engineKeys, connectors: [], pool: db.app, keys: testKeyProvider(), egress: { allowPrivate: ["127.0.0.1/32"] } });
+    connect = await createConnect({ audience: AUDIENCE, engineKeys: engine.engineKeys, connectors: [], pool: db.app, keys: testKeyProvider(), egress: { allowPrivate: ["127.0.0.1/32"], sqlPrivateTenants: [scope.tenantId] } });
     await connect.admin.installSql(scope, bookingConnector());
     await connect.admin.createConnection({
       scope,
@@ -110,16 +111,20 @@ describe.skipIf(postgresUnavailable())("the engine runs a booking flow through C
     close = () => served.close();
     const { port } = served.server.address() as { port: number };
 
+    // Published as a host would: each action pinned to the operation contract Connect lists, which covers its SQL.
+    const operations = await connect.admin.operations(scope);
+    const pinned = pinActionContracts(bookSlot, operations);
+    expect(pinned.diagnostics.filter((d) => d.severity === "error")).toEqual([]);
     const catalog = createMemoryCatalog();
-    catalog.publish(scope, bookSlot);
+    catalog.publish(scope, pinned.definition);
+    const http = httpPort(`http://127.0.0.1:${port}`, TOKEN);
     runtime = createFlowRuntime({
       catalog,
       store: createMemoryStore(),
-      actions: httpPort(`http://127.0.0.1:${port}`, TOKEN),
+      actions: { run: (a, signal) => (sent.push(a), http.run(a, signal)) },
       keys: hmacKeyMinter("engine-test-idempotency-secret-0123456789"),
       envelopes: { audience: AUDIENCE, signer: engine.signer },
-      // The contracts Connect lists for the scope: the engine pins each envelope to one, and the pin covers the SQL.
-      operations: await connect.admin.operations(scope),
+      operations,
       policy: () => ({ mode: "off" }),
     });
   });
@@ -153,5 +158,20 @@ describe.skipIf(postgresUnavailable())("the engine runs a booking flow through C
     expect((await bookings()).find((b) => b.reference === "ref-cy-00001")?.status).toBe("cancelled");
     const again = await bookAndConfirm("dee", "s2", "ref-dee-0001");
     expect(again.view.step?.id).toBe("after");
+  });
+
+  it("pins every envelope it sends, the undo included", () => {
+    expect(sent.length).toBeGreaterThan(3);
+    for (const a of sent) expect(a.action.contract, a.action.id).toMatch(/^sha256:/);
+    expect(sent.some((a) => a.action.id === "booking-db.cancelBooking")).toBe(true);
+  });
+
+  it("still undoes a booking after the database connector was changed under the run", async () => {
+    const { runId } = await bookAndConfirm("eve", "s3", "ref-eve-0001");
+    await connect.admin.installSql(scope, bookingConnector("1.1.0", "starts_at", "v1.1"));
+    await runtime.submit(ctx("eve"), runId, { kind: "output", stepId: "after", name: "cancel" });
+    await drain();
+    expect((await runtime.view(ctx("eve"), runId)).run).toBe("cancelled");
+    expect((await bookings()).find((b) => b.reference === "ref-eve-0001")?.status).toBe("cancelled");
   });
 });

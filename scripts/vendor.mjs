@@ -74,7 +74,7 @@ function sync(target, checkout, commit) {
   const head = commit ?? execFileSync("git", ["-C", checkout, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
   const keep = readFileSync(pinPath);
   // Everything but node_modules (pnpm's links) is replaced.
-  for (const name of readdirSync(join(ROOT, target))) if (name !== "node_modules") rmSync(join(ROOT, target, name), { recursive: true, force: true });
+  for (const name of existsSync(join(ROOT, target)) ? readdirSync(join(ROOT, target)) : []) if (name !== "node_modules") rmSync(join(ROOT, target, name), { recursive: true, force: true });
   const exclude = new Set(pin.exclude ?? []);
   cpSync(source, join(ROOT, target), {
     recursive: true,

@@ -11,8 +11,8 @@ import { ConnectorError, defineConnector, type Connector, type OperationDefiniti
 import { implementationDigest, type SqlConnectorDefinition } from "./definition.js";
 import type { SqlExecutor, SqlTarget } from "./executor.js";
 
-/** What a SQL handler needs from the call in progress: the connection's pool key, target and password. */
-export type SqlConnectionContext = () => Promise<{ poolKey: string; target: SqlTarget; password: string }>;
+/** What a SQL handler needs from the call in progress: the connection, its password, the caller's own deadline and its commit hook. */
+export type SqlConnectionContext = () => Promise<{ tenantId: string; poolKey: string; target: SqlTarget; password: string; deadline: number; onCommit(): void }>;
 
 export function sqlConnector(definition: SqlConnectorDefinition, executor: SqlExecutor, connection: SqlConnectionContext): Connector {
   const operations: Record<string, OperationDefinition> = {};
@@ -31,7 +31,7 @@ export function sqlConnector(definition: SqlConnectorDefinition, executor: SqlEx
       implementation,
       handler: async (input, ctx) => {
         const c = await connection();
-        const out = await executor.run({ ...c, op, name: implementation, input, signal: ctx.signal, deadline: ctx.deadline, now: Date.now() });
+        const out = await executor.run({ ...c, op, input, signal: ctx.signal, deadline: Math.min(ctx.deadline, c.deadline), now: Date.now() });
         if (out === undefined) throw new ConnectorError("final", "sql/no-row", "Nothing matched.");
         return out as never;
       },

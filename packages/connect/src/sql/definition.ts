@@ -65,6 +65,8 @@ export interface SqlConnectorDefinition {
 }
 
 export const MAX_SQL_ROWS = 1_000;
+const MAX_SQL_OPERATIONS = 100;
+const MAX_SQL_DEFINITION_CHARS = 256 * 1024;
 const ID = /^[a-z][a-z0-9-]{0,62}$/;
 const OP = /^[A-Za-z][A-Za-z0-9_]{0,62}$/;
 const CODE = /^[a-z][a-z0-9-]{0,30}\/[a-z0-9][a-z0-9-]{0,62}$/;
@@ -90,6 +92,8 @@ export function sqlDefinitionProblems(value: unknown): string[] {
   if (d.kind !== "sql") out.push('kind is "sql"');
   if (d.engine !== "postgres") out.push('engine is "postgres"');
   if (!isObject(d.operations) || Object.keys(d.operations).length === 0) return [...out, "operations names at least one operation"];
+  if (Object.keys(d.operations).length > MAX_SQL_OPERATIONS) out.push(`at most ${MAX_SQL_OPERATIONS} operations`);
+  if (JSON.stringify(d).length > MAX_SQL_DEFINITION_CHARS) out.push(`a definition is at most ${MAX_SQL_DEFINITION_CHARS} characters of JSON`);
   for (const [name, raw] of Object.entries(d.operations)) {
     const at = `operations.${name}`;
     if (!OP.test(name)) out.push(`${at}: an operation name is letters, digits and '_'`);
@@ -119,7 +123,11 @@ export function sqlDefinitionProblems(value: unknown): string[] {
       if (effect !== "write" || raw.rows !== "one" || !isObject(o)) out.push(`${at}.onConflictEmpty is for a write with rows "one", as { statement, params }`);
       else {
         const p = paramsProblem(o.params, input);
+        const required = Array.isArray(input.required) ? input.required : [];
+        // An optional value is NULL when left out, and `col = NULL` never matches: the retry of a write that applied would read as a reused reference.
+        const optional = p ? undefined : (o.params as string[]).find((name) => !required.includes(name));
         if (p) out.push(`${at}.onConflictEmpty: ${p}`);
+        else if (optional) out.push(`${at}.onConflictEmpty: param ${optional} must be required by the input (an optional one is NULL when left out, and = NULL never matches)`);
         else {
           const problem = statementProblem(o.statement as string, "read", (o.params as string[]).length);
           if (problem) out.push(`${at}.onConflictEmpty.statement: ${problem}`);
@@ -130,7 +138,8 @@ export function sqlDefinitionProblems(value: unknown): string[] {
       if (!isObject(raw.errors)) out.push(`${at}.errors maps SQLSTATE to an error code`);
       else
         for (const [state, code] of Object.entries(raw.errors)) {
-          if (!/^[0-9A-Z]{5}$/.test(state)) out.push(`${at}.errors: ${state} is not a SQLSTATE`);
+          // Only errors that say the statement was refused: constraint (23), data (22) and raised (P0) classes.
+          if (!/^(23|22|P0)[0-9A-Z]{3}$/.test(state)) out.push(`${at}.errors: ${state} is not a SQLSTATE of class 23, 22 or P0`);
           if (typeof code !== "string" || !CODE.test(code) || code.startsWith("connect/") || code.startsWith("flow/")) out.push(`${at}.errors.${state}: a code is <domain>/<name>, not connect/ or flow/`);
         }
     }

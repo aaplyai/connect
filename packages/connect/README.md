@@ -65,14 +65,26 @@ as bind parameters. The definition compiles into a kit connector, so every check
 each operation's statement digest is its contract's `implementation`: a flow pinned to an operation is
 pinned to its exact SQL, and changing a statement is a new pin.
 
-- Reads run in a `READ ONLY` transaction, so a write hidden in a read is refused by the database.
+- Every statement is sent with the extended protocol, which runs exactly one command, and with
+  `standard_conforming_strings` on, whatever the database's own settings.
+- Reads run in a `READ ONLY` transaction, so a write hidden in a read is refused by the database. That is
+  not a full boundary (dblink, `pg_notify` and advisory locks still work): give a connection that only
+  reads a database role that can only read.
+- A call reads at most 4 MiB from the database, and the session's state (settings, locks, temporary
+  tables) is discarded after each call.
+- A call stopped before `COMMIT` is sent closes its socket, so the database rolls it back; once `COMMIT`
+  of a write is sent, a failure or a stop is `unknown`.
 - Each call sets `statement_timeout` and `lock_timeout` from the call's budget.
 - A write de-duplicates on a business reference (`insert … on conflict do nothing returning …` with
   `onConflictEmpty`), so the engine may send it again safely.
 - A failure before `COMMIT` is retryable (connection, timeout, serialization) or final (a declared
   SQLSTATE in `errors`, or any other database error); a failed `COMMIT` on a write is `unknown`.
-- The database host is checked by egress like any other: a private address needs `allowPrivate`, and
-  TLS may be off only to such an address.
+- The database host is checked by egress like any other. A private address needs `allowPrivate` and
+  the tenant in `egress.sqlPrivateTenants` (the allowlist is the operator's, not every tenant's), and TLS
+  may be off only to such an address.
+- Installing a changed definition keeps the four it replaced serving runs pinned to them, so a booking
+  made before the change can still be undone after it.
+- `admin.operations(scope)` lists the contracts a host pins with the engine's `pinActionContracts`.
 
 ## Secrets
 

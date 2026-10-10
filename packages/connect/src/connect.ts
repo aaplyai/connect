@@ -8,7 +8,7 @@
  */
 
 import type pg from "pg";
-import { ed25519ActionVerifier, operationDigest, type ActionOutcome, type ActionPortDescription, type Ed25519PublicKey, type EnvironmentKind, type JsonObject, type OperationContract, type Scope } from "@aaply/action-contract";
+import { ed25519ActionVerifier, type ActionOutcome, type ActionPortDescription, type Ed25519PublicKey, type EnvironmentKind, type JsonObject, type OperationContract, type Scope } from "@aaply/action-contract";
 import { operationContractOf, type Connector, type ConnectorLogSink, type FetchLike } from "@aaply/connector-sdk";
 import { secretProblem, type TokenRefresher } from "./credentials.js";
 import { egressPolicy, safeFetch, type EgressOptions } from "./egress.js";
@@ -91,8 +91,12 @@ export interface ConnectAdmin {
   revokeConnection(tenantId: string, id: string): Promise<Connection | null>;
   connection(tenantId: string, id: string): Promise<Connection | null>;
   connections(scope: Scope, filter?: { connectorId?: string; ownerSubject?: string }): Promise<Connection[]>;
-  /** The operation contracts of the connectors installed for a scope (their newest version), which a host pins when it publishes a flow. */
-  operations(scope: Scope): Promise<Record<string, OperationContract & { digest: string }>>;
+  /**
+   * The operation contracts of the connectors installed for a scope (their
+   * newest version), as the engine's `pinActionContracts` takes them when a
+   * host publishes a flow. A pin is `operationDigest(contract)`.
+   */
+  operations(scope: Scope): Promise<Record<string, OperationContract>>;
 }
 
 export interface Connect {
@@ -119,7 +123,7 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
   const vault = createVault({ keys: options.keys, store, ...(options.now ? { now: options.now } : {}) });
   const policy = egressPolicy(options.egress);
   const egress = safeFetch(policy, { connections: options.egress?.connectionsPerOrigin ?? 64 });
-  const sql = createSqlExecutor({ egress: policy });
+  const sql = createSqlExecutor({ egress: policy, ...(options.egress?.sqlPrivateTenants ? { privateTenants: options.egress.sqlPrivateTenants } : {}) });
   const performer = createPerformer({
     audience: options.audience,
     verifier: ed25519ActionVerifier(options.engineKeys, options.now ? { now: options.now } : {}),
@@ -215,13 +219,13 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
     connection: (tenantId, id) => store.connection(tenantId, id),
     connections: (scope, filter) => store.connections(scope, filter),
     async operations(scope) {
-      const out: Record<string, OperationContract & { digest: string }> = {};
+      const out: Record<string, OperationContract> = {};
       for (const inst of await store.installations(scope)) {
         const connector = inst.kind === "sql" ? declared(inst.definition as unknown as SqlConnectorDefinition) : newest(options.connectors, inst.connectorId);
         if (!connector) continue;
         for (const name of Object.keys(connector.operations)) {
           const contract = operationContractOf(connector, name)!;
-          out[`${connector.id}.${name}`] = { ...contract, digest: operationDigest(contract) };
+          out[`${connector.id}.${name}`] = contract;
         }
       }
       return out;
