@@ -73,6 +73,9 @@ export class StoreConflict extends Error {
   override readonly name = "StoreConflict";
 }
 
+/** How long a replay claim outlives its envelope's deadline. */
+const CLAIM_MARGIN_MS = 10 * 60_000;
+
 const b64 = (text: string) => new Uint8Array(Buffer.from(text, "base64"));
 
 function connectionOf(row: Record<string, unknown>): Connection {
@@ -174,7 +177,7 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
               version: c.version,
               secret: c.secret
                 ? {
-                    sealed: { dataKeyId: c.secret.dataKeyId, iv: b64(c.secret.iv), sealed: b64(c.secret.sealed) },
+                    sealed: { dataKeyId: c.secret.dataKeyId, version: c.secret.version, iv: b64(c.secret.iv), sealed: b64(c.secret.sealed) },
                     dataKey: { dataKeyId: c.secret.dataKeyId, wrapped: b64(c.secret.wrapped), wrappingKeyId: c.secret.wrappingKeyId },
                   }
                 : null,
@@ -184,7 +187,8 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
     },
 
     async claim(tenantId, key, until) {
-      const { rows } = await pool.query("SELECT aaply_connect.claim($1, $2, to_timestamp($3::double precision / 1000)) AS claimed", [tenantId, key, until]);
+      // Held well past the deadline: the database's clock and each instance's may differ, and a claim that lapsed early would let a late copy through.
+      const { rows } = await pool.query("SELECT aaply_connect.claim($1, $2, to_timestamp($3::double precision / 1000)) AS claimed", [tenantId, key, until + CLAIM_MARGIN_MS]);
       return rows[0]?.claimed === true;
     },
 
@@ -268,10 +272,11 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
           [c.id, ...scopeParams(c.scope), c.connectorId, c.ownerSubject, c.role, c.environmentKind, [...c.grantedScopes], c.account, c.config],
         );
         if (secret) {
-          await client.query("INSERT INTO aaply_connect.secrets (connection_id, tenant_id, data_key_id, iv, sealed) VALUES ($1, $2, $3, $4, $5)", [
+          await client.query("INSERT INTO aaply_connect.secrets (connection_id, tenant_id, data_key_id, sealed_version, iv, sealed) VALUES ($1, $2, $3, $4, $5, $6)", [
             c.id,
             c.scope.tenantId,
             secret.dataKeyId,
+            secret.version,
             Buffer.from(secret.iv),
             Buffer.from(secret.sealed),
           ]);
@@ -281,7 +286,8 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
     },
 
     async updateConnection(tenantId, id, expectedVersion, change, seal) {
-      // Sealing reads the tenant's data key in its own transaction, so it runs before this one.
+      // Sealing reads the tenant's data key in its own transaction, so it runs before this one. The sealed
+      // value is bound to the connection's new version; a change without a new secret keeps the sealed one as it is.
       const sealed = seal ? await seal(expectedVersion + 1) : null;
       return tx(tenantId, async (client) => {
         const { rows } = await client.query(
@@ -294,9 +300,9 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
         if (rows.length === 0) throw new StoreConflict(`connection ${id} is not at version ${expectedVersion}, or is revoked`);
         if (sealed) {
           await client.query(
-            `INSERT INTO aaply_connect.secrets (connection_id, tenant_id, data_key_id, iv, sealed) VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (connection_id) DO UPDATE SET data_key_id = EXCLUDED.data_key_id, iv = EXCLUDED.iv, sealed = EXCLUDED.sealed`,
-            [id, tenantId, sealed.dataKeyId, Buffer.from(sealed.iv), Buffer.from(sealed.sealed)],
+            `INSERT INTO aaply_connect.secrets (connection_id, tenant_id, data_key_id, sealed_version, iv, sealed) VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (connection_id) DO UPDATE SET data_key_id = EXCLUDED.data_key_id, sealed_version = EXCLUDED.sealed_version, iv = EXCLUDED.iv, sealed = EXCLUDED.sealed`,
+            [id, tenantId, sealed.dataKeyId, sealed.version, Buffer.from(sealed.iv), Buffer.from(sealed.sealed)],
           );
         }
         return connectionOf(rows[0]);
@@ -339,16 +345,17 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
 
     async check() {
       const { rows } = await pool.query(
-        `SELECT (SELECT schema_version FROM aaply_connect.meta) AS version, r.rolsuper, r.rolbypassrls, pg_has_role(current_user, $1, 'MEMBER') AS member,
-                EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'aaply_connect' AND pg_get_userbyid(c.relowner) = current_user) AS owns
-         FROM pg_roles r WHERE r.rolname = current_user`,
+        `SELECT (SELECT schema_version FROM aaply_connect.meta) AS version, pg_has_role(current_user, $1, 'MEMBER') AS member,
+                EXISTS (SELECT 1 FROM pg_roles r WHERE (r.rolsuper OR r.rolbypassrls) AND pg_has_role(current_user, r.oid, 'MEMBER')) AS bypass,
+                EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE n.nspname = 'aaply_connect' AND pg_has_role(current_user, c.relowner, 'MEMBER')) AS owns`,
         [APP_ROLE],
       );
       const row = rows[0];
       if (!row) throw new Error("cannot read the login role");
       if (row.version !== SCHEMA_VERSION) throw new Error(`the database has Connect schema ${row.version}; this build needs ${SCHEMA_VERSION}. Pre-1.0 builds do not migrate: make a new database.`);
-      if (row.rolsuper || row.rolbypassrls) throw new Error("the login role can bypass row security; use a role that is only a member of aaply_connect_app");
-      if (row.owns) throw new Error("the login role owns Connect's tables, so row security does not bind it; use a role that is only a member of aaply_connect_app");
+      if (row.bypass) throw new Error("the login role is, or is a member of, a role that can bypass row security; use a role that is only a member of aaply_connect_app");
+      if (row.owns) throw new Error("the login role owns Connect's tables, or is a member of their owner, so it can switch row security off; use a role that is only a member of aaply_connect_app");
       if (!row.member) throw new Error("the login role is not a member of aaply_connect_app");
     },
   };

@@ -17,14 +17,16 @@ import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 export interface KeyProvider {
   /** The id of the key new data keys are wrapped under. */
   readonly keyId: string;
-  wrap(dataKey: Uint8Array, context: { tenantId: string }): Promise<Uint8Array>;
-  unwrap(wrapped: Uint8Array, context: { tenantId: string; keyId: string }): Promise<Uint8Array>;
+  wrap(dataKey: Uint8Array, context: { tenantId: string; dataKeyId: string }): Promise<Uint8Array>;
+  unwrap(wrapped: Uint8Array, context: { tenantId: string; dataKeyId: string; keyId: string }): Promise<Uint8Array>;
 }
 
 /** A sealed secret as the store keeps it. */
 export interface SealedSecret {
   /** The data key it is sealed under. */
   dataKeyId: string;
+  /** The secret version it is sealed for (bound in the additional data). Moves only when the secret changes. */
+  version: number;
   iv: Uint8Array;
   /** Ciphertext followed by the 16-byte GCM tag. */
   sealed: Uint8Array;
@@ -61,19 +63,19 @@ export function localKeyProvider(options: { keyId: string; key: Uint8Array }): K
   if (options.key.length !== 32) throw new Error("the local wrapping key must be 32 bytes");
   if (!/^[A-Za-z0-9._-]{1,64}$/.test(options.keyId)) throw new Error("keyId must be 1-64 letters, digits, '.', '_' or '-'");
   const key = Uint8Array.from(options.key);
-  const context = (tenantId: string, keyId: string) => Buffer.from(`aaply.connect.data-key.1\n${keyId}\n${tenantId}`, "utf8");
+  const context = (tenantId: string, dataKeyId: string, keyId: string) => Buffer.from(`aaply.connect.data-key.1\n${keyId}\n${tenantId}\n${dataKeyId}`, "utf8");
   return {
     keyId: options.keyId,
-    async wrap(dataKey, { tenantId }) {
-      const { iv, sealed } = aesSeal(key, dataKey, context(tenantId, options.keyId));
+    async wrap(dataKey, { tenantId, dataKeyId }) {
+      const { iv, sealed } = aesSeal(key, dataKey, context(tenantId, dataKeyId, options.keyId));
       const out = new Uint8Array(12 + sealed.length);
       out.set(iv, 0);
       out.set(sealed, 12);
       return out;
     },
-    async unwrap(wrapped, { tenantId, keyId }) {
+    async unwrap(wrapped, { tenantId, dataKeyId, keyId }) {
       if (keyId !== options.keyId) throw new Error(`no wrapping key ${keyId}`);
-      return new Uint8Array(aesOpen(key, wrapped.subarray(0, 12), wrapped.subarray(12), context(tenantId, keyId)));
+      return new Uint8Array(aesOpen(key, wrapped.subarray(0, 12), wrapped.subarray(12), context(tenantId, dataKeyId, keyId)));
     },
   };
 }
@@ -93,7 +95,7 @@ export interface WrappedDataKey {
 
 export interface Vault {
   seal(tenantId: string, connectionId: string, version: number, secret: Readonly<Record<string, string>>): Promise<SealedSecret>;
-  open(tenantId: string, connectionId: string, version: number, secret: SealedSecret, dataKey: WrappedDataKey): Promise<Record<string, string>>;
+  open(tenantId: string, connectionId: string, secret: SealedSecret, dataKey: WrappedDataKey): Promise<Record<string, string>>;
 }
 
 const CACHE_MS = 5 * 60_000;
@@ -123,26 +125,25 @@ export function createVault(options: { keys: KeyProvider; store: DataKeyStore; n
   const unwrap = async (tenantId: string, dataKey: WrappedDataKey): Promise<Uint8Array> => {
     const hit = cached(tenantId, dataKey.dataKeyId);
     if (hit) return hit;
-    const key = await options.keys.unwrap(dataKey.wrapped, { tenantId, keyId: dataKey.wrappingKeyId });
+    const key = await options.keys.unwrap(dataKey.wrapped, { tenantId, dataKeyId: dataKey.dataKeyId, keyId: dataKey.wrappingKeyId });
     if (key.length !== 32) throw new Error("a data key must be 32 bytes");
     remember(tenantId, dataKey.dataKeyId, key);
     return key;
   };
   return {
     async seal(tenantId, connectionId, version, secret) {
-      const current = await options.store.currentDataKey(tenantId, async () => ({
-        dataKeyId: `dk_${randomBytes(8).toString("hex")}`,
-        wrapped: await options.keys.wrap(randomBytes(32), { tenantId }),
-        wrappingKeyId: options.keys.keyId,
-      }));
+      const current = await options.store.currentDataKey(tenantId, async () => {
+        const dataKeyId = `dk_${randomBytes(8).toString("hex")}`;
+        return { dataKeyId, wrapped: await options.keys.wrap(randomBytes(32), { tenantId, dataKeyId }), wrappingKeyId: options.keys.keyId };
+      });
       const key = await unwrap(tenantId, current);
       const { iv, sealed } = aesSeal(key, Buffer.from(JSON.stringify(secret), "utf8"), aad(tenantId, connectionId, version));
-      return { dataKeyId: current.dataKeyId, iv, sealed };
+      return { dataKeyId: current.dataKeyId, version, iv, sealed };
     },
-    async open(tenantId, connectionId, version, secret, dataKey) {
+    async open(tenantId, connectionId, secret, dataKey) {
       if (secret.dataKeyId !== dataKey.dataKeyId) throw new Error("the secret is sealed under another data key");
       const key = await unwrap(tenantId, dataKey);
-      const plain = aesOpen(key, secret.iv, secret.sealed, aad(tenantId, connectionId, version));
+      const plain = aesOpen(key, secret.iv, secret.sealed, aad(tenantId, connectionId, secret.version));
       const parsed: unknown = JSON.parse(plain.toString("utf8"));
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed) || !Object.values(parsed).every((v) => typeof v === "string")) throw new Error("a sealed secret is not a map of strings");
       return parsed as Record<string, string>;

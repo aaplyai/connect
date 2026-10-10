@@ -13,6 +13,7 @@ import { operationContractOf, type Connector, type ConnectorLogSink, type FetchL
 import { secretProblem, type TokenRefresher } from "./credentials.js";
 import { egressPolicy, safeFetch, type EgressOptions } from "./egress.js";
 import { newId } from "./ids.js";
+import { compareVersions } from "./semver.js";
 import { createPerformer, DEFAULT_ROLE } from "./performer.js";
 import { createPgStore, type Connection, type ConnectStore } from "./store/store.js";
 import { createVault, type KeyProvider } from "./vault.js";
@@ -98,7 +99,7 @@ export interface Connect {
 }
 
 function newest(connectors: readonly Connector[], id: string): Connector | undefined {
-  return connectors.filter((c) => c.id === id).sort((a, b) => (a.version < b.version ? 1 : a.version > b.version ? -1 : 0))[0];
+  return connectors.filter((c) => c.id === id).sort((a, b) => compareVersions(b.version, a.version))[0];
 }
 
 export async function createConnect(options: ConnectOptions): Promise<Connect> {

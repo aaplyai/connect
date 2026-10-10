@@ -12,6 +12,10 @@
  * deadline and at a ceiling (55 s by default), so Connect answers before the
  * engine gives up and before a load balancer cuts the request.
  *
+ * Not yet: deferred results. A handler that defers (`ctx.defer`) has no sink
+ * here, so it answers `unknown` for a write and `retryable` for a read, as
+ * the contract says; the sink comes with the first flow that waits on one.
+ *
  * `perform` never throws: every path ends in an `ActionOutcome`.
  */
 
@@ -37,6 +41,7 @@ import {
   type FetchLike,
 } from "@aaply/connector-sdk";
 import { headersOf, type TokenRefresher } from "./credentials.js";
+import { compareVersions } from "./semver.js";
 import type { ConnectStore, Resolution } from "./store/store.js";
 import type { Vault } from "./vault.js";
 
@@ -83,17 +88,17 @@ interface CallState {
   secret?: Readonly<Record<string, string>> | null;
 }
 
-function compareVersions(a: string, b: string): number {
-  const pa = a.split(/[.+-]/).map((p) => (/^\d+$/.test(p) ? Number(p) : p));
-  const pb = b.split(/[.+-]/).map((p) => (/^\d+$/.test(p) ? Number(p) : p));
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const x = pa[i] ?? 0;
-    const y = pb[i] ?? 0;
-    if (x === y) continue;
-    if (typeof x === "number" && typeof y === "number") return x - y;
-    return String(x) < String(y) ? -1 : 1;
-  }
-  return 0;
+/** `work`, or a rejection once `signal` aborts (a store that stalls must not hold the answer past the deadline). */
+function whileOpen<T>(signal: AbortSignal, work: Promise<T>): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const stop = () => reject(signal.reason);
+    signal.addEventListener("abort", stop, { once: true });
+    work.then(
+      (value) => (signal.removeEventListener("abort", stop), resolve(value)),
+      (error: unknown) => (signal.removeEventListener("abort", stop), reject(error)),
+    );
+  });
 }
 
 export function createPerformer(options: PerformerOptions): Performer {
@@ -120,7 +125,7 @@ export function createPerformer(options: PerformerOptions): Performer {
     const c = s.resolution.connection;
     if (!c?.secret) return (s.secret = null);
     try {
-      s.secret = await options.vault.open(s.tenantId, c.id, c.version, c.secret.sealed, c.secret.dataKey);
+      s.secret = await options.vault.open(s.tenantId, c.id, c.secret.sealed, c.secret.dataKey);
     } catch (error) {
       report(error, "vault.open");
       throw new ConnectorError("retryable", "connect/unavailable", "The account's credentials could not be read right now.");
@@ -131,7 +136,7 @@ export function createPerformer(options: PerformerOptions): Performer {
   const versions = new Map<string, Served[]>();
   for (const connector of options.connectors) {
     const list = versions.get(connector.id) ?? [];
-    if (list.some((s) => s.connector.version === connector.version)) throw new Error(`${connector.id}@${connector.version} is given twice`);
+    if (list.some((s) => compareVersions(s.connector.version, connector.version) === 0)) throw new Error(`${connector.id}@${connector.version} is given twice`);
     const digests = new Map<string, Sha256Digest>();
     for (const name of Object.keys(connector.operations)) digests.set(name, operationDigest(operationContractOf(connector, name)!));
     const port = createConnectorActionPort({
@@ -183,22 +188,29 @@ export function createPerformer(options: PerformerOptions): Performer {
     const checked = await verifyApprovedAction(value, { now: now(), audience: options.audience, verifier: options.verifier });
     if (!checked.ok) return checked.outcome;
     const a: ApprovedAction = checked.action;
+    // A person is stored as domain:id; a domain with a colon in it would read as another person.
+    if (a.subject?.domain.includes(":")) return refuse("connect/invalid-envelope", "The run's person is malformed.", { detail: "subject.domain contains ':'" });
     const dot = a.action.id.indexOf(".");
     const connectorId = dot > 0 ? a.action.id.slice(0, dot) : a.action.id;
     const operation = dot > 0 ? a.action.id.slice(dot + 1) : "";
     const list = versions.get(connectorId);
     if (!list) return refuse("connect/unknown-action", "This action is not available.", { detail: `no connector ${connectorId}` });
+    // Too close to its deadline to answer in time: nothing is read, claimed or sent.
+    const budget = Math.min(a.deadline - marginMs - now(), ceilingMs);
+    if (budget <= 0) return refuse("connect/late", "This action arrived too close to its deadline.");
+    const timeout = AbortSignal.timeout(budget);
+    const capped = signal ? AbortSignal.any([signal, timeout]) : timeout;
 
     let resolution: Resolution;
     try {
-      resolution = await options.store.resolve({
+      resolution = await whileOpen(capped, options.store.resolve({
         scope: a.scope,
         connectorId,
         actingFor: a.connection.actingFor,
         role: a.connection.role ?? DEFAULT_ROLE,
         subject: a.subject ? `${a.subject.domain}:${a.subject.id}` : null,
         environment: a.environment,
-      });
+      }));
     } catch (error) {
       report(error, "store.resolve");
       return refuse("connect/unavailable", "Connect cannot reach its store right now.");
@@ -213,9 +225,6 @@ export function createPerformer(options: PerformerOptions): Performer {
     if (resolution.connection?.status === "revoked") return refuse("connect/connection-revoked", "This account was disconnected.");
 
     const served = pick(list, operation, a.action.contract);
-    const budget = Math.max(1, Math.min(a.deadline - marginMs - now(), ceilingMs));
-    const timeout = AbortSignal.timeout(budget);
-    const capped = signal ? AbortSignal.any([signal, timeout]) : timeout;
     try {
       return await calls.run({ tenantId: a.scope.tenantId, resolution, connector: served.connector }, () => served.port.run(a, capped));
     } catch (error) {

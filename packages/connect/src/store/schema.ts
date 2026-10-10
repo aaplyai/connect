@@ -100,6 +100,8 @@ CREATE TABLE aaply_connect.secrets (
   connection_id text PRIMARY KEY REFERENCES aaply_connect.connections (id) ON DELETE CASCADE,
   tenant_id text NOT NULL,
   data_key_id text NOT NULL,
+  -- The secret version the sealed value is bound to; moves only when the secret is replaced.
+  sealed_version integer NOT NULL,
   iv bytea NOT NULL,
   sealed bytea NOT NULL,
   FOREIGN KEY (tenant_id, data_key_id) REFERENCES aaply_connect.data_keys (tenant_id, data_key_id)
@@ -136,14 +138,15 @@ BEGIN
     'connection', (SELECT jsonb_build_object(
                      'id', c.id, 'ownerSubject', c.owner_subject, 'role', c.role, 'environmentKind', c.environment_kind,
                      'grantedScopes', to_jsonb(c.granted_scopes), 'account', c.account, 'config', c.config, 'status', c.status, 'version', c.version,
-                     'secret', (SELECT jsonb_build_object('dataKeyId', s.data_key_id, 'iv', encode(s.iv, 'base64'), 'sealed', encode(s.sealed, 'base64'),
+                     'secret', (SELECT jsonb_build_object('dataKeyId', s.data_key_id, 'version', s.sealed_version, 'iv', encode(s.iv, 'base64'), 'sealed', encode(s.sealed, 'base64'),
                                   'wrapped', encode(k.wrapped, 'base64'), 'wrappingKeyId', k.wrapping_key_id)
                                 FROM aaply_connect.secrets s JOIN aaply_connect.data_keys k ON k.tenant_id = s.tenant_id AND k.data_key_id = s.data_key_id
                                 WHERE s.connection_id = c.id))
                    FROM aaply_connect.connections c
                    WHERE c.tenant_id = p_tenant AND c.app_id = p_app AND c.environment_id = p_env AND c.connector_id = p_connector
+                     AND c.environment_kind = p_kind
                      AND CASE WHEN p_acting = 'endUser' THEN c.owner_subject = p_subject ELSE c.owner_subject IS NULL AND c.role = p_role END
-                   ORDER BY (c.status <> 'revoked') DESC, (c.environment_kind = p_kind) DESC, c.created_at DESC
+                   ORDER BY (c.status <> 'revoked') DESC, c.created_at DESC
                    LIMIT 1)
   ) INTO result;
   RETURN result;
@@ -166,7 +169,8 @@ $$;
 
 -- The owner (and so purge_expired, which runs as the owner) sees every tenant's claims; the app role never does.
 DO $$ BEGIN
-  EXECUTE format('CREATE POLICY purge ON aaply_connect.replay_claims FOR ALL TO %I USING (true)', current_user);
+  EXECUTE format('CREATE POLICY purge_read ON aaply_connect.replay_claims FOR SELECT TO %I USING (true)', current_user);
+  EXECUTE format('CREATE POLICY purge ON aaply_connect.replay_claims FOR DELETE TO %I USING (true)', current_user);
 END $$;
 
 -- Deletes expired claims across tenants, in batches. Runs as the owner (SECURITY DEFINER): row security would hide other tenants' rows.

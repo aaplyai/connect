@@ -47,7 +47,9 @@ const BLOCKED = blockList([...BLOCKED_V4, ...BLOCKED_V6]);
 export interface EgressOptions {
   /**
    * Private addresses Connect may reach anyway: CIDRs (`10.20.0.0/16`) and
-   * exact host names (`db.internal.aaply.ai`). Deployment config only.
+   * exact host names (`db.internal.aaply.ai`). Deployment config only. A host
+   * name here may resolve to any address, loopback and metadata included, so
+   * list names only of hosts whose DNS the operator controls; prefer CIDRs.
    */
   allowPrivate?: readonly string[];
 }

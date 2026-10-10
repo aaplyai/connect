@@ -26,8 +26,10 @@ import type { Connect } from "./connect.js";
 import { CONNECT_VERSION } from "./version.js";
 
 export interface ConnectHttpOptions {
-  /** The bearer token the engine's host sends. Without it, /perform is open to whoever can reach it: only behind mTLS. */
+  /** The bearer token the engine's host sends (at least 32 characters). Required unless `noPerformToken` says otherwise. */
   performToken?: string;
+  /** Leave /perform open to whoever can reach it: only behind mTLS or on a private link. Default false. */
+  noPerformToken?: boolean;
   /** Largest request body, in bytes. Default 2 MiB. */
   maxBodyBytes?: number;
 }
@@ -76,6 +78,7 @@ function bearerMatches(header: string | undefined, token: string): boolean {
 
 export function createConnectHandler(connect: Connect, options: ConnectHttpOptions = {}): ConnectHandler {
   const max = options.maxBodyBytes ?? 2 * 1024 * 1024;
+  if (options.performToken === undefined && options.noPerformToken !== true) throw new Error("performToken is required (or set noPerformToken behind mTLS)");
   if (options.performToken !== undefined && options.performToken.length < 32) throw new Error("performToken must be at least 32 characters");
   return (req, res) => {
     void (async () => {

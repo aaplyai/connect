@@ -36,6 +36,10 @@ describe.skipIf(postgresUnavailable())("Connect over HTTP", () => {
     return signApprovedAction<ApprovedAction>(unsigned, engine.signer);
   };
 
+  it("needs a transport token unless told to run without one", async () => {
+    await expect(serveConnect(connect, { port: 0 })).rejects.toThrow(/performToken is required/);
+  });
+
   it("needs the transport token before it reads anything", async () => {
     const { served, base } = await serve();
     try {

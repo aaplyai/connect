@@ -146,9 +146,12 @@ describe.skipIf(postgresUnavailable())("Connect", () => {
     const s = { ...scope, appId: "lifecycle" };
     await connect.admin.install(s, "notes");
     const c = await connect.admin.createConnection({ scope: s, connectorId: "notes", owner: { business: true }, secret: API_KEY });
-    const after = await connect.admin.updateConnection(s.tenantId, c.id, c.version, { status: "reauth" });
+    // A change that is not a new secret keeps the sealed one readable.
+    const scoped = await connect.admin.updateConnection(s.tenantId, c.id, c.version, { grantedScopes: ["x"] });
+    expect((await connect.perform(await read({ scope: s }))).status).toBe("ok");
+    const after = await connect.admin.updateConnection(s.tenantId, c.id, scoped.version, { status: "reauth" });
     expect(await connect.perform(await read({ scope: s }))).toMatchObject({ status: "final", error: { code: "connect/reconsent" } });
-    await expect(connect.admin.updateConnection(s.tenantId, c.id, c.version, { status: "active" })).rejects.toThrow(/version/);
+    await expect(connect.admin.updateConnection(s.tenantId, c.id, scoped.version, { status: "active" })).rejects.toThrow(/version/);
     await connect.admin.updateConnection(s.tenantId, c.id, after.version, { status: "active", secret: { "header:authorization": "Bearer rotated" } });
     expect((await connect.perform(await read({ scope: s }))).status).toBe("ok");
     expect(service.calls.at(-1)?.headers.authorization).toBe("Bearer rotated");
@@ -180,6 +183,23 @@ describe.skipIf(postgresUnavailable())("Connect", () => {
     }
   });
 
+  it("refuses an envelope already inside its answer margin without reading or claiming anything", async () => {
+    counter.reset();
+    expect(await connect.perform(await write({ timeoutMs: 1_500 }))).toMatchObject({ status: "retryable", error: { code: "connect/late" } });
+    expect(counter.count()).toBe(0);
+  });
+
+  it("uses only a connection of the call's environment kind", async () => {
+    const s = { ...scope, appId: "kinds" };
+    await connect.admin.install(s, "notes");
+    await connect.admin.createConnection({ scope: s, connectorId: "notes", owner: { business: true }, secret: API_KEY });
+    const sandbox = await connect.admin.createConnection({ scope: s, connectorId: "notes", owner: { business: true }, environmentKind: "test", secret: API_KEY });
+    await connect.admin.revokeConnection(s.tenantId, sandbox.id);
+    expect(await connect.perform(await read({ scope: s, environment: "test" }))).toMatchObject({ status: "final", error: { code: "connect/connection-revoked" } });
+    expect(await connect.perform(await read({ scope: s, environment: "preview" }))).toMatchObject({ status: "final", error: { code: "connect/no-connection" } });
+    expect((await connect.perform(await read({ scope: s }))).status).toBe("ok");
+  });
+
   it("refuses an envelope signed with HMAC, or with a key it does not pin", async () => {
     const hmac = draftApprovedAction({ action: "notes.get", effect: "read", input: {}, now: Date.now(), audience: AUDIENCE, scope });
     expect(await connect.perform(hmac)).toMatchObject({ status: "final", error: { code: "connect/proof-invalid" } });
@@ -188,8 +208,19 @@ describe.skipIf(postgresUnavailable())("Connect", () => {
     expect(await connect.perform(await signApprovedAction(unsigned, stranger.signer))).toMatchObject({ status: "final", error: { code: "connect/proof-invalid" } });
   });
 
-  it("refuses to start on the owner's pool, which row security does not bind", async () => {
-    await expect(createConnect({ audience: AUDIENCE, engineKeys: engine.engineKeys, connectors: [v1], pool: db.owner, keys })).rejects.toThrow(/owns Connect's tables/);
+  it("refuses to start as the owner, a member of the owner, or a role that can bypass row security", async () => {
+    const start = (pool: typeof db.owner) => createConnect({ audience: AUDIENCE, engineKeys: engine.engineKeys, connectors: [v1], pool, keys });
+    await expect(start(db.owner)).rejects.toThrow(/owns Connect's tables/);
+    const admin = db.pool("postgres");
+    await admin.query("CREATE ROLE sneaky LOGIN IN ROLE aaply_connect_app, connect_owner");
+    await expect(start(db.pool("sneaky"))).rejects.toThrow(/owns Connect's tables/);
+    await admin.query("CREATE ROLE bypasser NOLOGIN BYPASSRLS");
+    await admin.query("CREATE ROLE sly LOGIN IN ROLE aaply_connect_app, bypasser");
+    await expect(start(db.pool("sly"))).rejects.toThrow(/bypass row security/);
+  });
+
+  it("refuses an envelope whose person's domain could read as another person", async () => {
+    expect(await connect.perform(await read({ actingFor: "endUser", subject: { domain: "member:ana", id: "x" } }))).toMatchObject({ status: "final", error: { code: "connect/invalid-envelope" } });
   });
 
   it("keeps tenants apart even when a query forgets its tenant", async () => {
