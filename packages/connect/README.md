@@ -16,6 +16,7 @@ const connect = await createConnect({
   connectors: [gmail],                                               // imported modules of this build only
   pool: new pg.Pool({ connectionString: process.env.CONNECT_DATABASE_URL, max: 10, connectionTimeoutMillis: 2_000, statement_timeout: 5_000 }),
   keys: localKeyProvider({ keyId: "local-1", key: Buffer.from(process.env.CONNECT_WRAPPING_KEY!, "base64") }),
+  adminKeys: { "backend-2026-10": process.env.BACKEND_PUBLIC_KEY! }, // the Aaply backend's public key, for /admin
   egress: { allowPrivate: ["db.internal.aaply.ai"] },                // operator config, never tenant data
 });
 await serveConnect(connect, { port: 8080, host: "0.0.0.0", performToken: process.env.CONNECT_PERFORM_TOKEN });
@@ -54,6 +55,22 @@ instance to delete expired replay claims; it deletes in batches until none are l
 connections. Measured on one process against a local PostgreSQL 16 (warm cache, a pool of 10): a read
 costs about 1.9 ms p50 and 2.6 ms p95 in all, of which about 1.4 ms is Connect's own; 64 calls in flight
 run at about 1,500 calls per second, bound by CPU.
+
+## The admin API
+
+The Aaply backend administers Connect over `POST /admin/<operation>`, each request signed with the
+backend's Ed25519 key (`adminKeys` in `createConnect`). The signature covers Connect's audience, the
+method, the path, the time, a nonce and the body, so a request cannot be sent to another Connect,
+changed, or sent again, and is refused when more than a minute away from Connect's clock. The backend
+uses `createAdminClient({ url, audience, signer }).as(person)`, where `person` is
+`{ domain, id, roles }` as the backend knows them.
+
+Connect decides the permission itself. Installing connectors, policy, operation contracts, the
+business's own connections and the admin log need the tenant's `connect-admin` role. A person
+connects only their own account (an admin does not connect someone else's), and sees, changes and
+removes only their own; an admin may see and remove any. Every change is written to the admin log in
+the change's own transaction (the service's role can only add to it), without secrets; changes made
+through `connect.admin` in the deployment's code are logged as the operator's.
 
 ## Databases
 

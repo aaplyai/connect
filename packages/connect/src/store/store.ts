@@ -5,8 +5,10 @@
  * security applies to everything the service reads or writes.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import type pg from "pg";
 import type { EnvironmentKind, JsonObject, Scope } from "@aaply/action-contract";
+import { newId } from "../ids.js";
 import type { SealedSecret, WrappedDataKey } from "../vault.js";
 import { APP_ROLE, SCHEMA_VERSION } from "./schema.js";
 
@@ -70,6 +72,17 @@ export interface NewConnection {
   config: JsonObject;
 }
 
+/** One admin change, as the admin log keeps it. `detail` never holds a secret. */
+export interface AdminLogEntry {
+  id: string;
+  tenantId: string;
+  at: string;
+  actor: JsonObject;
+  action: string;
+  target: string | null;
+  detail: JsonObject;
+}
+
 /** Raised when a write would break a uniqueness rule, or a versioned write lost a race. */
 export class StoreConflict extends Error {
   override readonly name = "StoreConflict";
@@ -128,6 +141,14 @@ export interface ConnectStore {
   revokeConnection(tenantId: string, id: string): Promise<Connection | null>;
   connection(tenantId: string, id: string): Promise<Connection | null>;
   connections(scope: Scope, filter?: { connectorId?: string; ownerSubject?: string }): Promise<Connection[]>;
+  /**
+   * Runs `work` so that each change it makes is written to the admin log in
+   * the change's own transaction: no change without its entry, and no entry
+   * for a change that rolled back.
+   */
+  audited<T>(entry: Omit<AdminLogEntry, "id" | "at" | "tenantId">, work: () => Promise<T>): Promise<T>;
+  /** A tenant's admin log, newest first, `limit` (at most 500) entries older than `before` (an entry id). */
+  adminLog(tenantId: string, page?: { limit?: number; before?: string }): Promise<AdminLogEntry[]>;
   /** Deletes expired claims across tenants in batches, until none are left or `budgetMs` (default 5 s) runs out; answers how many. */
   purgeExpired(budgetMs?: number): Promise<number>;
   /** Refuses a database made by another build, and a login role that can bypass row security. */
@@ -135,12 +156,26 @@ export interface ConnectStore {
 }
 
 export function createPgStore(pool: pg.Pool): ConnectStore {
-  async function tx<T>(tenantId: string | null, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+  const audits = new AsyncLocalStorage<Omit<AdminLogEntry, "id" | "at" | "tenantId">>();
+
+  /** A transaction with the tenant set. A `change` also writes the admin entry of the call it runs under. */
+  async function tx<T>(tenantId: string | null, work: (client: pg.PoolClient) => Promise<T>, change: boolean | ((result: T) => string) = false): Promise<T> {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
       if (tenantId !== null) await client.query("SELECT set_config('aaply_connect.tenant', $1, true)", [tenantId]);
       const result = await work(client);
+      const entry = change ? audits.getStore() : undefined;
+      if (entry && tenantId !== null) {
+        await client.query("INSERT INTO aaply_connect.admin_log (id, tenant_id, actor, action, target, detail) VALUES ($1, $2, $3, $4, $5, $6)", [
+          newId("adm"),
+          tenantId,
+          entry.actor,
+          entry.action,
+          entry.target ?? (typeof change === "function" ? change(result) : null),
+          entry.detail,
+        ]);
+      }
       await client.query("COMMIT");
       return result;
     } catch (error) {
@@ -240,6 +275,7 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
           `INSERT INTO aaply_connect.installations AS i (id, tenant_id, app_id, environment_id, connector_id, kind, definition, digest) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ${replace}`,
           [i.id, ...scopeParams(scope), i.connectorId, i.kind, i.definition ?? null, i.digest ?? null],
         ),
+        true,
       );
       if (rowCount === 0) throw new StoreConflict(`${i.connectorId} is installed as a code connector here`);
     },
@@ -251,7 +287,7 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
           connectorId,
         ]);
         return (rowCount ?? 0) > 0;
-      });
+      }, true);
     },
 
     async installations(scope) {
@@ -272,6 +308,7 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
              disabled = coalesce($4::boolean, aaply_connect.policy.disabled), denied = coalesce($5::text[], aaply_connect.policy.denied), version = aaply_connect.policy.version + 1`,
           [...scopeParams(scope), change.disabled ?? null, change.denied ? [...change.denied] : null],
         ),
+        true,
       );
     },
 
@@ -297,7 +334,7 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
           ]);
         }
         return connectionOf(rows[0]);
-      });
+      }, (made) => made.id);
     },
 
     async updateConnection(tenantId, id, expectedVersion, change, seal) {
@@ -321,7 +358,7 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
           );
         }
         return connectionOf(rows[0]);
-      });
+      }, true);
     },
 
     async revokeConnection(tenantId, id) {
@@ -332,7 +369,7 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
           [tenantId, id],
         );
         return rows[0] ? connectionOf(rows[0]) : null;
-      });
+      }, true);
     },
 
     async connection(tenantId, id) {
@@ -350,6 +387,23 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
           [...scopeParams(scope), filter.connectorId ?? null, filter.ownerSubject ?? null],
         );
         return rows.map(connectionOf);
+      });
+    },
+
+    audited(entry, work) {
+      return audits.run({ ...entry }, work);
+    },
+
+    async adminLog(tenantId, page = {}) {
+      const limit = Math.min(Math.max(page.limit ?? 100, 1), 500);
+      return tx(tenantId, async (client) => {
+        const { rows } = await client.query(
+          `SELECT id, tenant_id, at, actor, action, target, detail FROM aaply_connect.admin_log
+           WHERE tenant_id = $1 AND ($2::text IS NULL OR (at, id) < (SELECT at, id FROM aaply_connect.admin_log WHERE tenant_id = $1 AND id = $2))
+           ORDER BY at DESC, id DESC LIMIT $3`,
+          [tenantId, page.before ?? null, limit],
+        );
+        return rows.map((r) => ({ id: r.id, tenantId: r.tenant_id, at: (r.at as Date).toISOString(), actor: r.actor, action: r.action, target: r.target ?? null, detail: r.detail }));
       });
     },
 

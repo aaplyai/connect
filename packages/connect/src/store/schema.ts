@@ -11,14 +11,17 @@
  */
 
 /** The schema this build writes and reads. A database with another is refused. */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /** The role the service's login role is a member of. */
 export const APP_ROLE = "aaply_connect_app";
 
 const TENANT = "current_setting('aaply_connect.tenant', true)";
 
-const TENANT_TABLES = ["data_keys", "policy", "installations", "connections", "secrets", "replay_claims"] as const;
+const TENANT_TABLES = ["data_keys", "policy", "installations", "connections", "secrets", "replay_claims", "admin_log"] as const;
+
+/** Tables the app role may change; the admin log is append-only to it. */
+const WRITABLE_TABLES = TENANT_TABLES.filter((t) => t !== "admin_log");
 
 export const SCHEMA_SQL = `
 CREATE SCHEMA aaply_connect;
@@ -120,6 +123,20 @@ CREATE TABLE aaply_connect.replay_claims (
 );
 CREATE INDEX replay_claims_until ON aaply_connect.replay_claims (until);
 
+-- Every admin change, written in the same transaction as the change. Append-only for the app role.
+CREATE TABLE aaply_connect.admin_log (
+  id text PRIMARY KEY,
+  tenant_id text NOT NULL,
+  at timestamptz NOT NULL DEFAULT now(),
+  -- Who: { "domain", "id", "roles" } as the Aaply backend signed it, or { "operator": true } for code in the deployment.
+  actor jsonb NOT NULL,
+  action text NOT NULL,
+  target text,
+  -- What changed, never a secret.
+  detail jsonb NOT NULL DEFAULT '{}'
+);
+CREATE INDEX admin_log_tenant_at ON aaply_connect.admin_log (tenant_id, at DESC, id DESC);
+
 ${TENANT_TABLES.map(
   (t) => `ALTER TABLE aaply_connect.${t} ENABLE ROW LEVEL SECURITY;
 ALTER TABLE aaply_connect.${t} FORCE ROW LEVEL SECURITY;
@@ -191,7 +208,8 @@ END $$;
 GRANT USAGE ON SCHEMA aaply_connect TO ${APP_ROLE};
 GRANT SELECT ON aaply_connect.meta TO ${APP_ROLE};
 GRANT SELECT, UPDATE ON aaply_connect.global_policy TO ${APP_ROLE};
-GRANT SELECT, INSERT, UPDATE, DELETE ON ${TENANT_TABLES.map((t) => `aaply_connect.${t}`).join(", ")} TO ${APP_ROLE};
+GRANT SELECT, INSERT, UPDATE, DELETE ON ${WRITABLE_TABLES.map((t) => `aaply_connect.${t}`).join(", ")} TO ${APP_ROLE};
+GRANT SELECT, INSERT ON aaply_connect.admin_log TO ${APP_ROLE};
 REVOKE ALL ON FUNCTION aaply_connect.resolve, aaply_connect.claim, aaply_connect.purge_expired FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION aaply_connect.resolve, aaply_connect.claim, aaply_connect.purge_expired TO ${APP_ROLE};
 `;
