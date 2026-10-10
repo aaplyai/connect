@@ -11,6 +11,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { chownSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createServer } from "node:net";
 import { join } from "node:path";
 import pg from "pg";
 import { ed25519ActionSigner, generateEd25519KeyPair, type ApprovedActionSigner } from "@aaply/action-contract";
@@ -55,7 +56,12 @@ export interface TestDatabase {
   close(): Promise<void>;
 }
 
-export async function startTestDatabase(): Promise<TestDatabase> {
+/**
+ * Starts a throwaway server with a migrated `connect` database. With `tcp`,
+ * it also listens on 127.0.0.1 at a free port (`port`), for tests that reach
+ * it as a customer database would.
+ */
+export async function startTestDatabase(options: { tcp?: boolean } = {}): Promise<TestDatabase> {
   const dir = mkdtempSync(join(tmpdir(), "aaply-connect-pg-"));
   const user = serverUser();
   if (user) chownSync(dir, user.uid, user.gid);
@@ -72,17 +78,18 @@ export async function startTestDatabase(): Promise<TestDatabase> {
   };
   process.on("exit", stop);
   const pools: pg.Pool[] = [];
+  const port = options.tcp ? await freePort() : 5432;
   const pool = (u: string, database = "connect") => {
-    const p = new pg.Pool({ host: dir, port: 5432, user: u, database, max: 10 });
+    const p = new pg.Pool({ host: dir, port, user: u, database, max: 10 });
     p.on("error", () => {});
     pools.push(p);
     return p;
   };
   try {
     execFileSync(join(PG_BIN, "initdb"), ["-D", data, "-U", "postgres", "--auth=trust", "-E", "UTF8", "--no-locale", "-N"], asServer);
-    const settings = ["-c listen_addresses=''", `-c unix_socket_directories=${dir}`, "-p 5432", "-c fsync=off", "-c synchronous_commit=off", "-c full_page_writes=off"];
+    const settings = [`-c listen_addresses='${options.tcp ? "127.0.0.1" : ""}'`, `-c unix_socket_directories=${dir}`, `-p ${port}`, "-c fsync=off", "-c synchronous_commit=off", "-c full_page_writes=off"];
     execFileSync(join(PG_BIN, "pg_ctl"), ["-D", data, "-l", log, "-w", "-s", "-o", settings.join(" "), "start"], asServer);
-    const bootstrap = new pg.Client({ host: dir, port: 5432, user: "postgres", database: "postgres" });
+    const bootstrap = new pg.Client({ host: dir, port, user: "postgres", database: "postgres" });
     await bootstrap.connect();
     await bootstrap.query("CREATE ROLE connect_owner LOGIN CREATEROLE");
     await bootstrap.query("CREATE DATABASE connect OWNER connect_owner");
@@ -95,7 +102,7 @@ export async function startTestDatabase(): Promise<TestDatabase> {
       app: pool("connect_app"),
       pool,
       host: dir,
-      port: 5432,
+      port,
       async close() {
         await Promise.all(pools.map((p) => p.end().catch(() => {})));
         stop();
@@ -107,6 +114,17 @@ export async function startTestDatabase(): Promise<TestDatabase> {
     stop();
     throw new Error(`could not start Postgres: ${error instanceof Error ? error.message : String(error)}\n${tail}`);
   }
+}
+
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as { port: number };
+      server.close(() => resolve(port));
+    });
+  });
 }
 
 /** An engine key pair for tests: the signer the engine's host would hold, and the key Connect pins. */

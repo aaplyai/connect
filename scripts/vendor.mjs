@@ -12,6 +12,12 @@
  *
  * The digest is a SHA-256 over every file's path and bytes, in path order,
  * leaving out VENDORED.json, node_modules and dist.
+ *
+ * A pin may name `exclude`: top-level entries of the owner's package that are
+ * not copied (its tests, its corpus). A pin with `testOnly: true` is a package
+ * only this repository's tests use (the engine, to run real flows against
+ * Connect): no package here may depend on it, and the API and size guards
+ * leave it to its owner.
  */
 
 import { createHash } from "node:crypto";
@@ -69,7 +75,14 @@ function sync(target, checkout, commit) {
   const keep = readFileSync(pinPath);
   // Everything but node_modules (pnpm's links) is replaced.
   for (const name of readdirSync(join(ROOT, target))) if (name !== "node_modules") rmSync(join(ROOT, target, name), { recursive: true, force: true });
-  cpSync(source, join(ROOT, target), { recursive: true, filter: (src) => !src.split(sep).some((part) => part === "node_modules" || part === "dist") });
+  const exclude = new Set(pin.exclude ?? []);
+  cpSync(source, join(ROOT, target), {
+    recursive: true,
+    filter: (src) => {
+      const rel = relative(source, src).split(sep);
+      return !rel.some((part) => part === "node_modules" || part === "dist") && !exclude.has(rel[0]);
+    },
+  });
   writeFileSync(pinPath, keep);
   const next = { ...pin, commit: head, digest: treeDigest(join(ROOT, target)) };
   writeFileSync(pinPath, `${JSON.stringify(next, null, 2)}\n`);

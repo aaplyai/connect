@@ -55,6 +55,25 @@ connections. Measured on one process against a local PostgreSQL 16 (warm cache, 
 costs about 1.9 ms p50 and 2.6 ms p95 in all, of which about 1.4 ms is Connect's own; 64 calls in flight
 run at about 1,500 calls per second, bound by CPU.
 
+## Databases
+
+A tenant's own PostgreSQL database is a connector declared as data, not code: `admin.installSql(scope,
+definition)` stores it for the scope (see `SqlConnectorDefinition` in `src/sql/definition.ts`), and a
+connection holds where to reach it (`{ host, port, database, user, tls, ca?, pooler? }`) with
+`{ password }` as its sealed secret. Each operation is one parameterised statement; input reaches it only
+as bind parameters. The definition compiles into a kit connector, so every check of the kit applies, and
+each operation's statement digest is its contract's `implementation`: a flow pinned to an operation is
+pinned to its exact SQL, and changing a statement is a new pin.
+
+- Reads run in a `READ ONLY` transaction, so a write hidden in a read is refused by the database.
+- Each call sets `statement_timeout` and `lock_timeout` from the call's budget.
+- A write de-duplicates on a business reference (`insert … on conflict do nothing returning …` with
+  `onConflictEmpty`), so the engine may send it again safely.
+- A failure before `COMMIT` is retryable (connection, timeout, serialization) or final (a declared
+  SQLSTATE in `errors`, or any other database error); a failed `COMMIT` on a write is `unknown`.
+- The database host is checked by egress like any other: a private address needs `allowPrivate`, and
+  TLS may be off only to such an address.
+
 ## Secrets
 
 Each connection's secret is sealed with AES-256-GCM under its tenant's data key, bound to the tenant,

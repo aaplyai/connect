@@ -35,6 +35,9 @@ importers:
         specifier: 7.29.1
         version: 7.29.1
     devDependencies:
+      '@aaply/flow':
+        specifier: workspace:*
+        version: link:../flow
       '@types/pg':
         specifier: ^8.23.1
         version: 8.23.1
@@ -47,6 +50,16 @@ importers:
 
   packages/connectors:
     dependencies:
+      '@aaply/connector-sdk':
+        specifier: workspace:*
+        version: link:../connector-sdk
+
+  packages/flow:
+    dependencies:
+      '@aaply/action-contract':
+        specifier: workspace:*
+        version: link:../action-contract
+    devDependencies:
       '@aaply/connector-sdk':
         specifier: workspace:*
         version: link:../connector-sdk

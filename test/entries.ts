@@ -33,12 +33,18 @@ const isFile = (path: string): boolean => {
   }
 };
 
-/** Every package directory under packages/ that has a package.json. */
+/** A vendored package only this repository's tests use (`testOnly` in its VENDORED.json): its owner guards its API and size. */
+export function isTestOnly(dir: string): boolean {
+  const pin = join(dir, "VENDORED.json");
+  return isFile(pin) && (JSON.parse(readFileSync(pin, "utf8")) as { testOnly?: boolean }).testOnly === true;
+}
+
+/** Every package directory under packages/ that has a package.json, but test-only ones. */
 export function packageDirs(): string[] {
   return readdirSync(join(ROOT, "packages"))
     .sort()
     .map((name) => join(ROOT, "packages", name))
-    .filter((dir) => isFile(join(dir, "package.json")));
+    .filter((dir) => isFile(join(dir, "package.json")) && !isTestOnly(dir));
 }
 
 /** Every exported entry point of every package, in a fixed order. */

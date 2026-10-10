@@ -1,0 +1,12 @@
+{
+  "$comment": "Read-only copy, for tests only: the engine runs real flows against Connect in the acceptance tests. @aaply/flow is owned by aaplyai/flow: change it there, then run `node scripts/vendor.mjs sync packages/flow <flow checkout>`. CI refuses any local edit, and no package here may depend on it.",
+  "repository": "aaplyai/flow",
+  "path": "packages/flow",
+  "exclude": [
+    "test",
+    "corpus"
+  ],
+  "testOnly": true,
+  "commit": "7f616bc8bf986933a058948e9c857e40464c796d",
+  "digest": "sha256:124aa485b410b208c0e3297cbe36e1d6afb1ed6fb0544fd03554e8ab7fc568bf"
+}

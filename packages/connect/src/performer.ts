@@ -43,6 +43,9 @@ import {
 } from "@aaply/connector-sdk";
 import { headersOf, type TokenRefresher } from "./credentials.js";
 import { compareVersions } from "./semver.js";
+import { sqlConnector } from "./sql/connector.js";
+import { definitionDigest, type SqlConnectorDefinition } from "./sql/definition.js";
+import { sqlTargetProblem, type SqlExecutor, type SqlTarget } from "./sql/executor.js";
 import type { ConnectStore, Resolution } from "./store/store.js";
 import type { Vault } from "./vault.js";
 
@@ -59,6 +62,8 @@ export interface PerformerOptions {
   vault: Vault;
   fetch: FetchLike;
   refresher?: TokenRefresher;
+  /** Runs declared SQL connectors' statements. Without it, SQL installations are refused. */
+  sql?: SqlExecutor;
   now?: () => number;
   /** Longest a call may run, in ms. Default 55 000. */
   ceilingMs?: number;
@@ -84,7 +89,8 @@ interface Served {
 interface CallState {
   tenantId: string;
   resolution: Resolution;
-  connector: Connector;
+  /** The code connector serving the call; null for a declared SQL one. */
+  connector: Connector | null;
   /** The proof `perform` already verified for this envelope, so the kit's own check need not verify it again. */
   verified: ActionProof;
   /** The call's budget: every store, vault or refresh step inside the kit stops when it runs out. */
@@ -148,14 +154,8 @@ export function createPerformer(options: PerformerOptions): Performer {
     },
   };
 
-  // One kit port per connector version, so a flow's pin routes to the version it was published against.
-  const versions = new Map<string, Served[]>();
-  for (const connector of options.connectors) {
-    const list = versions.get(connector.id) ?? [];
-    if (list.some((s) => compareVersions(s.connector.version, connector.version) === 0)) throw new Error(`${connector.id}@${connector.version} is given twice`);
-    const digests = new Map<string, Sha256Digest>();
-    for (const name of Object.keys(connector.operations)) digests.set(name, operationDigest(operationContractOf(connector, name)!));
-    const port = createConnectorActionPort({
+  const portFor = (connector: Connector): ConnectorActionPort =>
+    createConnectorActionPort({
       audience: options.audience,
       verifier: kitVerifier,
       connectors: [connector],
@@ -178,7 +178,7 @@ export function createPerformer(options: PerformerOptions): Performer {
       credentials: {
         headers: async () => {
           const s = state();
-          return headersOf(s.connector.auth, await secretOf(s));
+          return s.connector ? headersOf(s.connector.auth, await secretOf(s)) : {};
         },
         ...(options.refresher
           ? {
@@ -186,7 +186,7 @@ export function createPerformer(options: PerformerOptions): Performer {
                 const s = state();
                 const c = s.resolution.connection;
                 const secret = await secretOf(s);
-                if (!c || !secret || s.connector.auth.kind !== "oauth2") throw new ConnectorError("final", "connect/reconsent", "This account needs to be connected again.");
+                if (!c || !secret || s.connector?.auth.kind !== "oauth2") throw new ConnectorError("final", "connect/reconsent", "This account needs to be connected again.");
                 s.secret = await whileOpen(s.signal, options.refresher!.refresh({ tenantId: s.tenantId, connectionId: c.id, version: c.version, secret, signal: AbortSignal.any([request.signal, s.signal]) }));
                 return headersOf(s.connector.auth, s.secret);
               },
@@ -194,10 +194,46 @@ export function createPerformer(options: PerformerOptions): Performer {
           : {}),
       },
     });
+
+  // One kit port per connector version, so a flow's pin routes to the version it was published against.
+  const versions = new Map<string, Served[]>();
+  for (const connector of options.connectors) {
+    const list = versions.get(connector.id) ?? [];
+    if (list.some((s) => compareVersions(s.connector.version, connector.version) === 0)) throw new Error(`${connector.id}@${connector.version} is given twice`);
+    const digests = new Map<string, Sha256Digest>();
+    for (const name of Object.keys(connector.operations)) digests.set(name, operationDigest(operationContractOf(connector, name)!));
+    const port = portFor(connector);
     list.push({ connector, port, digests });
     list.sort((a, b) => compareVersions(b.connector.version, a.connector.version));
     versions.set(connector.id, list);
   }
+
+  // Declared SQL connectors: one kit port per installed definition, built on first use (by its digest), at most 500 kept.
+  const sqlPorts = new Map<string, ConnectorActionPort>();
+  const sqlPortFor = (digest: string, definition: SqlConnectorDefinition): ConnectorActionPort | null => {
+    const hit = sqlPorts.get(digest);
+    if (hit) {
+      sqlPorts.delete(digest);
+      sqlPorts.set(digest, hit);
+      return hit;
+    }
+    if (!options.sql || definitionDigest(definition) !== digest) return null;
+    const executor = options.sql;
+    const port = portFor(
+      sqlConnector(definition, executor, async () => {
+        const s = state();
+        const c = s.resolution.connection;
+        if (!c) throw new ConnectorError("final", "sql/no-connection", "No database connection is set up.");
+        const problem = sqlTargetProblem(c.config);
+        if (problem) throw new ConnectorError("final", "sql/bad-config", "The database connection is not set up correctly.", { detail: problem });
+        const secret = await secretOf(s);
+        return { poolKey: `${c.id}:${c.version}`, target: c.config as unknown as SqlTarget, password: secret?.password ?? "" };
+      }),
+    );
+    sqlPorts.set(digest, port);
+    if (sqlPorts.size > 500) sqlPorts.delete(sqlPorts.keys().next().value as string);
+    return port;
+  };
 
   /** The newest version whose operation the flow pinned; else the newest, which refuses a pin it does not serve. */
   const pick = (list: readonly Served[], operation: string, pin: Sha256Digest | undefined): Served => {
@@ -214,8 +250,6 @@ export function createPerformer(options: PerformerOptions): Performer {
     const dot = a.action.id.indexOf(".");
     const connectorId = dot > 0 ? a.action.id.slice(0, dot) : a.action.id;
     const operation = dot > 0 ? a.action.id.slice(dot + 1) : "";
-    const list = versions.get(connectorId);
-    if (!list) return refuse("connect/unknown-action", "This action is not available.", { detail: `no connector ${connectorId}` });
     // Too close to its deadline to answer in time: nothing is read, claimed or sent.
     const budget = Math.min(a.deadline - marginMs - now(), ceilingMs);
     if (budget <= 0) return refuse("connect/late", "This action arrived too close to its deadline.");
@@ -239,15 +273,29 @@ export function createPerformer(options: PerformerOptions): Performer {
     if (resolution.global.disabled) return refuse("connect/disabled", "Actions are switched off for now.", { detail: "global" });
     if (resolution.policy?.disabled) return refuse("connect/disabled", "Actions are switched off for this app.", { detail: "scope" });
     if (resolution.policy?.denied.includes(a.action.id)) return refuse("connect/policy-denied", "This action is not allowed here.");
-    if (!resolution.installation || resolution.installation.kind !== "code") {
-      return refuse("connect/unknown-action", "This action is not available here.", { detail: `${connectorId} is not installed for this app` });
+    const installation = resolution.installation;
+    if (!installation) return refuse("connect/unknown-action", "This action is not available here.", { detail: `${connectorId} is not installed for this app` });
+    let port: ConnectorActionPort;
+    let connector: Connector | null = null;
+    if (installation.kind === "sql") {
+      const sql = installation.definition && installation.digest ? sqlPortFor(installation.digest, installation.definition as unknown as SqlConnectorDefinition) : null;
+      if (!sql) {
+        report(new Error(`SQL installation ${installation.id} cannot be served`), "perform.sql");
+        return refuse("connect/unknown-action", "This action is not available here.", { detail: `${connectorId} cannot be served by this Connect` });
+      }
+      port = sql;
+    } else {
+      const list = versions.get(connectorId);
+      if (!list) return refuse("connect/unknown-action", "This action is not available.", { detail: `no connector ${connectorId} in this build` });
+      const served = pick(list, operation, a.action.contract);
+      port = served.port;
+      connector = served.connector;
     }
     if (resolution.connection?.status === "reauth") return refuse("connect/reconsent", "This account needs to be connected again.");
     if (resolution.connection?.status === "revoked") return refuse("connect/connection-revoked", "This account was disconnected.");
 
-    const served = pick(list, operation, a.action.contract);
     try {
-      return await calls.run({ tenantId: a.scope.tenantId, resolution, connector: served.connector, verified: a.proof, signal: capped }, () => served.port.run(a, capped));
+      return await calls.run({ tenantId: a.scope.tenantId, resolution, connector, verified: a.proof, signal: capped }, () => port.run(a, capped));
     } catch (error) {
       // The kit's port never throws; this is a last guard so /perform always answers an outcome.
       report(error, "perform");

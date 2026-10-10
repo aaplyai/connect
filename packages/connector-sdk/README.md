@@ -82,6 +82,11 @@ that long from the first `pending` instead of the action's `timeoutMs`, and the 
 sink gets it as `windowMs`. It is in the manifest and the operation contract, and in their
 digests, only when declared.
 
+`implementation: "sha256:…"` names the digest of declared data the host interprets in place
+of handler code (a SQL statement). It is in the manifest, the operation contract and their
+digests only when declared, so a flow's pin covers that exact data. A write that declares it
+needs no POST, PUT, PATCH or DELETE egress rule: its effect is not an HTTP request.
+
 **The handler** receives the validated input and `ctx`:
 
 | `ctx.` | |

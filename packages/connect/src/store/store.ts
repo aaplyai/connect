@@ -102,6 +102,7 @@ export interface ConnectStore {
   resolve(query: ResolveQuery): Promise<Resolution>;
   claim(tenantId: string, key: string, until: number): Promise<boolean>;
   currentDataKey(tenantId: string, create: () => Promise<WrappedDataKey>): Promise<WrappedDataKey>;
+  /** Installs a connector for a scope. A SQL definition replaces the scope's earlier one for that connector id; a code connector is installed once. */
   install(scope: Scope, installation: { id: string; connectorId: string; kind: "code" | "sql"; definition?: JsonObject; digest?: string }): Promise<void>;
   uninstall(scope: Scope, connectorId: string): Promise<boolean>;
   installations(scope: Scope): Promise<Array<Installation & { connectorId: string }>>;
@@ -219,16 +220,17 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
     },
 
     async install(scope, i) {
-      await tx(scope.tenantId, (client) =>
-        client.query("INSERT INTO aaply_connect.installations (id, tenant_id, app_id, environment_id, connector_id, kind, definition, digest) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", [
-          i.id,
-          ...scopeParams(scope),
-          i.connectorId,
-          i.kind,
-          i.definition ?? null,
-          i.digest ?? null,
-        ]),
+      const replace =
+        i.kind === "sql"
+          ? "ON CONFLICT (tenant_id, app_id, environment_id, connector_id) DO UPDATE SET definition = EXCLUDED.definition, digest = EXCLUDED.digest WHERE aaply_connect.installations.kind = 'sql'"
+          : "";
+      const { rowCount } = await tx(scope.tenantId, (client) =>
+        client.query(
+          `INSERT INTO aaply_connect.installations (id, tenant_id, app_id, environment_id, connector_id, kind, definition, digest) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ${replace}`,
+          [i.id, ...scopeParams(scope), i.connectorId, i.kind, i.definition ?? null, i.digest ?? null],
+        ),
       );
+      if (rowCount === 0) throw new StoreConflict(`${i.connectorId} is installed as a code connector here`);
     },
 
     async uninstall(scope, connectorId) {
