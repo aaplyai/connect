@@ -5,12 +5,13 @@ import { notion, NOTION_API, NOTION_VERSION } from "@aaply/connectors/notion";
 const DS = "1f2e3d4c-5b6a-4789-a0b1-c2d3e4f5a6b7";
 const PAGE = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 const BOT = "bot-aaply";
+const CREATED = "2026-10-10T04:00:00.000Z";
 
 const page = (over: Record<string, unknown> = {}) => ({
   object: "page",
   id: PAGE,
   url: "https://www.notion.so/Booking-aaaa",
-  created_time: "2026-10-10T04:00:00.000Z",
+  created_time: CREATED,
   last_edited_time: "2026-10-10T04:00:00.000Z",
   created_by: { object: "user", id: BOT },
   in_trash: false,
@@ -72,19 +73,51 @@ describe("notion", () => {
         [`PATCH ${NOTION_API}/pages/${PAGE}`]: { json: page({ in_trash: true }) },
       },
     });
-    expect(await t.run("pages.removeCreated", { pageId: PAGE })).toEqual({ pageId: PAGE, inTrash: true });
+    expect(await t.run("pages.removeCreated", { pageId: PAGE, createdTime: CREATED })).toEqual({ pageId: PAGE, inTrash: true });
     expect(t.mock!.callsTo(`PATCH ${NOTION_API}/pages/${PAGE}`)[0]!.json()).toEqual({ in_trash: true });
 
     t.mock!.on(`GET ${NOTION_API}/pages/${PAGE}`, { json: page({ in_trash: true }) });
-    await t.run("pages.removeCreated", { pageId: PAGE });
+    await t.run("pages.removeCreated", { pageId: PAGE, createdTime: CREATED });
     expect(t.mock!.callsTo(`PATCH ${NOTION_API}/pages/${PAGE}`).length).toBe(1);
 
     t.mock!.on(`GET ${NOTION_API}/pages/${PAGE}`, { json: page({ created_by: { object: "user", id: "a-person" } }) });
-    expect(await t.call("pages.removeCreated", { pageId: PAGE })).toMatchObject({ status: "final", error: { code: "notion/not-created-here" } });
+    expect(await t.call("pages.removeCreated", { pageId: PAGE, createdTime: CREATED })).toMatchObject({ status: "final", error: { code: "notion/not-created-here" } });
 
     // Not shared any more: a person must look, it is not counted as removed.
     t.mock!.on(`GET ${NOTION_API}/pages/${PAGE}`, { status: 404, json: { object: "error", code: "object_not_found" } });
-    expect(await t.call("pages.removeCreated", { pageId: PAGE })).toMatchObject({ status: "final", error: { code: "notion/not-accessible" } });
+    expect(await t.call("pages.removeCreated", { pageId: PAGE, createdTime: CREATED })).toMatchObject({ status: "final", error: { code: "notion/not-accessible" } });
+  });
+
+  it("undoes only the page its own create made, not another page the integration made", async () => {
+    const OTHER = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    const theirs = page({ id: OTHER, url: "https://www.notion.so/Booking-bbbb", created_time: "2026-10-10T05:00:00.000Z" });
+    const t = testConnector(notion, {
+      routes: {
+        [`POST ${NOTION_API}/pages`]: { json: page() },
+        [`GET ${NOTION_API}/pages/${PAGE}`]: { json: page() },
+        [`GET ${NOTION_API}/pages/${OTHER}`]: { json: theirs },
+        [`GET ${NOTION_API}/users/me`]: { json: { object: "user", id: BOT, type: "bot" } },
+        [`PATCH ${NOTION_API}/pages/${PAGE}`]: { json: page({ in_trash: true }) },
+        [`PATCH ${NOTION_API}/pages/${OTHER}`]: { json: { ...theirs, in_trash: true } },
+      },
+    });
+    // Two runs each create a page; the bot created both.
+    const a = (await t.run("pages.create", { parent: { dataSourceId: DS }, properties: {} })) as { id: string; createdTime: string };
+    t.mock!.on(`POST ${NOTION_API}/pages`, { json: theirs });
+    const b = (await t.run("pages.create", { parent: { dataSourceId: DS }, properties: {} })) as { id: string; createdTime: string };
+    expect(b.id).toBe(OTHER);
+
+    // Run A's undo pointed at run B's page is refused, and nothing is trashed.
+    expect(await t.call("pages.removeCreated", { pageId: b.id, createdTime: a.createdTime })).toMatchObject({ status: "final", error: { code: "notion/not-created-here" } });
+    expect(t.mock!.callsTo(`PATCH ${NOTION_API}/pages/${OTHER}`)).toEqual([]);
+    // An undo without the created time is refused before anything is sent.
+    const sent = t.mock!.calls.length;
+    expect((await t.call("pages.removeCreated", { pageId: a.id })).status).toBe("final");
+    expect(t.mock!.calls.length).toBe(sent);
+
+    // Run A's own undo, from its create's output, still works.
+    expect(await t.run("pages.removeCreated", { pageId: a.id, createdTime: a.createdTime })).toEqual({ pageId: PAGE, inTrash: true });
+    expect(t.mock!.callsTo(`PATCH ${NOTION_API}/pages/${PAGE}`).length).toBe(1);
   });
 
   it("answers unknown for a create Notion answered 503, since it may have been saved, and retryable for an overload", async () => {

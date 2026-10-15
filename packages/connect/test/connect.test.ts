@@ -309,18 +309,42 @@ describe.skipIf(postgresUnavailable())("Connect", () => {
     const handler = (e: unknown) => uncaught.push(e);
     process.on("uncaughtException", handler);
     try {
-      const alone = await createConnect({ audience: AUDIENCE, engineKeys: engine.engineKeys, connectors: [v1], pool, keys, observer: { error: (_e, where) => reported.push(where) } });
+      let now = Date.now();
+      const alone = await createConnect({ audience: AUDIENCE, engineKeys: engine.engineKeys, connectors: [v1], pool, keys, now: () => now, observer: { error: (_e, where) => reported.push(where) } });
       expect(await alone.ready()).toBe(true);
       // The database restarts, or a pooler recycles: every idle socket of this pool errors at once.
       await db.pool("postgres").query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'pool-error-test'");
       await new Promise((r) => setTimeout(r, 300));
       expect(uncaught).toEqual([]);
       expect(reported).toContain("pool");
+      now += 10_000; // past the readiness answer that stands, so the pool is asked again
       expect(await alone.ready()).toBe(true);
       await alone.close();
     } finally {
       process.off("uncaughtException", handler);
       await pool.end().catch(() => {});
+    }
+  });
+
+  it("answers readiness probes that come together with one query, and never throws", async () => {
+    const query = vi.spyOn(db.app, "query");
+    let now = Date.now();
+    try {
+      const probed = await createConnect({ audience: AUDIENCE, engineKeys: engine.engineKeys, connectors: [v1], pool: db.app, keys, now: () => now });
+      const before = query.mock.calls.length;
+      expect(await Promise.all(Array.from({ length: 5 }, () => probed.ready()))).toEqual([true, true, true, true, true]);
+      expect(query.mock.calls.length - before).toBe(1);
+      // A pool that throws as it is asked: a rejected promise, not a throw in the caller.
+      now += 10_000;
+      query.mockImplementationOnce(() => {
+        throw new Error("pool broken");
+      });
+      let answer: Promise<boolean> | undefined;
+      expect(() => (answer = probed.ready())).not.toThrow();
+      await expect(answer).rejects.toThrow("pool broken");
+      await probed.close();
+    } finally {
+      query.mockRestore();
     }
   });
 

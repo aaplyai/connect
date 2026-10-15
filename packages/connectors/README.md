@@ -48,10 +48,31 @@ person shared with Aaply.
 | `pages.update` | write, idempotent, confirm | Sets the given properties. |
 | `dataSources.query` | read, paged | Notion's own filter and sorts. |
 | `search` | read, paged | Pages or data sources by title. |
-| `pages.removeCreated` | write, idempotent | Moves the page to the trash, only if this integration's bot created it. A page no longer shared with Aaply is refused for a person to check. |
+| `pages.removeCreated` | write, idempotent | The undo of a create, given its `pageId` and `createdTime` from the create's output: moves that page to the trash, only if this integration's bot created it and its created time is the same. A page no longer shared with Aaply is refused for a person to check. |
+
+**A flow's undo of `pages.create` must pass both `pageId` and `createdTime`, read from the create's
+output.** A compensate that passes only `pageId`, or reads `createdTime` from anywhere else, still
+publishes, and then every undo is refused (`notion/not-created-here`, or an input error) and
+lands with a person. Write it as:
+
+```json
+"compensate": {
+  "action": "notion.pages.removeCreated",
+  "connection": "workspace",
+  "input": { "pageId": { "resource": ["output", "id"] }, "createdTime": { "resource": ["output", "createdTime"] } }
+}
+```
+
+Version 2.0.0 added `createdTime` to the undo's input; a flow pinned to 1.0.0's `removeCreated`
+answers `connect/contract-mismatch` until it is published again with the input above.
 
 Property values, filters and blocks are Notion's own JSON, passed on as given. A conflict (409)
 and an overload (529) answer `retryable`. A data source query answers pages only (a wiki's data source
-lists child data sources too). Not yet checked against a live workspace: whether a reconnect gives the
-integration a new bot user (then `removeCreated` refuses pages made before it). Connect it with Connect's OAuth (`oauthProviders.notion`); Notion's tokens do
+lists child data sources too). Notion has no private place to mark a page with the action that made
+it (Drive's undo checks such a mark), so the undo is bound by the page's created time instead: an undo
+pointed at another page Aaply made is refused, unless that page was created in the same instant (Notion
+may give created times to the minute only). A flow that calls `removeCreated` as an ordinary step, with
+a page's id and created time it read, can still trash any page this integration made. Not yet checked
+against a live workspace: whether a reconnect gives the integration a new bot user (then `removeCreated`
+refuses pages made before it). Connect it with Connect's OAuth (`oauthProviders.notion`); Notion's tokens do
 not expire, so Connect renews one only when Notion refuses it.
