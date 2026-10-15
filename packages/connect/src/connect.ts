@@ -74,6 +74,15 @@ export interface ConnectOptions {
   /** Longest a call may run, in ms. Default 55 000. */
   ceilingMs?: number;
   /**
+   * Calls one instance runs at once, in all and per tenant (default 256 and
+   * 32); a call past either cap is refused `connect/unavailable`, retryable
+   * after a second, before anything is read. The engine's lanes pace each
+   * tenant's calls; this bounds what all tenants together can hold of one
+   * instance's sockets and call budgets.
+   */
+  maxInFlight?: number;
+  maxInFlightPerTenant?: number;
+  /**
    * Tests only: replaces the egress-checked fetch (the kit's `mockFetch`).
    * Production leaves it out, so every socket passes the egress check.
    */
@@ -180,6 +189,17 @@ function newest(connectors: readonly Connector[], id: string): Connector | undef
 export async function createConnect(options: ConnectOptions): Promise<Connect> {
   if (!options.audience) throw new Error("audience is required");
   if (Object.keys(options.engineKeys).length === 0) throw new Error("engineKeys needs at least one key");
+  // pg emits an idle socket's error on the pool; with no listener Node treats it as an uncaught exception,
+  // so a database restart or failover would end every instance at once. The deployment may listen itself.
+  if (options.pool.listenerCount("error") === 0) {
+    options.pool.on("error", (error) => {
+      try {
+        options.observer?.error?.(error, "pool");
+      } catch {
+        // An observer that throws changes nothing.
+      }
+    });
+  }
   const store = createPgStore(options.pool);
   await store.check();
   const vault = createVault({ keys: options.keys, store, ...(options.now ? { now: options.now } : {}) });
@@ -200,6 +220,8 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
     ...(options.oauth ? { refresher: { refresh: (request) => refresher!.refresh(request) } satisfies TokenRefresher } : {}),
     ...(options.now ? { now: options.now } : {}),
     ...(options.ceilingMs !== undefined ? { ceilingMs: options.ceilingMs } : {}),
+    ...(options.maxInFlight !== undefined ? { maxInFlight: options.maxInFlight } : {}),
+    ...(options.maxInFlightPerTenant !== undefined ? { maxInFlightPerTenant: options.maxInFlightPerTenant } : {}),
     ...(options.files ? { files: options.files } : {}),
     ...(options.httpLimits ? { httpLimits: options.httpLimits } : {}),
     ...(options.log ? { log: options.log } : {}),

@@ -89,6 +89,18 @@ export function createOAuth(options: {
     return app;
   };
 
+  /** Revokes a token at its provider, as far as it can (RFC 7009); answers whether the provider confirmed. */
+  async function revokeTokens(app: OAuthApp | undefined, secret: Readonly<Record<string, string>> | null): Promise<boolean> {
+    const token = secret?.refreshToken ?? secret?.accessToken;
+    if (!app?.provider.revokeUrl || !token) return false;
+    try {
+      return (await providerPost(options.fetch, app, app.provider.revokeUrl, { token })).status === 200;
+    } catch (error) {
+      report(error, "oauth.revoke");
+      return false;
+    }
+  }
+
   /** Trades the code, checks the account, and saves the connection. */
   async function finish(r: Record<string, any>, app: OAuthApp, code: string, verifier: string, back: (result: Record<string, string>) => OAuthAnswer): Promise<OAuthAnswer> {
     let tokens: Record<string, unknown>;
@@ -102,12 +114,25 @@ export function createOAuth(options: {
       report(error, "oauth.exchange");
       return back({ connect: "error", reason: "provider-unreachable" });
     }
-    if (typeof r.expectAccount === "string" && account.email?.toLowerCase() !== r.expectAccount.toLowerCase()) return back({ connect: "error", reason: "different-account" });
+    const secret = tokenSecret(tokens, null, now());
+    // A grant Connect will not keep is revoked at the provider (as far as it allows), so the person's account does not keep an "Aaply" grant with nothing behind it.
+    // A provider revokes the whole grant (account and Aaply's client), so it is left alone while a connection here uses that account, as revokeConnection does.
+    // When that cannot be checked, the grant is left alone too: an unused grant costs less than a live connection sent to reauth.
+    const refused = async (reason: string): Promise<OAuthAnswer> => {
+      let inUse = true;
+      try {
+        inUse = (await options.admin.connections(r.scope as Scope)).some((c) => c.status !== "revoked" && c.account.provider === app.provider.id && c.account.id === account.id);
+      } catch (error) {
+        report(error, "oauth.revoke");
+      }
+      if (!inUse) await revokeTokens(app, secret);
+      return back({ connect: "error", reason });
+    };
+    if (typeof r.expectAccount === "string" && account.email?.toLowerCase() !== r.expectAccount.toLowerCase()) return refused("different-account");
     const asked = options.scopesOf(r.connectorId as string);
     // A provider that names no scopes granted what was asked (RFC 6749 5.1); one that names them may have had some unticked.
     const granted = typeof tokens.scope === "string" ? tokens.scope.split(/[\s,]+/).filter(Boolean) : [...asked];
-    if (asked.some((s) => !granted.includes(s))) return back({ connect: "error", reason: "scopes-declined" });
-    const secret = tokenSecret(tokens, null, now());
+    if (asked.some((s) => !granted.includes(s))) return refused("scopes-declined");
     const scope = r.scope as Scope;
     const owner = r.owner as ConnectionOwner;
     const kind = r.environmentKind as EnvironmentKind;
@@ -124,7 +149,7 @@ export function createOAuth(options: {
     try {
       const current = await existing();
       if (current && current.status !== "revoked") {
-        if ((current.account as Record<string, unknown>).id !== account.id) return back({ connect: "error", reason: "different-account" });
+        if ((current.account as Record<string, unknown>).id !== account.id) return refused("different-account");
         const updated = await admin.updateConnection(scope.tenantId, current.id, current.version, { secret, grantedScopes: granted, account: accountJson, status: "active" });
         return back({ connect: "ok", connection: updated.id });
       }
@@ -222,17 +247,7 @@ export function createOAuth(options: {
     },
 
     /** Revokes a connection's token at its provider, as far as it can; answers whether the provider confirmed. */
-    async revokeAtProvider(connectorId: string, secret: Readonly<Record<string, string>> | null): Promise<boolean> {
-      const app = config.apps[connectorId];
-      const token = secret?.refreshToken ?? secret?.accessToken;
-      if (!app?.provider.revokeUrl || !token) return false;
-      try {
-        return (await providerPost(options.fetch, app, app.provider.revokeUrl, { token })).status === 200;
-      } catch (error) {
-        report(error, "oauth.revoke");
-        return false;
-      }
-    },
+    revokeAtProvider: (connectorId: string, secret: Readonly<Record<string, string>> | null) => revokeTokens(config.apps[connectorId], secret),
 
     /** A connection's secret as it is now (to revoke it at the provider before it is deleted). */
     async secretOf(tenantId: string, connectionId: string): Promise<Readonly<Record<string, string>> | null> {

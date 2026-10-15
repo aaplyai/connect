@@ -17,7 +17,7 @@
 
 import { lookup as dnsLookup, type LookupAddress } from "node:dns";
 import { BlockList, isIP } from "node:net";
-import { Agent, fetch as undiciFetch } from "undici";
+import { Agent, buildConnector, fetch as undiciFetch } from "undici";
 import type { FetchLike } from "@aaply/connector-sdk";
 
 const BLOCKED_V4 = [
@@ -122,17 +122,33 @@ export function isEgressRefusal(error: unknown): boolean {
   return false;
 }
 
-/** A `fetch` for the kit whose sockets pass the egress policy. Literal IP hosts are checked before anything is sent. */
+/**
+ * A `fetch` for the kit whose sockets pass the egress policy. Every socket is
+ * checked where it is opened, a literal IP host included (`net.connect` never
+ * resolves one, so the `lookup` check alone would miss it), and no redirect is
+ * followed: the kit sends each hop itself, checking each one, so a redirect to
+ * a private address is refused like a request to it.
+ */
 export function safeFetch(policy: EgressPolicy, options: { connections?: number } = {}): { fetch: FetchLike; close(): Promise<void> } {
-  const agent = new Agent({ connect: { lookup: policy.lookup }, connections: options.connections ?? 64, keepAliveTimeout: 10_000 });
+  const refusal = (problem: string) => Object.assign(new Error(`egress refused: ${problem}`), { code: "ECONNREFUSED", egressRefused: true });
+  const base = buildConnector({ lookup: policy.lookup });
+  const connect: typeof base = (opts, callback) => {
+    const host = String(opts.hostname).replace(/^\[|\]$/g, "");
+    const problem = isIP(host) !== 0 ? policy.check(host, host) : null;
+    if (problem) return callback(refusal(problem), null);
+    return base(opts, callback);
+  };
+  const agent = new Agent({ connect, connections: options.connections ?? 64, keepAliveTimeout: 10_000 });
   const fetch: FetchLike = async (input, init) => {
     const url = new URL(input);
     const host = url.hostname.replace(/^\[|\]$/g, "");
     if (isIP(host) !== 0) {
       const problem = policy.check(host, host);
-      if (problem) throw Object.assign(new TypeError(`fetch failed`), { cause: Object.assign(new Error(`egress refused: ${problem}`), { code: "ECONNREFUSED", egressRefused: true }) });
+      if (problem) throw Object.assign(new TypeError(`fetch failed`), { cause: refusal(problem) });
     }
-    return (await undiciFetch(input, { ...(init as object), dispatcher: agent } as Parameters<typeof undiciFetch>[1])) as unknown as Response;
+    const redirect = (init as { redirect?: string } | undefined)?.redirect ?? "manual";
+    if (redirect === "follow") throw new TypeError("safeFetch follows no redirect: send each hop as its own request");
+    return (await undiciFetch(input, { ...(init as object), redirect, dispatcher: agent } as Parameters<typeof undiciFetch>[1])) as unknown as Response;
   };
   return { fetch, close: () => agent.close() };
 }

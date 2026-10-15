@@ -36,6 +36,32 @@ describe("the egress policy", () => {
     expect(error?.message).toMatch(/egress refused/);
   });
 
+  it("follows no redirect, so a hop to a private address is never taken behind the policy's back", async () => {
+    let secrets = 0;
+    const server = createServer((req, res) => {
+      if (req.url === "/secret") secrets++;
+      if (req.url === "/go") {
+        res.writeHead(302, { location: `http://127.0.0.1:${port}/secret` });
+        return res.end();
+      }
+      res.end("ok");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+    // The name is allowed, the literal loopback address behind the redirect is not.
+    const byName = safeFetch(egressPolicy({ allowPrivate: ["localhost"] }));
+    try {
+      const res = await byName.fetch(`http://localhost:${port}/go`, {});
+      expect(res.status).toBe(302);
+      expect(secrets).toBe(0);
+      await expect(byName.fetch(`http://localhost:${port}/go`, { redirect: "follow" } as never)).rejects.toThrow(/follows no redirect/);
+      expect(secrets).toBe(0);
+    } finally {
+      await byName.close();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
   it("never sends a request to a blocked address, and says so as nothing sent", async () => {
     let hits = 0;
     const server = createServer((_req, res) => (hits++, res.end("{}")));
