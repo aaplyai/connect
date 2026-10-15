@@ -107,6 +107,8 @@ describe.skipIf(postgresUnavailable())("the signed admin API", () => {
     await expect(as(boss).createConnection({ scope, connectorId: "notes", owner: { business: true }, environmentKind: "live" as never, secret: KEY })).rejects.toMatchObject({ code: "admin/invalid" });
     await expect(as(boss).install(scope, 7 as never)).rejects.toMatchObject({ code: "admin/invalid" });
     await expect(as(boss).connections(scope, { connectorId: 7 as never })).rejects.toMatchObject({ code: "admin/invalid" });
+    await expect(as(boss).createConnection({ scope, connectorId: "notes", owner: { business: true }, secret: { "header:authorization": 7 } as never })).rejects.toMatchObject({ code: "admin/invalid" });
+    await expect(as(bo).updateConnection(scope.tenantId, mine.id, mine.version, { secret: { "header:authorization": ["x"] } } as never)).rejects.toMatchObject({ code: "admin/invalid" });
     expect(await as(bo).revokeConnection(scope.tenantId, mine.id)).toMatchObject({ status: "revoked" });
   });
 

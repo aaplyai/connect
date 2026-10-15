@@ -103,6 +103,14 @@ describe.skipIf(postgresUnavailable())("declared SQL connectors", () => {
     };
     expect(Array.isArray(await ids(pinned))).toBe(true);
     expect(Array.isArray(await ids(repinned))).toBe(true);
+    // Another instance, which never built the replaced statement, loads it from the store by its digest.
+    const cold = await createConnect({ audience: AUDIENCE, engineKeys: engine.engineKeys, connectors: [], pool: db.app, keys, egress: { allowPrivate: ["127.0.0.1/32"], sqlPrivateTenants: [scope.tenantId] } });
+    try {
+      const outcome = await cold.perform(await sign({ scope: s, action: "booking-db.freeSlots", effect: "read", input: {}, contract: pinned as never }));
+      expect(outcome.status).toBe("ok");
+    } finally {
+      await cold.close();
+    }
     for (const v of ["1.0.2", "1.0.3", "1.0.4", "1.0.5"]) await connect.admin.installSql(s, bookingConnector(v, `starts_at desc, id /* ${v} */`));
     expect(await ids(pinned)).toMatchObject({ status: "final", error: { code: "connect/contract-mismatch" } });
   });

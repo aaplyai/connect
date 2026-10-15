@@ -151,6 +151,8 @@ const types = {
 interface Held {
   pool: pg.Pool;
   tenantId: string;
+  /** Calls between poolFor and the end of their checkout: pg-pool does not count them as waiting until connect() runs. */
+  users: number;
 }
 
 export function createSqlExecutor(options: SqlExecutorOptions): SqlExecutor {
@@ -188,13 +190,15 @@ export function createSqlExecutor(options: SqlExecutorOptions): SqlExecutor {
     void held.pool.end().catch(() => {});
   };
 
-  async function poolFor(call: SqlCall): Promise<pg.Pool> {
+  /** The pool for a call's database, counted as in use until the caller's checkout settles (see `users`). */
+  async function poolFor(call: SqlCall): Promise<Held> {
     if (closed) throw new ConnectorError("retryable", "sql/closing", "Connect is shutting down.");
     const existing = pools.get(call.poolKey);
     if (existing) {
       pools.delete(call.poolKey);
       pools.set(call.poolKey, existing);
-      return existing.pool;
+      existing.users++;
+      return existing;
     }
     const ip = await address(call.target);
     if (closed) throw new ConnectorError("retryable", "sql/closing", "Connect is shutting down.");
@@ -222,20 +226,23 @@ export function createSqlExecutor(options: SqlExecutorOptions): SqlExecutor {
     const raced = pools.get(call.poolKey);
     if (raced) {
       void pool.end().catch(() => {});
-      return raced.pool;
+      raced.users++;
+      return raced;
     }
-    const held: Held = { pool, tenantId: call.tenantId };
+    const held: Held = { pool, tenantId: call.tenantId, users: 1 };
     // A pool whose last socket closed (idle) is dropped, so old keys do not pile up.
     // Checked a tick later: pg-pool serves waiting callers after it reports the removal.
     pool.on("remove", () =>
       setImmediate(() => {
-        if (pool.totalCount === 0 && pool.waitingCount === 0) drop(call.poolKey, held);
+        if (pool.totalCount === 0 && pool.waitingCount === 0 && held.users === 0) drop(call.poolKey, held);
       }),
     );
     pools.set(call.poolKey, held);
     // Room is made by dropping the least recently used pool that nothing uses: pg-pool never serves a call already queued
     // on a pool it is ending, so a busy pool stays (its idle timer reaps it later) and the cap is exceeded for that long.
-    const idle = (h: Held) => h.pool.waitingCount === 0 && h.pool.idleCount === h.pool.totalCount;
+    // A pool is in use from poolFor until its checkout settles, not only once pg-pool counts the call as waiting.
+    // So a tenant whose pools are all busy may hold more than perTenant for a while; the in-flight caps bound that.
+    const idle = (h: Held) => h.users === 0 && h.pool.waitingCount === 0 && h.pool.idleCount === h.pool.totalCount;
     const mine = [...pools].filter(([, h]) => h.tenantId === call.tenantId);
     if (mine.length > perTenant) {
       const victim = mine.find(([, h]) => h !== held && idle(h));
@@ -247,7 +254,7 @@ export function createSqlExecutor(options: SqlExecutorOptions): SqlExecutor {
         if (h !== held && idle(h)) drop(key, h);
       }
     }
-    return pool;
+    return held;
   }
 
   async function checkout(pool: pg.Pool, signal: AbortSignal): Promise<pg.PoolClient> {
@@ -285,8 +292,13 @@ export function createSqlExecutor(options: SqlExecutorOptions): SqlExecutor {
     async run(call) {
       const op = call.op;
       if (!call.password) throw new ConnectorError("final", "sql/no-credentials", "The database connection has no password.");
-      const pool = await poolFor(call);
-      const client = await checkout(pool, call.signal);
+      const held = await poolFor(call);
+      let client: pg.PoolClient;
+      try {
+        client = await checkout(held.pool, call.signal);
+      } finally {
+        held.users--;
+      }
       // A socket this call closes (or the server drops) errors on the client; the query's own rejection carries it.
       if (!quiet.has(client)) {
         quiet.add(client);

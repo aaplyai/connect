@@ -343,6 +343,36 @@ describe.skipIf(postgresUnavailable())("Connect", () => {
     }
   });
 
+  it("keeps one tenant at its cap from taking another tenant's room, and frees a slot when a call is aborted", async () => {
+    const slow = notesConnector("1.0.0", "slow", { slowMs: 5_000 });
+    const busy = await make({ connectors: [slow], maxInFlightPerTenant: 2, maxInFlight: 10 });
+    const other = { ...scope, tenantId: "tenant-cap-b" };
+    await busy.admin.install(other, "notes");
+    await busy.admin.createConnection({ scope: other, connectorId: "notes", owner: { business: true }, secret: API_KEY });
+    const stop = new AbortController();
+    try {
+      const first = busy.perform(await read(), stop.signal);
+      const second = busy.perform(await read());
+      await new Promise((r) => setTimeout(r, 50));
+      expect(await busy.perform(await read())).toMatchObject({ status: "retryable", error: { code: "connect/unavailable", detail: "tenant cap" }, retryAfterMs: 1000 });
+      // Tenant B is not held back by tenant A's calls.
+      const pending = (call: Promise<unknown>) => Promise.race([call, new Promise((r) => setTimeout(() => r("still running"), 100))]);
+      const b = busy.perform(await read({ scope: other }));
+      expect(await pending(b)).toBe("still running");
+      // An aborted call gives its slot back, so tenant A has room again.
+      stop.abort(new Error("the engine gave up"));
+      expect((await first).status).not.toBe("ok");
+      const third = busy.perform(await read());
+      expect(await pending(third)).toBe("still running");
+      expect(await busy.perform(await read())).toMatchObject({ error: { detail: "tenant cap" } });
+      void second.catch(() => undefined);
+      void third.catch(() => undefined);
+      void b.catch(() => undefined);
+    } finally {
+      await busy.close();
+    }
+  });
+
   it("gives handlers the backend's file store, and refuses file references made for another workspace", async () => {
     const copier = defineConnector({
       id: "copier",

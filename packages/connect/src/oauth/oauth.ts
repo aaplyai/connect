@@ -116,8 +116,16 @@ export function createOAuth(options: {
     }
     const secret = tokenSecret(tokens, null, now());
     // A grant Connect will not keep is revoked at the provider (as far as it allows), so the person's account does not keep an "Aaply" grant with nothing behind it.
+    // A provider revokes the whole grant (account and Aaply's client), so it is left alone while a connection here uses that account, as revokeConnection does.
+    // When that cannot be checked, the grant is left alone too: an unused grant costs less than a live connection sent to reauth.
     const refused = async (reason: string): Promise<OAuthAnswer> => {
-      await revokeTokens(app, secret);
+      let inUse = true;
+      try {
+        inUse = (await options.admin.connections(r.scope as Scope)).some((c) => c.status !== "revoked" && c.account.provider === app.provider.id && c.account.id === account.id);
+      } catch (error) {
+        report(error, "oauth.revoke");
+      }
+      if (!inUse) await revokeTokens(app, secret);
       return back({ connect: "error", reason });
     };
     if (typeof r.expectAccount === "string" && account.email?.toLowerCase() !== r.expectAccount.toLowerCase()) return refused("different-account");
@@ -141,7 +149,7 @@ export function createOAuth(options: {
     try {
       const current = await existing();
       if (current && current.status !== "revoked") {
-        if ((current.account as Record<string, unknown>).id !== account.id) return back({ connect: "error", reason: "different-account" });
+        if ((current.account as Record<string, unknown>).id !== account.id) return refused("different-account");
         const updated = await admin.updateConnection(scope.tenantId, current.id, current.version, { secret, grantedScopes: granted, account: accountJson, status: "active" });
         return back({ connect: "ok", connection: updated.id });
       }

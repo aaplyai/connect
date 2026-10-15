@@ -63,6 +63,8 @@ function scopeProblem(scope: unknown): string | null {
 
 const isId = (v: unknown) => typeof v === "string" && v.length > 0 && v.length <= 200;
 const isObject = (v: unknown) => typeof v === "object" && v !== null && !Array.isArray(v);
+/** A secret is sealed as given and read back as strings: anything else would reach a connector as the wrong type. */
+const isSecret = (v: unknown): v is Record<string, string> => isObject(v) && Object.values(v as object).every((x) => typeof x === "string");
 const ENVIRONMENT_KINDS = new Set(["production", "preview", "test"]);
 const isStrings = (v: unknown, max: number) => Array.isArray(v) && v.length <= max && v.every((x) => typeof x === "string" && x.length > 0 && x.length <= 256);
 
@@ -76,6 +78,7 @@ function changeProblem(change: unknown): string | null {
   if (c.status !== undefined && c.status !== "active" && c.status !== "reauth") return "change.status is active or reauth (revoke with revokeConnection)";
   if (c.grantedScopes !== undefined && !isStrings(c.grantedScopes, 200)) return "change.grantedScopes is a list of scopes";
   for (const k of ["secret", "account", "config"]) if (c[k] !== undefined && (typeof c[k] !== "object" || c[k] === null || Array.isArray(c[k]))) return `change.${k} is an object`;
+  if (c.secret !== undefined && !isSecret(c.secret)) return "change.secret is an object of strings";
   return null;
 }
 
@@ -185,7 +188,7 @@ export function adminAs(raw: RawAdmin, store: ConnectStore, actor: AdminActor): 
       if (!isId(input.connectorId)) throw new AdminError("admin/invalid", "connectorId is a connector id");
       if (input.environmentKind !== undefined && !ENVIRONMENT_KINDS.has(input.environmentKind)) throw new AdminError("admin/invalid", "environmentKind is production, preview or test");
       if ((input.account !== undefined && !isObject(input.account)) || (input.config !== undefined && !isObject(input.config))) throw new AdminError("admin/invalid", "account and config are objects");
-      if (input.secret !== null && input.secret !== undefined && !isObject(input.secret)) throw new AdminError("admin/invalid", "secret is an object of strings, or null");
+      if (input.secret !== null && input.secret !== undefined && !isSecret(input.secret)) throw new AdminError("admin/invalid", "secret is an object of strings, or null");
       if (input.grantedScopes !== undefined && !isStrings(input.grantedScopes, 200)) throw new AdminError("admin/invalid", "grantedScopes is a list of scopes");
       if ("person" in input.owner) {
         if (input.owner.person !== personOf(actor)) throw new AdminError("admin/forbidden", "a person connects only their own account");
