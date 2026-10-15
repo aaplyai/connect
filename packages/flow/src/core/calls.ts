@@ -7,7 +7,7 @@
 import { isParentLink, childRunId, CALL_START_RETRIES, readCallEnd, CALL_ACTOR, capContributors, isContributor, MAX_CALL_OUTPUT_BYTES } from "../calls.js";
 import { type CompiledStep, DEFAULT_RETRY } from "../compile.js";
 import { suppliersOf } from "../core-items-stale.js";
-import { truthy } from "../expr-eval.js";
+import { isTooCostly, truthy } from "../expr-eval.js";
 import { type JsonValue, hasOwn, own, type JsonObject, cloneJson, jsonByteLength } from "../json.js";
 import { publicError, readable } from "../reader.js";
 import type { RunStartedEvent, CallState, CallStartedEvent, CallSettledEvent, CallCancelledEvent, CallCancelReason, CallEnd } from "../state.js";
@@ -213,7 +213,8 @@ export function releaseStaleCalls(this: Machine): void {
     if (step?.call) {
       const applies = this.applies(step);
       const status = this.stepStatus(step);
-      wanted = (!applies.known || truthy(applies.value)) && status.kind === "calling" && status.callId === callId;
+      // What was too costly to work out says nothing about the call, so it is kept.
+      wanted = isTooCostly(applies) || (status.kind === "blocked" && status.missing.costly === true) || ((!applies.known || truthy(applies.value)) && status.kind === "calling" && status.callId === callId);
     }
     if (!wanted) this.abandonCall(callId, call, "superseded");
   }

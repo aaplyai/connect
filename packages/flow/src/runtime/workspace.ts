@@ -11,21 +11,22 @@ import { type Scope, isTerminal, type RunState } from "../state.js";
 import { WORKSPACE_VERSION } from "../stored-versions.js";
 import type { FlowView } from "../view.js";
 import { FlowError } from "../errors.js";
-import { RuntimeContext, type Busy } from "./context.js";
+import { RuntimeContext, type Busy, type Loaded } from "./context.js";
 import { type WorkspaceView } from "../runtime.js";
-import { checkContext, checkId, subjectOf, pause } from "./helpers.js";
+import { checkContext, checkId, subjectOf, pause, isNotFound } from "./helpers.js";
+import { authorize } from "./admission.js";
 import { tryLoadFor, nestedView, shownPending } from "./views.js";
 
 // --- workspace -----------------------------------------------------------------
 
-export async function workspace(rt: RuntimeContext, ctx: TrustedContext, workspaceId: string): Promise<WorkspaceView> {
+export async function workspace(rt: RuntimeContext, ctx: TrustedContext, workspaceId: string, known?: Loaded): Promise<WorkspaceView> {
   checkContext(ctx);
-  return workspaceView(rt, ctx, await loadWorkspace(rt, ctx, workspaceId), workspaceId);
+  return workspaceView(rt, ctx, await loadWorkspace(rt, ctx, workspaceId), workspaceId, undefined, known);
 }
 
-/** The workspace after a call that met a busy refusal on `busy.runId`. */
-export async function workspaceAfter(rt: RuntimeContext, ctx: TrustedContext, workspaceId: string, busy: { runId: string; busy: Busy } | undefined): Promise<WorkspaceView> {
-  return workspaceView(rt, ctx, await loadWorkspace(rt, ctx, workspaceId), workspaceId, busy);
+/** The workspace after a call that met a busy refusal on `busy.runId`; `known` as for {@link workspaceView}. */
+export async function workspaceAfter(rt: RuntimeContext, ctx: TrustedContext, workspaceId: string, busy: { runId: string; busy: Busy } | undefined, known?: Loaded): Promise<WorkspaceView> {
+  return workspaceView(rt, ctx, await loadWorkspace(rt, ctx, workspaceId), workspaceId, busy, known);
 }
 
 /**
@@ -110,10 +111,30 @@ export async function activeRun(rt: RuntimeContext, ctx: TrustedContext, ws: Wor
   return loaded;
 }
 
-export async function workspaceView(rt: RuntimeContext, ctx: TrustedContext, ws: WorkspaceState, workspaceId: string, busy?: { runId: string; busy: Busy }): Promise<WorkspaceView> {
+/**
+ * The run the request holds, if the caller may still see it as it is now,
+ * as `loadFor` would decide on a fresh load: a participant the event left
+ * out sees it no longer.
+ */
+function stillVisible(ctx: TrustedContext, known: Loaded): Loaded | null {
+  try {
+    authorize(ctx, known.state, known.flow);
+    return known;
+  } catch (error) {
+    if (isNotFound(error)) return null;
+    throw error;
+  }
+}
+
+/**
+ * The workspace as `ctx` sees it. `known` is a run this request loaded for
+ * `ctx` or has just recorded: when it is the active run it is shown as it
+ * is, not loaded again.
+ */
+export async function workspaceView(rt: RuntimeContext, ctx: TrustedContext, ws: WorkspaceState, workspaceId: string, busy?: { runId: string; busy: Busy }, known?: Loaded): Promise<WorkspaceView> {
   let active: FlowView | null = null;
   if (ws.active) {
-    const loaded = await tryLoadFor(rt, ctx, ws.active);
+    const loaded = known?.state.runId === ws.active ? stillVisible(ctx, known) : await tryLoadFor(rt, ctx, ws.active);
     // A run waiting for a child shows it nested, so the person sees where they are.
     if (loaded) {
       const view = await nestedView(rt, ctx, loaded.state, loaded.flow, loaded.state.parent?.depth ?? 0);

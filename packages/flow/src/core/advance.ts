@@ -7,14 +7,15 @@
 import { keyOf } from "../address.js";
 import { MAX_INFLIGHT } from "../collections-compile.js";
 import { type CompiledStep, type CompiledAction, actionNode } from "../compile.js";
-import { truthy, type Missing, evaluateRecord } from "../expr-eval.js";
+import { isTooCostly, truthy, type Evaluated, type Missing } from "../expr-eval.js";
 import { fingerprint } from "../hash.js";
 import { own, type JsonObject, cloneJson } from "../json.js";
 import { liveItems } from "../items.js";
 import type { StepStatus } from "../reader.js";
-import { isTerminal, type CauseRef, type EffectPurpose, type ActionEffect, type ResourceState } from "../state.js";
+import { isTerminal, type ActionError, type CauseRef, type EffectPurpose, type ActionEffect, type ResourceState } from "../state.js";
 import type { EndKind } from "../definition.js";
 import { type Machine, NO_ITEM, traceOf, effectNumber, MAX_ENDED_RESOURCES } from "../core.js";
+import { undoInDoubt } from "./settle.js";
 
 // --- the next move ----------------------------------------------------------
 
@@ -69,11 +70,17 @@ export function advance(this: Machine): void {
     room--;
     this.startRun(status.action, status.input, status.fingerprint, item);
   };
-  for (const step of this.flow.steps) {
+  let held = false;
+  steps: for (const step of this.flow.steps) {
     // Once the current step is found, only early starts remain; stop when none can happen.
     if (items && current && ((prefetch === 0 && current.step !== step) || room <= 0)) break;
     for (const item of step.forEach === undefined ? NO_ITEM : liveItems(s, step.forEach)) {
       const applies = this.applies(step, item);
+      // A step whose condition or input was too costly to work out holds the run there: nothing past it is skipped to.
+      if (isTooCostly(applies)) {
+        held = true;
+        break steps;
+      }
       if (!applies.known) {
         missing.facts.push(...applies.missing.facts);
         continue;
@@ -81,6 +88,10 @@ export function advance(this: Machine): void {
       if (!truthy(applies.value)) continue;
       const status = this.stepStatus(step, item);
       if (status.kind === "complete") continue;
+      if (status.kind === "blocked" && status.missing.costly) {
+        held = true;
+        break steps;
+      }
       if (status.kind === "blocked") {
         missing.facts.push(...status.missing.facts);
         missing.results.push(...status.missing.results);
@@ -112,6 +123,13 @@ export function advance(this: Machine): void {
         early(status, item);
       }
     }
+  }
+  if (!current && held) {
+    // Held where something was too costly to work out, it is not stuck, and its waits stay open:
+    // a delivery to one may still come, and the step may yet apply.
+    s.current = null;
+    delete s.currentItem;
+    return;
   }
   for (const [stepId, wait] of Object.entries(s.waits)) {
     if (current?.step.id !== stepId || (current.status.kind === "wait" && current.status.key !== wait.key)) this.closeWait(stepId);
@@ -174,9 +192,23 @@ export function startEffect(this: Machine, purpose: EffectPurpose, action: Compi
   this.effects.push(effect);
 }
 
-export function frozenInput(this: Machine, entries: CompiledAction["call"]["input"], resource: JsonObject): JsonObject {
-  const r = evaluateRecord(entries, this.env({ resource }));
-  return r.known ? (r.value as JsonObject) : {};
+/**
+ * The input of an undo or a reconcile, worked out from what was sent (the
+ * only data its expressions may read, so only a cap can leave it unknown),
+ * on its own evaluation's budget rather than the step's.
+ * When it cannot be worked out it is not sent with a guessed input:
+ * {@link unsentError} says why, and the caller records the effect in doubt
+ * for someone to check.
+ */
+export function frozenInput(this: Machine, entries: CompiledAction["call"]["input"], resource: JsonObject): Evaluated {
+  return this.evalFrozen(entries, resource);
+}
+
+/** Why an undo or a reconcile whose input could not be worked out was not sent. */
+export function unsentError(r: Evaluated): ActionError {
+  return isTooCostly(r)
+    ? { code: "flow/expr-too-costly", message: "Its input took too much work to work out, so it was not sent." }
+    : { code: "flow/unknown", message: "Its input could not be worked out, so it was not sent." };
 }
 
 /** Releases holds whose input changed or whose step no longer applies. */
@@ -191,6 +223,8 @@ export function releaseStale(this: Machine): void {
     const gone = resource.item !== undefined && !liveItems(s, action.forEach ?? "").includes(resource.item);
     const applies = step ? this.applies(step, resource.item) : { known: true as const, value: true };
     const input = this.currentInput(action, resource.item);
+    // What was too costly to work out says nothing about the hold, so it is kept (its time to live still runs).
+    if (!gone && (isTooCostly(applies) || isTooCostly(input))) continue;
     const stillWanted = !gone && (!applies.known || truthy(applies.value)) && input.known && fingerprint(input.value) === resource.fingerprint;
     if (!stillWanted) this.release(resourceId, resource);
   }
@@ -227,7 +261,9 @@ export function sendRelease(this: Machine, resourceId: string, resource: Resourc
   const effectId = this.nextEffectId();
   delete resource.releaseQueued;
   resource.releaseEffectId = effectId;
-  this.startEffect("compensate", action, this.frozenInput(action.compensate!.input, { input: resource.input, output: resource.output }), 1, effectId, resourceId, resource.item);
+  const input = this.frozenInput(action.compensate!.input, { input: resource.input, output: resource.output });
+  if (!input.known) return undoInDoubt(this, resource, effectId, action.name, unsentError(input));
+  this.startEffect("compensate", action, input.value as JsonObject, 1, effectId, resourceId, resource.item);
 }
 
 /**

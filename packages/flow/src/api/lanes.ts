@@ -17,6 +17,7 @@ export {
   MAX_LANE_RATE,
   MIN_LANE_RATE,
   NEW_LANE_STATE,
+  NO_CAP,
   NO_LANE,
   tokensAt,
   type BreakerState,

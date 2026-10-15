@@ -22,15 +22,29 @@ const page = (over: Record<string, unknown> = {}) => ({
 });
 
 describe("notion", () => {
-  it("creates a row in a data source on API version 2025-09-03, and answers only the page's fields", async () => {
+  it("creates a row in a data source on API version 2025-09-03, and answers only what Notion made", async () => {
     const t = testConnector(notion, { routes: { [`POST ${NOTION_API}/pages`]: { json: page() } } });
     const properties = { Name: { title: [{ text: { content: "Ana, 10:00" } }] } };
     const out = await t.run("pages.create", { parent: { dataSourceId: DS }, properties });
-    expect(out).toMatchObject({ id: PAGE, inTrash: false, parent: { data_source_id: DS } });
-    expect(out).not.toHaveProperty("icon");
+    // Not the parent or properties it was sent: its undo reads this output, so nothing the flow chose may be in it.
+    expect(out).toEqual({ id: PAGE, url: "https://www.notion.so/Booking-aaaa", createdTime: CREATED });
     const sent = t.mock!.calls[0]!;
     expect(sent.headers["notion-version"]).toBe(NOTION_VERSION);
     expect(sent.json()).toEqual({ parent: { type: "data_source_id", data_source_id: DS }, properties });
+  });
+
+  it("answers unknown for a create Notion answered without its created time, which its undo needs", async () => {
+    const { created_time: _c, ...noTime } = page();
+    const t = testConnector(notion, { routes: { [`POST ${NOTION_API}/pages`]: { json: noTime } } });
+    expect(await t.call("pages.create", { parent: { pageId: PAGE }, properties: {} })).toMatchObject({ status: "unknown", error: { code: "notion/bad-response" } });
+  });
+
+  it("refuses an undo whose created time is not one, before calling Notion", async () => {
+    const t = testConnector(notion, { routes: {} });
+    // V8 reads this as a date; the undo's input schema does not.
+    expect(Date.parse("x Oct 10 2026 04:00:00 GMT")).toBe(Date.parse(CREATED));
+    expect(await t.call("pages.removeCreated", { pageId: PAGE, createdTime: "x Oct 10 2026 04:00:00 GMT" })).toMatchObject({ status: "final", error: { code: "connect/invalid-input" } });
+    expect(t.mock!.calls).toEqual([]);
   });
 
   it("answers unknown when a create's answer is lost, so the engine asks instead of creating twice", async () => {

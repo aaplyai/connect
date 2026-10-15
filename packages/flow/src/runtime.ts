@@ -55,7 +55,7 @@ import { RuntimeContext } from "./runtime/context.js";
 import { exportSubject, eraseSubject, placeHold, releaseHold, listHolds } from "./runtime/privacy.js";
 import { migrate, migrateAll } from "./runtime/migrate.js";
 import { deliver, completeAction, resolveEffect } from "./runtime/deliver.js";
-import { work } from "./runtime/work.js";
+import { drain, work } from "./runtime/work.js";
 import { workspace } from "./runtime/workspace.js";
 import { view, inspect, health } from "./runtime/views.js";
 import { start, submit } from "./runtime/start.js";
@@ -452,6 +452,14 @@ export interface FlowRuntime {
    */
   work(options?: { limit?: number; only?: "actions" | "timers" }): Promise<{ actions: number; timers: number }>;
   /**
+   * Waits for the outcomes this instance is still recording after their
+   * requests answered (an inline call that outlived `inlineBudgetMs`).
+   * A host shutting down stops taking requests, then awaits this, so a call
+   * that completed is recorded rather than left to a worker as interrupted.
+   * Never throws.
+   */
+  drain(): Promise<void>;
+  /**
    * A person's data: their runs with their events, and their workspaces
    * (with any open question or offer, and the facts it holds). The person
    * themself, or `privacyRoles`. Secrets are masked unless `secrets` is
@@ -570,6 +578,10 @@ class Runtime implements FlowRuntime {
 
   work(options?: { limit?: number; only?: "actions" | "timers" }): Promise<{ actions: number; timers: number }> {
     return work(this.rt, options);
+  }
+
+  drain(): Promise<void> {
+    return drain(this.rt);
   }
 
   exportSubject(ctx: TrustedContext, subjectId: string, options?: SubjectExportOptions): Promise<SubjectExport> {

@@ -91,7 +91,8 @@ export interface PatternBudget {
 /**
  * True when the pattern matches anywhere in `subject` (JSON Schema's
  * unanchored search). Null when `budget` ran out first: a unit is one
- * thread followed on one character, or one state of a set the cache keeps.
+ * thread followed on one character, or two for each state of a set the cache
+ * sorts and keys.
  */
 export function patternMatches(p: CompiledPattern, subject: string, budget: PatternBudget = { left: Infinity }): boolean | null {
   const points: number[] = [];
@@ -169,7 +170,7 @@ export function patternMatches(p: CompiledPattern, subject: string, budget: Patt
   // so a repetitive value costs one lookup a character. What a step does depends only on the set,
   // the character, and whether the next position is the end or before a word character.
   const cache = new ThreadSets();
-  let state = cache.intern(current, currentCount);
+  let state = cache.intern(current, currentCount, budget);
   for (let pos = 0; pos < length; pos++) {
     if (budget.left < 0) return null;
     const key = cps[pos]! * 4 + (pos + 1 === length ? 2 : 0) + (pos + 1 < length && isWord(cps[pos + 1]!) ? 1 : 0);
@@ -188,8 +189,7 @@ export function patternMatches(p: CompiledPattern, subject: string, budget: Patt
     current = next;
     next = swap;
     currentCount = nextCount;
-    const to = cache.intern(current, currentCount);
-    if (to >= 0) budget.left -= currentCount;
+    const to = cache.intern(current, currentCount, budget);
     if (state >= 0 && to >= 0) cache.link(state, key, to);
     state = to;
   }
@@ -210,12 +210,13 @@ class ThreadSets {
   private misses = 0;
   private resting = 0;
 
-  /** The set's id, or -1 while the cache rests. */
-  intern(list: Int32Array, count: number): number {
+  /** The set's id, or -1 while the cache rests. Sorting the set and making its key are charged to `budget`. */
+  intern(list: Int32Array, count: number, budget: PatternBudget): number {
     if (this.resting > 0) {
       this.resting--;
       return -1;
     }
+    budget.left -= 2 * count;
     const pcs = list.slice(0, count).sort();
     const key = pcs.join(",");
     let id = this.ids.get(key);

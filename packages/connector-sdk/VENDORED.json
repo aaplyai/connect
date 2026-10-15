@@ -2,6 +2,6 @@
   "$comment": "Read-only copy. @aaply/connector-sdk is owned by aaplyai/flow until both libraries are published to a registry: change it there, then run `node scripts/vendor.mjs sync packages/connector-sdk <flow checkout>`. CI refuses any local edit.",
   "repository": "aaplyai/flow",
   "path": "packages/connector-sdk",
-  "commit": "7f616bc8bf986933a058948e9c857e40464c796d",
-  "digest": "sha256:0e0cb992ea241613b8dca36dd7ad554c6466b551155e4e0c801edd79299ab718"
+  "commit": "77071d3ce44095d916eb7d3f2b6a806d6ccd1202",
+  "digest": "sha256:3dce49d79204d103eec02df64db83fb660dd6cb7c616cac45df7c28854264b9f"
 }

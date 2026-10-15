@@ -89,6 +89,8 @@ describe("validateConnector", () => {
       ["GET metadata.google.internal/x", "connector/egress-private-host"],
       ["GET router.home.arpa/x", "connector/egress-private-host"],
       ["GET 10.0.0.1.nip.io/x", "connector/egress-private-host"],
+      ["GET api.vcap.me/x", "connector/egress-private-host"],
+      ["GET 169-254-169-254.traefik.me/x", "connector/egress-private-host"],
       ["GET intranet/x", "connector/egress-private-host"],
       ["GET api.example.com:8443/x", "connector/egress-port"],
       ["GET user:secret@api.example.com/x", "connector/egress-credentials"],

@@ -325,18 +325,31 @@ function codePointLength(value: string): number {
  * Pattern work one {@link validateValue} call may spend, across every value it
  * matches (see `patternMatches`): a few tens of milliseconds. An ordinary form
  * uses a small fraction; a value it runs out on is reported, not matched.
+ * A caller that validates many values for one request passes one budget to
+ * every call, so the request, not each value, is bounded.
  */
 export const MAX_PATTERN_WORK = 2_000_000;
 
-/** Validates `value` against `schema`. Returns at most 50 issues. */
-export function validateValue(schema: JsonSchema, value: JsonValue, path: PathSegment[] = []): SchemaIssue[] {
+/**
+ * Validates `value` against `schema`. Returns at most 50 issues. `budget` is
+ * the pattern work it may spend, drawn on in place; by default a fresh
+ * {@link MAX_PATTERN_WORK} for this call alone.
+ */
+export function validateValue(schema: JsonSchema, value: JsonValue, path: PathSegment[] = [], budget: PatternBudget = { left: MAX_PATTERN_WORK }): SchemaIssue[] {
   const issues: SchemaIssue[] = [];
-  validateInto(schema, value, path, issues, { left: MAX_PATTERN_WORK });
+  validateInto(schema, value, path, issues, budget);
   return issues;
 }
 
 function push(issues: SchemaIssue[], path: PathSegment[], code: string, message: string): void {
   if (issues.length < MAX_ISSUES) issues.push({ path, code, message });
+}
+
+/** Whether `value` equals one of `options`, writing a list or object `value` out once however many options there are. */
+function oneOf(options: readonly JsonValue[], value: JsonValue): boolean {
+  if (value === null || typeof value !== "object") return options.some((option) => jsonEqual(option, value));
+  const key = canonicalJson(value);
+  return options.some((option) => option !== null && typeof option === "object" && canonicalJson(option) === key);
 }
 
 function validateInto(schema: JsonSchema, value: JsonValue, path: PathSegment[], issues: SchemaIssue[], budget: PatternBudget): void {
@@ -361,10 +374,8 @@ function validateInto(schema: JsonSchema, value: JsonValue, path: PathSegment[],
       return;
     }
   }
-  if (schema.const !== undefined && !jsonEqual(schema.const, value)) push(issues, path, "const", "value is not the allowed constant");
-  if (schema.enum !== undefined && !schema.enum.some((option) => jsonEqual(option, value))) {
-    push(issues, path, "enum", "value is not one of the allowed options");
-  }
+  if (schema.const !== undefined && !oneOf([schema.const], value)) push(issues, path, "const", "value is not the allowed constant");
+  if (schema.enum !== undefined && !oneOf(schema.enum, value)) push(issues, path, "enum", "value is not one of the allowed options");
   if (typeof value === "string") {
     const length = codePointLength(value);
     if (schema.minLength !== undefined && length < schema.minLength) push(issues, path, "minLength", `must be at least ${schema.minLength} characters`);
@@ -376,7 +387,8 @@ function validateInto(schema: JsonSchema, value: JsonValue, path: PathSegment[],
         const compiled = compiledPattern(schema.pattern);
         if (typeof compiled === "string") push(issues, path, "pattern", "pattern cannot be matched");
         else {
-          const matched = patternMatches(compiled, value, budget);
+          // A budget already spent is not drawn on again.
+          const matched = budget.left < 0 ? null : patternMatches(compiled, value, budget);
           if (matched === null) push(issues, path, "pattern", "value is too costly to check against this pattern");
           else if (!matched) push(issues, path, "pattern", "value has the wrong shape");
         }

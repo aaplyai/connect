@@ -6,6 +6,7 @@
 import { splitTemplate, fieldAddress, templateOf, keyOf } from "./address.js";
 import type { CompiledRule, CompiledCollection } from "./compile.js";
 import type { Node } from "./expr.js";
+import { isTooCostly } from "./expr-eval.js";
 import { liveItem, fieldLocked, fieldState, liveItems } from "./items.js";
 import { type JsonValue, own, isJsonObject } from "./json.js";
 import type { Provenance } from "./state.js";
@@ -33,6 +34,7 @@ export function applyItemRule(
   const collection = rule.addresses !== undefined ? m.flow.collections.get(rule.addresses) : undefined;
   if (rule.item && collection) {
     const r = m.eval(rule.item, { payload });
+    if (isTooCostly(r)) m.refuse("flow/expr-too-costly", "Which item this is about took too much work to work out.");
     if (!r.known) m.refuse("flow/rule-incomplete", "It is not clear which item this is about.", r.missing.facts);
     if (!liveItem(s, collection.name, r.value)) m.refuse("flow/unknown-item", "That item is not in the list any more.", [collection.name]);
     target = r.value as string;

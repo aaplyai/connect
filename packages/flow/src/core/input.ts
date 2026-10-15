@@ -8,9 +8,8 @@ import { keyOf } from "../address.js";
 import { CALL_END_RULES } from "../compile.js";
 import { checkInputOps, applyItemOps, itemGateProblems } from "../core-items.js";
 import { outputItem } from "../core-items-stale.js";
-import { truthy } from "../expr-eval.js";
 import { own, type JsonValue, jsonEqual, jsonByteLength, cloneJson, hasOwn } from "../json.js";
-import { readable } from "../reader.js";
+import { checkIssue, readable } from "../reader.js";
 import { validateValue } from "../schema.js";
 import { fillModeOf, personOwned } from "../fill.js";
 import { type RunState, type OutputEvent, isTerminal, type FactsInputEvent, type AssistMark, type AssistBasis, type FactState, type Provenance, type ItemOp } from "../state.js";
@@ -157,9 +156,9 @@ export function propose(this: Machine, name: string, value: JsonValue, basis: As
   const fails = (): boolean =>
     fact.checks.some((check) => {
       const r = this.eval(check.test, { value });
-      return r.known && !truthy(r.value);
+      return checkIssue(r, check) !== null;
     });
-  if (jsonByteLength(value) > this.flow.limits.maxFactBytes || validateValue(fact.schema, value).length > 0 || fails()) {
+  if (jsonByteLength(value) > this.flow.limits.maxFactBytes || validateValue(fact.schema, value, [], this.patternBudget).length > 0 || fails()) {
     // A guess that does not even fit the fact is not worth offering.
     if (basis === "stated") this.note("flow/assist-invalid", `"${fact.def.title ?? name}" was not filled: what was heard does not fit.`, [name]);
     return;

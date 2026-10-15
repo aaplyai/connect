@@ -8,7 +8,7 @@
  * an empty store.
  */
 
-import type { LaneClass, LaneLimit, LaneSignal, Priority } from "../lanes.js";
+import { backgroundCap, LANE_DEFAULTS, NO_CAP, type LaneClass, type LaneLimit, type LaneSignal, type Priority } from "../lanes.js";
 import type { ActionEffect, Scope } from "../state.js";
 import type { LaneOps, OutboxItem, RunStore } from "../store.js";
 import type { ConformanceCase } from "./conformance.js";
@@ -68,6 +68,8 @@ function item(id: string, o: ItemOptions = {}): OutboxItem {
 
 const ids = (items: OutboxItem[]) => items.map((i) => i.id).sort();
 const LEASE = 10_000;
+/** A platform cap above anything a case claims, for cases about order or tokens: without a row, a lane has the default cap. */
+const ROOMY: LaneLimit = { cap: 1_000 };
 
 export function laneConformanceCases(makeStore: (config: LaneConfig) => RunStore | Promise<RunStore>): ConformanceCase[] {
   const cases: ConformanceCase[] = [];
@@ -97,7 +99,7 @@ export function laneConformanceCases(makeStore: (config: LaneConfig) => RunStore
     eq(ids(await claim(store, 100, 4)), ["a2", "a3", "a4", "a5"], "work-conserving");
   });
 
-  it("takes one run's items in the order the run wrote them, within a lane", {}, async (store) => {
+  it("takes one run's items in the order the run wrote them, within a lane", { limits: [ROOMY] }, async (store) => {
     // A per-item step writes one row per item in one commit: same lane, same due time, effect ids
     // `<runId>.<n>`. They go in that order, also past `.9` and `.99`, however they were added.
     const seqs = [12, 3, 100, 9, 1, 10, 2, 11, 99];
@@ -143,7 +145,7 @@ export function laneConformanceCases(makeStore: (config: LaneConfig) => RunStore
     eq(got.map((t) => `${t.scope.tenantId}/${t.timerId}`), ["z/due"], "the first claim finds it");
   });
 
-  it("ranks priority within a round: one tenant's interactive burst never holds back another's background item", {}, async (store) => {
+  it("ranks priority within a round: one tenant's interactive burst never holds back another's background item", { limits: [ROOMY] }, async (store) => {
     await add(store, B, [item("b-old", { scope: B, availableAt: 0 })]);
     await add(store, A, Array.from({ length: 100 }, (_, i) => item(`burst${i}`, { priority: "interactive", availableAt: 50 })));
     // The old ranking (interactive first across every lane) gave all 10 to the burst, pass after pass.
@@ -165,7 +167,7 @@ export function laneConformanceCases(makeStore: (config: LaneConfig) => RunStore
     eq(ids(await claim(store, 100, 1)), [], "the reserved slot stays for interactive work");
   });
 
-  it("is fair per tenant first: a tenant with 100 apps takes half the claims from a tenant with one", {}, async (store) => {
+  it("is fair per tenant first: a tenant with 100 apps takes half the claims from a tenant with one", { limits: [ROOMY] }, async (store) => {
     for (let a = 0; a < 100; a++) {
       const scope = { ...A, appId: `app-${String(a).padStart(3, "0")}` };
       await add(store, scope, Array.from({ length: 5 }, (_, i) => item(`a${a}-${i}`, { scope })));
@@ -184,6 +186,23 @@ export function laneConformanceCases(makeStore: (config: LaneConfig) => RunStore
     const order: string[] = [];
     for (let i = 0; i < 8; i++) order.push(...(await claim(store, 100, 1)).map((x) => x.id));
     eq(order, ["l1-0", "b0", "l2-0", "b1", "l3-0", "b2", "l1-1", "b3"], "tenants alternate, and A's lanes take turns across claims");
+  });
+
+  // No limit rows at all: one tenant's lane still holds at most the default cap in flight, so a
+  // connector that hangs cannot take every worker's slots.
+  it("caps a lane at LANE_DEFAULTS.cap when no row sets a cap", {}, async (store, lanes) => {
+    const cap = LANE_DEFAULTS.cap;
+    assert(cap !== null && cap > 1, "the default cap is set");
+    const background = backgroundCap(cap, LANE_DEFAULTS.reserve);
+    await add(store, A, Array.from({ length: cap + 2 }, (_, i) => item(`bg${i}`, { availableAt: i })));
+    eq((await claim(store, 100)).length, background, "background stops at the default cap less its reserve");
+    await add(store, A, Array.from({ length: cap }, (_, i) => item(`i${i}`, { priority: "interactive", availableAt: 50 })));
+    await add(store, B, [item("b0", { scope: B })]);
+    const next = await claim(store, 200);
+    eq(next.filter((i) => i.scope.tenantId === A.tenantId).length, cap - background, "interactive fills the cap, no further");
+    eq(ids(next.filter((i) => i.scope.tenantId === B.tenantId)), ["b0"], "another tenant's lane has its own cap");
+    eq(ids(await claim(store, 300)), [], "the lane is full");
+    eq((await lanes.stats({ now: 300, scope: A })).find((x) => x.lane === "mail")?.cap, cap, "stats report the default cap");
   });
 
   it("never grants past a lane's cap; done and lease expiry free slots", { limits: [{ tenantId: A.tenantId, cap: 2, reserve: 0 }] }, async (store) => {
@@ -212,7 +231,7 @@ export function laneConformanceCases(makeStore: (config: LaneConfig) => RunStore
     eq(ids(got), ["b-i", "i0", "i1"], "interactive first within each tenant's round");
   });
 
-  it("spends and refills a lane's token bucket, keeping reserve tokens", { limits: [laneRow(A, "mail", { ratePerSec: 4, burst: 4, reserve: 0.25 })] }, async (store) => {
+  it("spends and refills a lane's token bucket, keeping reserve tokens", { limits: [ROOMY, laneRow(A, "mail", { ratePerSec: 4, burst: 4, reserve: 0.25 })] }, async (store) => {
     await add(store, A, Array.from({ length: 10 }, (_, i) => item(`bg${i}`, { availableAt: i })));
     eq((await claim(store, 1000)).length, 3, "background leaves reserve * burst = 1 token");
     await add(store, A, [item("i0", { priority: "interactive" }), item("i1", { priority: "interactive" })]);
@@ -353,6 +372,22 @@ export function laneConformanceCases(makeStore: (config: LaneConfig) => RunStore
     eq(other.refused.map((r) => [r.id, r.reason]), [["r2", "taken"]], "another scope's ids match nothing");
   });
 
+  // Concurrent turns on one lane each commit a reservation before any is decided. Another turn's
+  // reservation is not in flight until it is granted, so they share the cap rather than refuse each
+  // other; a granted one is counted, so none goes past it.
+  it("grants other turns' reservations up to the cap, one turn at a time", {}, async (store, lanes) => {
+    const cap = LANE_DEFAULTS.cap;
+    assert(cap !== null, "the default cap is set");
+    await add(store, A, Array.from({ length: 2 * cap }, (_, i) => item(`r${i}`, { priority: "interactive", reserved: { owner: `api-${i}`, until: 5_000 } })));
+    const decided: string[] = [];
+    for (let i = 0; i < 2 * cap; i++) {
+      const grant = await lanes.claimInline(A, [`r${i}`], { owner: `api-${i}`, now: 100, leaseMs: LEASE });
+      decided.push(grant.granted.length === 1 ? "granted" : (grant.refused[0]?.reason ?? "none"));
+    }
+    eq(decided, [...Array<string>(cap).fill("granted"), ...Array<string>(cap).fill("capacity")], "the first cap granted, the rest refused for capacity");
+    eq(await claim(store, 100), [], "the lane is full for workers too");
+  });
+
   it("counts an item a worker holds as in flight, even when its id is in the inline request", { limits: [{ tenantId: A.tenantId, cap: 1, reserve: 0 }] }, async (store, lanes) => {
     await add(store, A, [item("w0")]);
     eq(ids(await claim(store, 100)), ["w0"], "a worker holds the only slot");
@@ -381,6 +416,24 @@ export function laneConformanceCases(makeStore: (config: LaneConfig) => RunStore
     await add(store, A, [item("call2", { lane: "-", laneClass: "-", reserved: { owner: "api", until: 5_000 } }), item("call3", { lane: "-", laneClass: "-" })]);
     eq((await lanes.claimInline(A, ["call2"], { owner: "api", now: 200, leaseMs: LEASE })).granted.map((i) => i.id), ["call2"], "granted inline");
     eq(ids(await claim(store, 200)), ["call3"], "signals on lane \"-\" change nothing");
+  });
+
+  it("leaves a lane uncapped by NO_CAP on the platform row, under a tenant row's cap", { limits: [{ cap: NO_CAP, reserve: 0.25 }, { tenantId: B.tenantId, cap: 2 }] }, async (store, lanes) => {
+    const many = 2 * (LANE_DEFAULTS.cap ?? 8);
+    await add(store, A, Array.from({ length: many }, (_, i) => item(`a${i}`, { availableAt: i })));
+    await add(store, B, Array.from({ length: 5 }, (_, i) => item(`b${i}`, { scope: B, availableAt: i })));
+    const got = await claim(store, 100);
+    eq(got.filter((i) => i.scope.tenantId === A.tenantId).length, many, "no cap, not the default, and no reserve held back");
+    eq(got.filter((i) => i.scope.tenantId === B.tenantId).length, 1, "a tenant row's cap still applies: 2 less its reserve");
+    eq((await lanes.stats({ now: 100, scope: A })).find((x) => x.lane === "mail")?.cap, null, "stats report no cap");
+  });
+
+  it("lets a tenant row opt its lanes out of the platform's cap with NO_CAP", { limits: [{ cap: 2, reserve: 0 }, { tenantId: A.tenantId, cap: NO_CAP }] }, async (store, lanes) => {
+    await add(store, A, Array.from({ length: 6 }, (_, i) => item(`r${i}`, { priority: "interactive", reserved: { owner: "api", until: 5_000 } })));
+    const grant = await lanes.claimInline(A, Array.from({ length: 6 }, (_, i) => `r${i}`), { owner: "api", now: 100, leaseMs: LEASE });
+    eq([grant.granted.length, grant.refused], [6, []], "every reservation granted inline");
+    await add(store, B, Array.from({ length: 4 }, (_, i) => item(`b${i}`, { scope: B })));
+    eq((await claim(store, 100)).length, 2, "another tenant keeps the platform's cap");
   });
 
   it("clamps a tenant's cap and rate by the platform ceilings", { limits: [{ capMax: 2, rateMax: 1000, reserve: 0 }, { tenantId: A.tenantId, cap: 50 }] }, async (store) => {

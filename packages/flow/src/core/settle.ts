@@ -12,6 +12,7 @@ import { publicError } from "../reader.js";
 import { validateValue } from "../schema.js";
 import type { ActionSettledEvent, ActionError, ActionOutcome, ResourceState, EffectResolvedEvent } from "../state.js";
 import { type Machine, reject, windowOf, backoff } from "../core.js";
+import { unsentError } from "./advance.js";
 
 // --- system events ---------------------------------------------------------
 
@@ -208,12 +209,17 @@ export function reconcileOrDoubt(this: Machine, action: CompiledAction, effectId
   const s = this.state;
   const item = own(s.inflight, effectId)?.item;
   const res = s.results[keyOf(action.name, item)]!;
-  if (action.reconcile) {
+  const input = action.reconcile ? this.frozenInput(action.reconcile.input, { input: res.input }) : null;
+  if (input && !input.known) {
+    this.markInDoubt(action, effectId, unsentError(input));
+    return;
+  }
+  if (action.reconcile && input) {
     res.status = "reconciling";
     res.error = error;
     res.rev = this.rev;
     s.inflight[effectId] = { ...s.inflight[effectId]!, waiting: true };
-    this.startEffect("reconcile", action, this.frozenInput(action.reconcile.input, { input: res.input }), 1, undefined, effectId, item);
+    this.startEffect("reconcile", action, input.value as JsonObject, 1, undefined, effectId, item);
     return;
   }
   this.markInDoubt(action, effectId, error);
@@ -337,12 +343,18 @@ export function settleCompensation(this: Machine, ev: ActionSettledEvent, action
     this.setTimer(`retry:${ev.effectId}`, this.now + backoff(action.retry, ev.attempt, ev.effectId, retryAfter));
     return true;
   }
-  resource.status = "in_doubt";
-  resource.error = "error" in outcome ? outcome.error : { code: "flow/unknown", message: "Undo failed." };
-  resource.rev = this.rev;
-  if (!s.attention.includes(ev.effectId)) s.attention.push(ev.effectId);
-  this.note("flow/undo-failed", "Something could not be undone automatically. Someone will check.", undefined, action.name);
+  undoInDoubt(this, resource, ev.effectId, action.name, "error" in outcome ? outcome.error : { code: "flow/unknown", message: "Undo failed." });
   return true;
+}
+
+/** An undo that failed, or could not be sent: the hold is in doubt until someone checks it (`effect.resolved` for `effectId`). */
+export function undoInDoubt(m: Machine, resource: ResourceState, effectId: string, action: string, error: ActionError): void {
+  const s = m.state;
+  resource.status = "in_doubt";
+  resource.error = error;
+  resource.rev = m.rev;
+  if (!s.attention.includes(effectId)) s.attention.push(effectId);
+  m.note("flow/undo-failed", "Something could not be undone automatically. Someone will check.", undefined, action);
 }
 
 export function onResolved(this: Machine, ev: EffectResolvedEvent): boolean {

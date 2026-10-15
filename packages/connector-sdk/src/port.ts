@@ -12,7 +12,7 @@
  * the operation contract the flow pinned, that the flow uses the operation as
  * declared (a write is never run as a read, a check is a read, and an undo is
  * the operation the undone write declares as its undo, which de-duplicates and
- * needs no review), that the review meets the
+ * needs no review, and an undo-only operation is never a step), that the review meets the
  * operation's risk floor, and that the input is valid. It then binds the
  * flow's connection role to a real connection through the host's
  * {@link ConnectionResolver} and checks that the connection's consent covers
@@ -446,6 +446,10 @@ export function createConnectorActionPort(options: ConnectorActionPortOptions): 
       }
       if (!op.idempotent) return final("connect/idempotency-mismatch", `${action} does not de-duplicate, so it cannot be an undo the engine may send again.`);
       if (op.riskFloor !== "none") return final("connect/approval-invalid", `${action} needs a review, which nobody can give to an undo.`);
+    }
+    if (call.purpose === "run" && op.undoOnly === true) {
+      // Bound to what one write made only when it is that write's undo: as a step it would act on whatever the flow names.
+      return final("connect/effect-mismatch", `${action} only undoes another operation; a flow cannot call it as a step.`);
     }
     if (call.purpose === "run" && op.effect === "write" && call.idempotent && !op.idempotent) {
       return final("connect/idempotency-mismatch", `${action} is not idempotent; the flow must not mark it idempotent.`);

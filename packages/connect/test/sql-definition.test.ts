@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { sqlDefinitionProblems } from "@aaply/connect";
+import { CONFORMANCE_AUDIENCE, conformanceVerifier, draftApprovedAction } from "@aaply/action-contract/conformance";
+import { createConnectorActionPort, memoryReplayGuard, operationContractOf } from "@aaply/connector-sdk";
+import { sqlDefinitionProblems, type SqlConnectorDefinition } from "@aaply/connect";
+import { sqlConnector } from "../src/sql/connector.js";
 import { scanStatement, statementProblem } from "../src/sql/statement.js";
 
 describe("declared statements", () => {
@@ -86,5 +89,70 @@ describe("SQL connector definitions", () => {
     expect(problems).toContain("class 23, 22 or P0");
     const many = Object.fromEntries(Array.from({ length: 101 }, (_, i) => [`op${i}`, ok.operations.find]));
     expect(sqlDefinitionProblems({ ...ok, operations: many }).join("\n")).toContain("at most 100 operations");
+  });
+});
+
+describe("an undo-only SQL operation", () => {
+  const definition = (undoOnly?: boolean): SqlConnectorDefinition => ({
+    id: "holds-db",
+    version: "1.0.0",
+    title: "Holds",
+    kind: "sql",
+    engine: "postgres",
+    operations: {
+      hold: {
+        title: "Hold",
+        effect: "write",
+        idempotent: true,
+        compensate: "release",
+        statement: "insert into h (ref) values ($1) on conflict (ref) do nothing returning id",
+        params: ["ref"],
+        rows: "one",
+        onConflictEmpty: { statement: "select id from h where ref = $1", params: ["ref"] },
+        input: { type: "object", required: ["ref"], properties: { ref: { type: "string" } } },
+        output: { type: "object", required: ["id"], properties: { id: { type: "integer" } } },
+      },
+      release: {
+        title: "Release",
+        effect: "write",
+        idempotent: true,
+        ...(undoOnly !== undefined ? { undoOnly } : {}),
+        statement: "delete from h where id = $1 returning id",
+        params: ["id"],
+        rows: "one",
+        input: { type: "object", required: ["id"], properties: { id: { type: "integer" } } },
+        output: { type: "object" },
+      },
+    },
+  });
+
+  it("is declared with undoOnly, carried into its contract, and refused as a step without running its statement", async () => {
+    expect(sqlDefinitionProblems(definition(true))).toEqual([]);
+    let ran = 0;
+    const executor = { run: async () => (ran++, { id: 1 }), close: async () => {} };
+    const connection = async () => ({ tenantId: "t", poolKey: "p", target: {} as never, password: "pw", deadline: Date.now() + 10_000, onCommit() {}, onRolledBack() {} });
+    const step = draftApprovedAction({ action: "holds-db.release", effect: "write", input: { id: 1 }, idempotent: true, now: Date.now(), role: null, subject: null });
+    const perform = (undoOnly?: boolean) => {
+      const connector = sqlConnector(definition(undoOnly), executor, connection);
+      const port = createConnectorActionPort({ audience: CONFORMANCE_AUDIENCE, verifier: conformanceVerifier(), replayGuard: memoryReplayGuard(), connectors: [connector], connections: () => ({ connectionId: "c", grantedScopes: [], subjectId: null }), credentials: { headers: () => ({}) } });
+      return { contract: operationContractOf(connector, "release"), outcome: port.run(step) };
+    };
+
+    const marked = perform(true);
+    expect(marked.contract?.undoOnly).toBe(true);
+    expect(await marked.outcome).toMatchObject({ status: "final", error: { code: "connect/effect-mismatch" } });
+    expect(ran).toBe(0);
+    // Unmarked, the same envelope runs the statement: the refusal above is the marker's.
+    const unmarked = perform(undefined);
+    expect(unmarked.contract).not.toHaveProperty("undoOnly");
+    expect(await unmarked.outcome).toMatchObject({ status: "ok" });
+    expect(ran).toBe(1);
+  });
+
+  it("refuses an undoOnly that is not a boolean, when it is built", () => {
+    const bad = definition();
+    (bad.operations.release as unknown as Record<string, unknown>).undoOnly = "yes";
+    const executor = { run: async () => ({}), close: async () => {} };
+    expect(() => sqlConnector(bad, executor, async () => ({}) as never)).toThrow(/undoOnly/);
   });
 });

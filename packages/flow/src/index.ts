@@ -53,6 +53,7 @@ export type { EnvelopeSigning } from "./approved.js";
 export type { NormaliseContext, Normalised } from "./assist/normalise.js";
 export { checkActionBindings, pinActionContracts, type ActionBindingOptions, type OperationContracts } from "./bindings.js";
 export { defineFlow, e } from "./builder.js";
+export { checkFlowCalls } from "./calls.js";
 export { createMemoryCatalog, type DirectPolicy, type MemoryCatalog, type MemoryCatalogOptions } from "./catalog.js";
 export {
   compileFlow,

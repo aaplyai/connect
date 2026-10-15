@@ -68,6 +68,17 @@ Names are camelCase, optionally dotted (`files.upload`).
 | `compensate: "<op>"` | Another write of this connector undoes it. The undo must be idempotent with risk floor `none`: the engine sends it unreviewed, and again after an unknown answer. The port runs an undo only for the write that declares it (the envelope's `undoes`), and refuses any other. |
 | `irreversible: true` | It cannot be undone (a sent message, a payment). Not combinable with `compensate`. |
 
+Mark an undo `undoOnly: true` when it is safe only as the undo of what its write made (a
+delete bound to one create's page or file): a flow may then name it only as that write's
+`compensate`. Publish refuses it as a step (`connector/flow-undo-only`), and the port refuses
+it sent as one (`connect/effect-mismatch`). Every field of that `compensate`'s input must read
+the write's output, never a literal or the write's input (`connector/flow-undo-unbound`). That
+binds the undo to what the write made only through output fields the service made, which no read
+exposes and the write does not echo from its input: keep echoed input (a parent id, a title)
+out of an undo-only operation's binding, and out of its write's output. It must be another operation's `compensate`
+(`connector/undo-only-undeclared`), idempotent with risk floor `none` (errors for it), and it
+is part of the operation contract.
+
 `riskFloor` (`none`, `confirm`, `approval`) is the least review a flow must put in front
 of a write; reads have none. A write must be allowed at least one POST, PUT, PATCH or
 DELETE rule: GET and HEAD are treated as reads.
@@ -320,6 +331,7 @@ Before running an operation the port refuses, as `final` unless noted:
   (`connect/effect-mismatch`), that does not de-duplicate (`connect/idempotency-mismatch`), or
   whose `riskFloor` is above `none` (`connect/approval-invalid`): an undo is never reviewed and
   may be sent more than once;
+- an `undoOnly` operation sent as a step (`run`, `connect/effect-mismatch`);
 - invalid input (`connect/invalid-input`);
 - no connection bound to the flow's connection role (`connect/no-connection`);
 - a connection of another environment kind than the envelope's `environment`
@@ -369,7 +381,9 @@ op)` one of them. Pass them to `pinActionContracts` and `checkActionBindings` in
 which check what the engine cannot see at run time: the flow's `risk` is at least each
 operation's `riskFloor`, effects and idempotency match, irreversible operations have no
 `compensate`, undo and reconcile calls name a write and a read, an undo is a declared one
-that de-duplicates and needs no review, and each call's pinned
+that de-duplicates and needs no review, an `undoOnly` operation is never a step and its undo reads
+only the write's output, an undo's or check's input names every field its operation requires and
+none it forbids, and each call's pinned
 digest is current (in production every call must be pinned).
 `checkActionBindings(flow, operationContracts([...]))` reports the
 `connector/flow-*` codes.
@@ -476,7 +490,7 @@ Definition (`validateConnector`, `validateManifest`): `connector/invalid-shape`,
 `invalid-schema`, `input-not-object`, `missing-handler`, `write-needs-undo`,
 `write-undo-conflict`, `compensate-unknown`, `compensate-self`, `compensate-not-write`,
 `compensate-not-idempotent` (warning), `compensate-reviewed` (warning: an undo with a risk
-floor above `none`, which no flow can use), `read-with-write-option`, `write-without-unsafe-egress`,
+floor above `none`, which no flow can use), `undo-only-undeclared`, `read-with-write-option`, `write-without-unsafe-egress`,
 `invalid-egress`, `egress-format`, `egress-method`, `egress-scheme`, `egress-not-https`,
 `egress-credentials`, `egress-port`, `egress-host`, `egress-wildcard`, `egress-ip-literal`,
 `egress-private-host`, `egress-path`, `egress-duplicate` (warning), `egress-not-declared`.
@@ -484,7 +498,7 @@ floor above `none`, which no flow can use), `read-with-write-option`, `write-wit
 Flow bindings (`checkActionBindings` in `@aaply/flow`): `connector/flow-unknown-operation`,
 `flow-effect-mismatch`, `flow-idempotency-mismatch`, `flow-risk-below-floor`, `flow-undo-mismatch`,
 `flow-undo-undeclared`, `flow-undo-unpaired`, `flow-undo-not-idempotent`, `flow-undo-reviewed`,
-and `flow/contract-mismatch`, `flow/contract-unpinned`, `flow/contract-invalid`.
+`flow-undo-only`, `flow-undo-unbound`, `flow-input-mismatch`, and `flow/contract-mismatch`, `flow/contract-unpinned`, `flow/contract-invalid`.
 
 Run time (`error.code` of outcomes): `connect/invalid-envelope`, `contract-unsupported`,
 `expired`, `approval-invalid`, `contract-mismatch`, `no-completion`,

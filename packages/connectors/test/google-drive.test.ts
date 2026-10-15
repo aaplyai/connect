@@ -95,11 +95,12 @@ describe("google-drive files.upload", () => {
     const content = bytesOf(9 * 1024 * 1024 + 7);
     const file = await stored(blobs, content);
     const out = (await t.run("files.upload", { file, parentId: "folder_1" }, { idempotencyKey: "effect-1" })) as Record<string, unknown>;
-    expect(out).toMatchObject({ name: "report.pdf", mimeType: "application/pdf", size: content.length, parents: ["folder_1"] });
-    expect(out).not.toHaveProperty("extra");
+    // Only what Drive and the connector made: none of the input (name, folder, type) is echoed, so an undo reading the output cannot be aimed by it.
+    expect(Object.keys(out).sort()).toEqual(["id", "mark"]);
     const saved = drive.files.get(out.id as string)!;
+    expect(saved).toMatchObject({ name: "report.pdf", mimeType: "application/pdf", parents: ["folder_1"] });
     expect(Buffer.compare(saved.bytes, content)).toBe(0);
-    expect(saved.appProperties?.aaplyKey).toMatch(/^[0-9a-f]{40}$/);
+    expect(saved.appProperties?.aaplyKey).toBe(out.mark);
     expect(drive.log.filter((l) => l === `PUT ${UPLOAD}?session`).length).toBe(3);
 
     // The same action again (a retry after a lost answer) finds its file and uploads nothing.
@@ -151,8 +152,8 @@ describe("google-drive files.upload", () => {
     const drive = fakeDrive();
     const blobs = memoryBlobStore();
     const t = testConnector(googleDrive, { fetch: drive.fetch, blobs });
-    const out = (await t.run("files.upload", { file: await stored(blobs, new Uint8Array(0), "text/plain", "empty.txt") })) as { id: string; size: number };
-    expect(out.size).toBe(0);
+    const out = (await t.run("files.upload", { file: await stored(blobs, new Uint8Array(0), "text/plain", "empty.txt") })) as { id: string };
+    expect(drive.files.get(out.id)!.bytes.length).toBe(0);
   });
 
   it("refuses a file reference made for another workspace before calling Drive", async () => {
@@ -231,8 +232,9 @@ describe("google-drive trash and undo", () => {
   });
 
   it("declares what the engine needs to ask and undo", () => {
-    const ops = googleDrive.operations as Record<string, { effect: string; idempotent?: boolean; riskFloor?: string; compensate?: string }>;
+    const ops = googleDrive.operations as Record<string, { effect: string; idempotent?: boolean; riskFloor?: string; compensate?: string; undoOnly?: true }>;
     expect(ops["files.upload"]).toMatchObject({ effect: "write", idempotent: true, compensate: "files.removeCreated" });
+    expect(ops["files.removeCreated"]).toMatchObject({ effect: "write", idempotent: true, undoOnly: true });
     expect(ops["files.trash"]).toMatchObject({ riskFloor: "confirm" });
     expect(googleDrive.auth).toEqual({ kind: "oauth2", scopes: ["https://www.googleapis.com/auth/drive.file"] });
   });

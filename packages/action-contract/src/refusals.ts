@@ -35,7 +35,7 @@ export const CONNECT_REFUSALS = deepFreeze({
   "connect/unknown-action": "final",
   /** The flow pinned an operation contract this performer does not serve. */
   "connect/contract-mismatch": "final",
-  /** A write sent as a read, or an undo or reconcile of the wrong kind. */
+  /** A write sent as a read, an undo or reconcile of the wrong kind, or an undo-only operation sent as a step (`run`). */
   "connect/effect-mismatch": "final",
   /** A write marked idempotent that does not de-duplicate. */
   "connect/idempotency-mismatch": "final",

@@ -3,8 +3,10 @@
  *
  * Every outbox item belongs to a lane: (scope, lane name), where the lane
  * name defaults to the effect's connection role, else its connector id. A
- * lane can have a durable cap on effects in flight, a token bucket that
- * honours Retry-After, and a breaker. Claims go round-robin across lanes, so
+ * lane has a durable cap on effects in flight ({@link LANE_DEFAULTS}' cap
+ * unless a limits row sets one, or opts out with {@link NO_CAP}), can have a
+ * token bucket that honours Retry-After, and has a breaker. Claims go
+ * round-robin across lanes, so
  * one tenant's burst cannot starve the others, and interactive work keeps a
  * reserve that background work cannot take.
  *
@@ -70,7 +72,7 @@ export interface LaneLimit {
   appId?: string | null;
   environmentId?: string | null;
   lane?: string | null;
-  /** Most effects in flight at once. Null: unlimited. */
+  /** Most effects in flight at once. Null: the next row's, else {@link LANE_DEFAULTS}' cap. {@link NO_CAP}: no cap. */
   cap?: number | null;
   /** Share of the cap (and of the token bucket) kept for interactive work, in [0, 1). */
   reserve?: number | null;
@@ -116,9 +118,24 @@ export interface LaneLimits {
   maxPauseMs: number;
 }
 
-/** The defaults, seeded into the Postgres platform row (a test holds the two together). */
+/**
+ * The defaults, seeded into the Postgres platform row (a test holds the two together).
+ *
+ * The cap applies to every lane no row gives one. Claims are fair in order,
+ * not in occupancy: a call that hangs keeps its worker slot until it is cut
+ * off, so without a cap one lane's hung connector collects every slot and
+ * every other lane waits for the cut-off. The cap counts a lane's calls in
+ * flight from leases across the whole fleet, not per worker: with 8, one
+ * lane holds at most 8 slots of all the workers' slots together, and the
+ * rest serve other lanes once the fleet has more than 8. It is per lane
+ * (tenant, app, environment and lane name), so a tenant with several apps,
+ * environments or connectors has 8 for each. It is also a lane's ceiling:
+ * at 300 ms a call, 8 in flight is about 26 calls a second. A tenant that
+ * needs more is given a cap of its own (a limits row); a larger cap on the
+ * platform row raises it for all, and {@link NO_CAP} removes it.
+ */
 export const LANE_DEFAULTS: Readonly<LaneLimits> = Object.freeze({
-  cap: null,
+  cap: 8,
   reserve: 0.25,
   ratePerSec: null,
   burst: null,
@@ -129,6 +146,15 @@ export const LANE_DEFAULTS: Readonly<LaneLimits> = Object.freeze({
   maxOpenMs: 300_000,
   maxPauseMs: 600_000,
 });
+
+/**
+ * The cap of a limits row that opts its lanes out of any cap. A row's null
+ * cap falls back to a less specific row's and then to {@link LANE_DEFAULTS}'
+ * cap; `NO_CAP` resolves to no cap at all (a lane uncounted while healthy),
+ * on the platform row for every lane no more specific row caps. The
+ * platform's `capMax` still clamps it.
+ */
+export const NO_CAP = -1;
 
 /**
  * The slowest token rate a limit may set: one grant a day. Lower rates mean
@@ -293,7 +319,7 @@ export function laneLimitProblems(row: LaneLimit): string[] {
     if (set(v) && (typeof v !== "number" || !Number.isFinite(v) || !ok(v))) problems.push(`${key} must be ${what}`);
   };
   const int = (n: number) => Number.isSafeInteger(n);
-  num("cap", (n) => int(n) && n >= 0, "a whole number >= 0");
+  num("cap", (n) => int(n) && (n >= 0 || n === NO_CAP), `a whole number >= 0, or NO_CAP (${NO_CAP}) for no cap`);
   num("reserve", (n) => n >= 0 && n < 1, "in [0, 1)");
   num("ratePerSec", rateOk, RATE_RANGE);
   num("burst", burstOk, BURST_RANGE);
@@ -329,6 +355,7 @@ export function laneLimitKey(row: LaneLimit): string {
  * Resolves a lane's limits from the rows: per field, the most specific
  * non-null value (lane, then environment, then tenant, then platform, then
  * {@link LANE_DEFAULTS}), clamped by the platform's `capMax` and `rateMax`.
+ * A cap of {@link NO_CAP} resolves to null: no cap.
  * Lane {@link NO_LANE} has no limits at all.
  */
 export function resolveLaneLimits(rows: readonly LaneLimit[], scope: Scope, lane: string): LaneLimits | null {
@@ -353,6 +380,7 @@ export function resolveLaneLimits(rows: readonly LaneLimit[], scope: Scope, lane
   const capMax = matching.find((m) => m.s === 0)?.row.capMax ?? null;
   const rateMax = matching.find((m) => m.s === 0)?.row.rateMax ?? null;
   let cap = pick("cap") ?? LANE_DEFAULTS.cap;
+  if (cap === NO_CAP) cap = null;
   if (capMax !== null) cap = cap === null ? capMax : Math.min(cap, capMax);
   let ratePerSec = pick("ratePerSec") ?? LANE_DEFAULTS.ratePerSec;
   if (rateMax !== null) ratePerSec = ratePerSec === null ? rateMax : Math.min(ratePerSec, rateMax);

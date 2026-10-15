@@ -37,6 +37,14 @@ export interface SqlOperation extends SqlStatement {
   effect: "read" | "write";
   idempotent?: boolean;
   compensate?: string;
+  /**
+   * Only an undo: a write that is another operation's `compensate` and must
+   * not be called as a step (the kit's port refuses it so, and publish
+   * refuses a flow that does). Its undo's input then reads only that write's
+   * output, so the write must answer nothing the flow chose that could name
+   * another row.
+   */
+  undoOnly?: boolean;
   irreversible?: boolean;
   riskFloor?: Risk;
   rows: SqlRows;
@@ -70,7 +78,7 @@ const MAX_SQL_DEFINITION_CHARS = 256 * 1024;
 const ID = /^[a-z][a-z0-9-]{0,62}$/;
 const OP = /^[A-Za-z][A-Za-z0-9_]{0,62}$/;
 const CODE = /^[a-z][a-z0-9-]{0,30}\/[a-z0-9][a-z0-9-]{0,62}$/;
-const OP_KEYS = new Set(["title", "description", "effect", "idempotent", "compensate", "irreversible", "riskFloor", "statement", "params", "rows", "maxRows", "onConflictEmpty", "errors", "input", "output"]);
+const OP_KEYS = new Set(["title", "description", "effect", "idempotent", "compensate", "undoOnly", "irreversible", "riskFloor", "statement", "params", "rows", "maxRows", "onConflictEmpty", "errors", "input", "output"]);
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 

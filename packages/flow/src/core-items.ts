@@ -16,11 +16,11 @@
 import { fieldAddress, keyOf, templateOf } from "./address.js";
 import { type CompiledCollection, type CompiledFact, type CompiledFlow, type CompiledStep } from "./compile.js";
 import { type Node } from "./expr.js";
-import { truthy, type Evaluated, type Read } from "./expr-eval.js";
+import { type Evaluated, type Read } from "./expr-eval.js";
 import { fieldLocked, fieldState, itemLocked, liveItem, liveItems, listShown, parseItemOps } from "./items.js";
 import { cloneJson, formatPath, jsonByteLength, jsonEqual, own, type JsonValue } from "./json.js";
-import { readable } from "./reader.js";
-import { validateValue } from "./schema.js";
+import { checkIssue, readable } from "./reader.js";
+import { validateValue, type PatternBudget } from "./schema.js";
 import type { ActorRef, AssistMark, FactState, FlowEvent, ItemOp, Provenance, RunState } from "./state.js";
 import { fillModeOf, personOwned } from "./fill.js";
 
@@ -39,6 +39,8 @@ export interface ItemMachine {
   readonly rows: Set<string>;
   /** Item fields an output's own rule wrote exactly as the view gave them. */
   readonly ownRows: Set<string>;
+  /** Pattern work every value this event validates draws on. */
+  readonly patternBudget: PatternBudget;
   lockedFacts(): Set<string>;
   eval(node: Node, extra?: { payload?: JsonValue; value?: JsonValue }, item?: string): Evaluated;
   note(code: string, message: string, facts?: string[], action?: string): void;
@@ -239,7 +241,7 @@ export function setFields(m: ItemMachine, collection: CompiledCollection, id: st
       refuseOr(m, mode, "flow/limit", `"${collection.def.title ?? collection.name}" is too large.`, [address]);
       continue;
     }
-    const issues = validateValue(field.schema, value).map((i) => ({ code: i.code, message: i.message, path: formatPath(i.path) }));
+    const issues = validateValue(field.schema, value, [], m.patternBudget).map((i) => ({ code: i.code, message: i.message, path: formatPath(i.path) }));
     if (assisted !== undefined && issues.length > 0) {
       // An assistant's value that does not fit is not written; the person is told why.
       m.note("flow/assist-invalid", `"${label}" was not filled: ${issues[0]!.message}`, [address]);
@@ -284,8 +286,8 @@ export function checkFields(m: ItemMachine, collection: CompiledCollection, id: 
     if (!current || (current.status !== "valid" && current.status !== "needs_confirmation") || field.checks.length === 0) continue;
     const issues = [];
     for (const check of field.checks) {
-      const r = m.eval(check.test, { value: current.value ?? null }, id);
-      if (r.known && !truthy(r.value)) issues.push({ code: check.code, message: check.message, path: "" });
+      const issue = checkIssue(m.eval(check.test, { value: current.value ?? null }, id), check);
+      if (issue) issues.push(issue);
     }
     if (issues.length === 0) continue;
     const address = fieldAddress(collection.name, id, name);

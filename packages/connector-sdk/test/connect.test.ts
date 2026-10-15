@@ -174,9 +174,9 @@ describe("undos and checks", () => {
     const cases = actionPortConformance(port, {
       read: { action: "pay.status", input: {}, role: null },
       undos: [
-        { action: "pay.release", input: {}, role: null, undoes: "pay.reserve" },
-        { action: "pay.refund", input: {}, role: null, undoes: "pay.charge", risk: "approval" },
-        { action: "pay.unhold", input: {}, role: null, undoes: "pay.hold", idempotent: false },
+        { action: "pay.release", input: {}, role: null, undoes: "pay.reserve", undoOnly: false },
+        { action: "pay.refund", input: {}, role: null, undoes: "pay.charge", risk: "approval", undoOnly: false },
+        { action: "pay.unhold", input: {}, role: null, undoes: "pay.hold", idempotent: false, undoOnly: false },
       ],
       performed: () => fetch.calls.length,
       now: clock.now,
@@ -194,6 +194,82 @@ describe("undos and checks", () => {
     expect(await port.run(undo("release", { target: null }))).toMatchObject({ status: "final", error: { code: "connect/invalid-envelope" } });
     expect(await port.run(envelope("pay.status", "read", {}, { role: null, purpose: "reconcile" }))).toMatchObject({ status: "ok" });
     expect(fetch.callsTo(`POST ${PAY}/*`)).toHaveLength(0);
+  });
+});
+
+describe("an undo-only operation", () => {
+  // A page store whose removeCreated trashes the page one create made: bound to that page only when it is create's undo.
+  const PAGES = "https://api.pages.test/v1";
+  const pages = (undoOnly: boolean) =>
+    defineConnector({
+      id: "pages",
+      version: "1.0.0",
+      title: "Pages",
+      auth: { kind: "none" },
+      egress: [`POST api.pages.test/v1/*`, `GET api.pages.test/v1/*`],
+      operations: {
+        create: { title: "Create", effect: "write", compensate: "removeCreated", input: { type: "object" }, output: { type: "object" }, handler: async (_i, ctx) => (await ctx.http({ method: "POST", url: `${PAGES}/pages` })).ensureOk().json() },
+        removeCreated: {
+          title: "Remove a created page",
+          effect: "write",
+          idempotent: true,
+          undoOnly,
+          input: { type: "object", required: ["pageId", "createdTime"], properties: { pageId: { type: "string" }, createdTime: { type: "string" } } },
+          output: { type: "object" },
+          handler: async (_i, ctx) => (await ctx.http({ method: "POST", url: `${PAGES}/trash` })).ensureOk().json(),
+        },
+        get: { title: "Get", effect: "read", input: { type: "object" }, output: { type: "object" }, handler: async (_i, ctx) => (await ctx.http({ url: `${PAGES}/pages` })).ensureOk().json() },
+      },
+    });
+  const pagesPort = (undoOnly = true) => {
+    const fetch = mockFetch({ [`POST ${PAGES}/*`]: { json: { ok: true } }, [`GET ${PAGES}/*`]: { json: { id: "p-1" } } });
+    const port = createConnectorActionPort({ ...TRUST, replayGuard: memoryReplayGuard(clock), connectors: [pages(undoOnly)], connections: () => ({ connectionId: "c", grantedScopes: [], subjectId: null }), credentials: { headers: () => ({}) }, fetch, clock });
+    return { fetch, port };
+  };
+  const input = { pageId: "p-1", createdTime: "2026-10-07T00:00:00.000Z" };
+
+  it("is refused as a step, sending nothing, and performed as the undo of its write", async () => {
+    const { fetch, port } = pagesPort();
+    expect(await port.run(envelope("pages.removeCreated", "write", input, { role: null }))).toMatchObject({ status: "final", error: { code: "connect/effect-mismatch" } });
+    expect(fetch.calls).toHaveLength(0);
+    expect(await port.run(envelope("pages.removeCreated", "write", input, { role: null, purpose: "compensate", risk: "none", approval: null, undoes: "pages.create" }))).toMatchObject({ status: "ok" });
+    expect(fetch.callsTo(`POST ${PAGES}/trash`)).toHaveLength(1);
+    // Without the marker the same operation is also a step, as before.
+    const open = pagesPort(false);
+    expect(await open.port.run(envelope("pages.removeCreated", "write", input, { role: null }))).toMatchObject({ status: "ok" });
+  });
+
+  it("carries the marker in its manifest and operation contract, and so in its pin", () => {
+    expect(manifestOf(pages(true)).operations.removeCreated!.undoOnly).toBe(true);
+    expect("undoOnly" in manifestOf(pages(false)).operations.removeCreated!).toBe(false);
+    expect(operationContractOf(pages(true), "removeCreated")!.undoOnly).toBe(true);
+    expect("undoOnly" in operationContractOf(pages(false), "removeCreated")!).toBe(false);
+    expect(operationDigest(operationContractOf(pages(true), "removeCreated")!)).not.toBe(operationDigest(operationContractOf(pages(false), "removeCreated")!));
+  });
+
+  it("must be some operation's undo, and a write", () => {
+    const codes = (ops: Record<string, unknown>) => validateConnector({ id: "x", version: "1.0.0", title: "X", auth: { kind: "none" }, egress: ["POST api.x.test/*"], operations: ops }).map((d) => `${d.severity}:${d.code}@${d.path}`);
+    const h = async () => ({});
+    const obj = { type: "object" };
+    expect(codes({ trash: { title: "T", effect: "write", idempotent: true, undoOnly: true, input: obj, output: obj, handler: h } })).toEqual(["error:connector/undo-only-undeclared@operations.trash.undoOnly"]);
+    expect(codes({ peek: { title: "P", effect: "read", undoOnly: true, input: obj, output: obj, handler: h } })).toEqual(["error:connector/read-with-write-option@operations.peek.undoOnly"]);
+    expect(codes({ trash: { title: "T", effect: "write", idempotent: true, undoOnly: "yes", input: obj, output: obj, handler: h } })).toEqual(["error:connector/invalid-field@operations.trash.undoOnly"]);
+    // An undo-only operation that cannot be an undo either is usable nowhere.
+    const make = { title: "M", effect: "write", compensate: "trash", input: obj, output: obj, handler: h };
+    expect(codes({ make, trash: { title: "T", effect: "write", irreversible: true, undoOnly: true, input: obj, output: obj, handler: h } })).toEqual(["error:connector/compensate-not-idempotent@operations.make.compensate"]);
+    expect(codes({ make, trash: { title: "T", effect: "write", idempotent: true, riskFloor: "confirm", undoOnly: true, input: obj, output: obj, handler: h } })).toEqual(["error:connector/compensate-reviewed@operations.make.compensate"]);
+  });
+
+  it("passes the conformance suite's undo-only case", async () => {
+    const { fetch, port } = pagesPort();
+    const cases = actionPortConformance(port, {
+      read: { action: "pages.get", input: {}, role: null },
+      undos: [{ action: "pages.removeCreated", input, role: null, undoes: "pages.create", undoOnly: true }],
+      performed: () => fetch.calls.length,
+      now: clock.now,
+    });
+    expect(cases.map((c) => c.name)).toContain("refuses an undo-only operation sent as a step");
+    for (const c of cases) await c.run();
   });
 });
 

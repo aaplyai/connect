@@ -145,6 +145,10 @@ export function canonicalJson(value: JsonValue): string {
 export function jsonEqual(a: JsonValue | undefined, b: JsonValue | undefined): boolean {
   if (a === undefined || b === undefined) return a === b;
   if (a === b) return true;
+  // Two different strings, or a string and anything else, never write out the same; nor do
+  // a list or object and a value that is neither. Neither is written out to find that.
+  if (typeof a === "string" || typeof b === "string") return false;
+  if ((typeof a === "object" && a !== null) !== (typeof b === "object" && b !== null)) return false;
   return canonicalJson(a) === canonicalJson(b);
 }
 

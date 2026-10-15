@@ -419,7 +419,7 @@ function evalInput(reader: RunReader, entries: ReadonlyArray<readonly [string, P
   const out: JsonObject = {};
   const env = reader.env({}, item);
   for (const [key, node] of entries) {
-    const r = evaluate(node, env);
+    const r = evaluate(node, env, reader.evalBudget);
     Object.defineProperty(out, key, { value: r.known ? r.value : null, enumerable: true, writable: true, configurable: true });
   }
   return out;

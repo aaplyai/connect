@@ -35,7 +35,7 @@ import {
   type Scope,
 } from "@aaply/action-contract";
 import { keyOf } from "./address.js";
-import type { OperationContracts } from "./bindings.js";
+import { unboundUndoFields, type OperationContracts } from "./bindings.js";
 import type { CompiledFlow } from "./compile.js";
 import { own } from "./json.js";
 import type { KeyMinter } from "./ports.js";
@@ -165,10 +165,23 @@ export function dispatchFor(state: RunState, actor: ActorRef, effect: ActionEffe
  * the outcome to record instead of sending, or null to send:
  * - the input must match the action's `inputSchema` (`flow/action-input-invalid`, `final`);
  * - a review with a time to live must not have expired (`flow/approval-expired`: `final`,
- *   or `unknown` when an earlier attempt of the write may have been applied).
+ *   or `unknown` when an earlier attempt of the write may have been applied);
+ * - an undo with an operation that `operations` marks undo-only must take every field from
+ *   the output of the write it undoes (`flow/undo-unbound`, `final`: its effect is put in
+ *   doubt). Publish refuses such a flow (`connector/flow-undo-unbound`); this holds for one
+ *   published without the check.
  */
-export function refuseBeforeSending(flow: CompiledFlow, effect: ActionEffect, dispatch: ActionDispatch, now: number): ActionOutcome | null {
+export function refuseBeforeSending(flow: CompiledFlow, effect: ActionEffect, dispatch: ActionDispatch, now: number, operations?: OperationContracts): ActionOutcome | null {
   const action = flow.actions.get(effect.name);
+  if (effect.purpose === "compensate" && contractOf(operations, effect.action)?.undoOnly === true) {
+    const unbound = action?.compensate ? unboundUndoFields(action.compensate.input) : ["*"];
+    if (unbound.length > 0) {
+      return {
+        status: "final",
+        error: { code: "flow/undo-unbound", message: "This could not be undone automatically.", detail: `${effect.action} undoes only what its write made; ${unbound.join(", ")} must read the write's output` },
+      };
+    }
+  }
   const schema = effect.purpose === "run" ? action?.def.inputSchema : undefined;
   if (schema) {
     const issues = validateValue(schema, effect.input);

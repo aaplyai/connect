@@ -15,6 +15,14 @@
  *   person's confirmation.
  * - `files.removeCreated` trashes only the file one upload made: the flow
  *   passes the upload's `id` and `mark`, and the file must carry that mark.
+ *   It is undo-only: a flow names it only as the compensate of
+ *   `files.upload`, reading both from the upload's output, and the port
+ *   refuses it as a step.
+ * - The upload's output holds only what Drive and the connector made (`id`,
+ *   `mark`, `webViewLink`, `createdTime`, `modifiedTime`), never the name,
+ *   folder or type the flow sent: the undo reads only that output, so an
+ *   echo of the flow's own input there (another file's id as the folder, its
+ *   mark as the name) could aim it at a file the flow chose.
  *
  * Downloads larger than 16 MiB need the deployment to raise the kit's
  * `maxTotalResponseBytes` (`ConnectOptions.httpLimits`); a file is at most
@@ -23,7 +31,21 @@
 
 import { BLOB_REF_SCHEMA, type JsonObject, type JsonSchema } from "@aaply/action-contract";
 import { defineConnector } from "@aaply/connector-sdk";
-import { DRIVE_ID, EXPORT_TYPES, download, fileSchema, getFile, listFiles, removeCreated, trash, upload, type DownloadInput, type ListInput, type UploadInput } from "./drive/files.js";
+import { DRIVE_ID, EXPORT_TYPES, download, fileSchema, getFile, listFiles, removeCreated, trash, upload, type DownloadInput, type DriveFile, type ListInput, type UploadInput } from "./drive/files.js";
+
+/** What an upload answers: none of its input echoed back. */
+const uploadedSchema: JsonSchema = {
+  type: "object",
+  required: ["id", "mark"],
+  properties: { id: { type: "string" }, mark: { type: "string" }, webViewLink: { type: "string" }, createdTime: { type: "string" }, modifiedTime: { type: "string" } },
+  additionalProperties: false,
+};
+
+function uploaded(file: DriveFile & { mark: string }): JsonObject {
+  const out: JsonObject = { id: file.id, mark: file.mark };
+  for (const key of ["webViewLink", "createdTime", "modifiedTime"] as const) if (file[key] !== undefined) out[key] = file[key];
+  return out;
+}
 
 export const DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 
@@ -33,7 +55,8 @@ const plainText = (max: number): JsonSchema => ({ type: "string", minLength: 1, 
 
 export const googleDrive = defineConnector({
   id: "google-drive",
-  version: "1.0.0",
+  // 2.0.0: files.removeCreated is undo-only and files.upload answers only what Drive made.
+  version: "2.0.0",
   title: "Google Drive",
   description: "Uploads, finds, downloads and trashes files in the connected Google Drive.",
   auth: { kind: "oauth2", scopes: [DRIVE_FILE_SCOPE] },
@@ -51,9 +74,9 @@ export const googleDrive = defineConnector({
         properties: { file: BLOB_REF_SCHEMA, name: plainText(255), parentId: fileId, description: { type: "string", maxLength: 2000 } },
         additionalProperties: false,
       },
-      output: { ...fileSchema, required: [...(fileSchema.required ?? []), "mark"], properties: { ...fileSchema.properties, mark: { type: "string" } } },
+      output: uploadedSchema,
       // A file reference is plain JSON; its interface type has no index signature.
-      handler: (input, ctx) => upload(ctx, input as unknown as UploadInput),
+      handler: async (input, ctx) => uploaded(await upload(ctx, input as unknown as UploadInput)),
     },
     "files.get": {
       title: "Get a file's details",
@@ -108,6 +131,7 @@ export const googleDrive = defineConnector({
       description: "The undo of an upload: moves the file to the trash, only the file that upload made (its id and mark).",
       effect: "write",
       idempotent: true,
+      undoOnly: true,
       input: { type: "object", required: ["fileId", "mark"], properties: { fileId, mark: { type: "string", pattern: "^[0-9a-f]{40}$" } }, additionalProperties: false },
       output: { type: "object", required: ["fileId", "trashed"], properties: { fileId: { type: "string" }, trashed: { const: true } }, additionalProperties: false },
       handler: (input: { fileId: string; mark: string }, ctx) => removeCreated(ctx, input.fileId, input.mark),

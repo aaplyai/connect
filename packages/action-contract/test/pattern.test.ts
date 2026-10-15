@@ -168,6 +168,8 @@ describe("the linear-time pattern matcher", () => {
     expect(patternMatches(compiled(".{1,999}!"), "a".repeat(MAX_PATTERN_SUBJECT), budget)).toBe(false);
     // Without the cache the remaining 9,000 characters would cost 999 threads each.
     expect(1e9 - budget.left).toBeLessThan(3_000_000);
+    // Sorting and keying the 999 sets is charged too: the threads followed alone come to about 794,000.
+    expect(1e9 - budget.left).toBeGreaterThan(850_000);
   });
 
   it("bounds the work of one validation, and says when a value is too costly to check", () => {
@@ -181,5 +183,36 @@ describe("the linear-time pattern matcher", () => {
     expect(validateValue(form, values)).toEqual([]);
     expect(MAX_PATTERN_WORK).toBeGreaterThan(0);
   });
+
+  it("draws on a budget the caller shares between calls, so many values cost one budget", () => {
+    const schema = { type: "string" as const, pattern: ".{1,999}!" };
+    const value = "a".repeat(MAX_PATTERN_SUBJECT);
+    // Alone, each call has a budget of its own and one value fits in it.
+    expect(validateValue(schema, value)).toEqual([{ path: [], code: "pattern", message: "value has the wrong shape" }]);
+    const budget = { left: MAX_PATTERN_WORK };
+    const issues = Array.from({ length: 6 }, () => validateValue(schema, value, [], budget));
+    expect(budget.left).toBeLessThan(0);
+    expect(issues.at(-1)).toEqual([{ path: [], code: "pattern", message: "value is too costly to check against this pattern" }]);
+    // A spent budget answers at once, and a value that needs no pattern work is unaffected.
+    expect(validateValue({ type: "string", maxLength: 3 }, "abc", [], budget)).toEqual([]);
+  });
 });
 
+
+describe("enum and const", () => {
+  it("write a list or object value out once, however many options there are", () => {
+    let reads = 0;
+    const target = { k: "x".repeat(1000) };
+    // Counts each time the value's keys are listed, which writing it out does.
+    const value = new Proxy(target, { ownKeys: (t) => (reads++, Reflect.ownKeys(t)) });
+    const options = Array.from({ length: 200 }, (_, i) => ({ k: `option ${i}` }));
+    expect(validateValue({ enum: options }, value).map((i) => i.code)).toEqual(["enum"]);
+    // Once to write it out; the rest is the walk over its properties.
+    expect(reads).toBeLessThanOrEqual(2);
+    expect(validateValue({ enum: [...options, { k: "x".repeat(1000) }] }, target)).toEqual([]);
+    expect(validateValue({ const: { k: "y" } }, { k: "y" })).toEqual([]);
+    expect(validateValue({ enum: ["a", 1, null, { a: [1] }] }, { a: [1] })).toEqual([]);
+    expect(validateValue({ enum: ["a", 1, null] }, "1").map((i) => i.code)).toEqual(["enum"]);
+    expect(validateValue({ enum: [{}, 0] }, -0)).toEqual([]);
+  });
+});

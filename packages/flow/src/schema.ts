@@ -4,5 +4,5 @@
  * so the engine's own imports stay where they were.
  */
 
-export { MAX_PATTERN_LENGTH, MAX_PATTERN_SUBJECT, assignabilityProblems, checkFormat, checkPattern, checkSchema, dateMs, dateTimeMs, describeType, isAssignable, timestampMs, validateValue, type JsonSchema, type JsonType, type SchemaIssue, type StringFormat } from "@aaply/action-contract";
-export { MAX_PATTERN_STATES } from "@aaply/action-contract/internal";
+export { MAX_PATTERN_LENGTH, MAX_PATTERN_SUBJECT, MAX_PATTERN_WORK, assignabilityProblems, checkFormat, checkPattern, checkSchema, dateMs, dateTimeMs, describeType, isAssignable, timestampMs, validateValue, type JsonSchema, type JsonType, type SchemaIssue, type StringFormat } from "@aaply/action-contract";
+export { MAX_PATTERN_STATES, type PatternBudget } from "@aaply/action-contract/internal";

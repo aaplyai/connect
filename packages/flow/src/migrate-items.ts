@@ -29,7 +29,7 @@ import { canonicalJson, cloneJson, formatPath, jsonByteLength, jsonEqual, own, t
 import type { CompiledMigration } from "./migration-def.js";
 import type { FactOutcome } from "./migrate.js";
 import { readable } from "./reader.js";
-import { validateValue } from "./schema.js";
+import { validateValue, type PatternBudget } from "./schema.js";
 import type { FactState, ItemState, Provenance, RunState } from "./state.js";
 
 /** The issue a value too large to keep carries. */
@@ -131,6 +131,7 @@ function carryField(
   rev: number,
   check: (address: string) => void,
   address: string,
+  budget: PatternBudget,
 ): { next: FactState | undefined; outcome: FactOutcome; reason?: string } {
   if (field.derive) {
     // Worked out again under the new definition, from the old value, so only a real change clears what depends on it.
@@ -143,7 +144,7 @@ function carryField(
   if (oldDef.derive) return { next: missing(), outcome: "dropped", reason: "derived" };
   if (old.status === "missing") return { next: { status: "missing", rev: old.rev }, outcome: "kept" };
   if (oldDef.sensitivity === "secret" && field.sensitivity !== "secret") return { next: missing(), outcome: "dropped", reason: "sensitivity" };
-  const fits = (value: JsonValue): boolean => jsonByteLength(value) <= to.limits.maxFactBytes && validateValue(field.schema, value).length === 0;
+  const fits = (value: JsonValue): boolean => jsonByteLength(value) <= to.limits.maxFactBytes && validateValue(field.schema, value, [], budget).length === 0;
   if (old.status === "declined") return field.def.optional ? { next: { ...old }, outcome: "kept" } : { next: missing(), outcome: "dropped", reason: "required" };
   if (old.status === "stale") {
     const keep = old.value !== undefined && fits(old.value);
@@ -162,7 +163,7 @@ function carryField(
     outcome = "invalid";
     reason = "too-large";
   } else {
-    const issues = validateValue(field.schema, value).map((i) => ({ code: i.code, message: i.message, path: formatPath(i.path) }));
+    const issues = validateValue(field.schema, value, [], budget).map((i) => ({ code: i.code, message: i.message, path: formatPath(i.path) }));
     const status = issues.length > 0 ? "invalid" : old.provenance === "model" && field.def.confirm ? "needs_confirmation" : "valid";
     next = { status, value: cloneJson(value), rev, ...(issues.length > 0 ? { issues } : {}) };
     if (issues.length > 0) {
@@ -181,7 +182,7 @@ function carryField(
  * Carries the collections of `state` from `from` to `to` (see the module
  * comment). Lists of the target that the source does not have start empty.
  */
-export function carryItems(from: CompiledFlow, to: CompiledFlow, migration: CompiledMigration | undefined, state: RunState, rev: number): CarriedItems {
+export function carryItems(from: CompiledFlow, to: CompiledFlow, migration: CompiledMigration | undefined, state: RunState, rev: number, budget: PatternBudget): CarriedItems {
   const out: CarriedItems = { lists: {}, items: {}, outcomes: new Map(), plan: { kept: [], dropped: [], fields: [] }, changed: [], check: [] };
   const put = <T>(record: Record<string, T>, key: string, value: T) => Object.defineProperty(record, key, { value, enumerable: true, writable: true, configurable: true });
   for (const [c, collection] of to.collections) {
@@ -214,7 +215,7 @@ export function carryItems(from: CompiledFlow, to: CompiledFlow, migration: Comp
       for (const [name, field] of collection.fields) {
         const address = fieldAddress(c, id, name);
         const prev = own(item.fields, name);
-        const r = carryField(to, c, field, source.fields.get(name), prev, rev, (a) => out.check.push(a), address);
+        const r = carryField(to, c, field, source.fields.get(name), prev, rev, (a) => out.check.push(a), address, budget);
         if (r.next !== undefined) put(fields, name, r.next);
         if (r.outcome !== "kept" && r.outcome !== "new" && r.outcome !== "derived") out.plan.fields.push({ field: address, outcome: r.outcome, ...(r.reason !== undefined ? { reason: r.reason } : {}) });
         if (!field.derive && shownChanged(prev, r.next)) out.changed.push(address);

@@ -2,6 +2,6 @@
   "$comment": "Read-only copy. @aaply/action-contract is owned by aaplyai/flow: change it there, then run `node scripts/vendor.mjs sync packages/action-contract <flow checkout>`. CI refuses any local edit.",
   "repository": "aaplyai/flow",
   "path": "packages/action-contract",
-  "commit": "7f616bc8bf986933a058948e9c857e40464c796d",
-  "digest": "sha256:d8bbf540f669336a4ed00f20268bd1183f16875375abaa9e61eeec55063ed4ac"
+  "commit": "77071d3ce44095d916eb7d3f2b6a806d6ccd1202",
+  "digest": "sha256:e46abc4636d9c97e7b6cc8dde2a605cbc0224162b0d9489987c987e81aca36a2"
 }

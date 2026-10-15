@@ -5,8 +5,9 @@
  * published. Whoever performs the action (Aaply Connect, the connector kit)
  * may run any implementation with that digest, so a security patch needs no
  * republishing; a change to the contract (its effect, its idempotency, its
- * undo, its risk floor, its schemas, its completion window, or the declared
- * implementation of an operation made of data, such as a SQL statement) does.
+ * undo, whether it is only an undo, its risk floor, its schemas, its
+ * completion window, or the declared implementation of an operation made of
+ * data, such as a SQL statement) does.
  */
 
 import { isSha256Digest, sha256Digest, type Sha256Digest } from "./digest.js";
@@ -28,6 +29,14 @@ export interface OperationContract {
   irreversible: boolean;
   /** The action id (`<connectorId>.<operation>`) of the write that undoes this one. */
   compensate?: string;
+  /**
+   * A write that exists only to undo another (some operation's `compensate`),
+   * such as a delete bound to what one create made. A flow may name it only as
+   * a `compensate` whose input reads only the write's output: publish refuses
+   * anything else, and the performer refuses it sent with purpose `run`. Left
+   * out, the operation is also an ordinary step.
+   */
+  undoOnly?: true;
   /** The least review a flow must put in front of the action. `none` for reads. */
   riskFloor: Risk;
   /** Schema of the input (`type: "object"`). */
@@ -50,7 +59,7 @@ export interface OperationContract {
   implementation?: Sha256Digest;
 }
 
-const KEYS = new Set(["effect", "idempotent", "irreversible", "compensate", "riskFloor", "input", "output", "completion", "implementation"]);
+const KEYS = new Set(["effect", "idempotent", "irreversible", "compensate", "undoOnly", "riskFloor", "input", "output", "completion", "implementation"]);
 
 /**
  * Whether `value` is a well-formed operation contract: the known keys only,
@@ -63,6 +72,7 @@ export function isOperationContract(value: unknown): value is OperationContract 
   if (c.effect !== "read" && c.effect !== "write") return false;
   if (typeof c.idempotent !== "boolean" || typeof c.irreversible !== "boolean" || !isRisk(c.riskFloor)) return false;
   if (c.compensate !== undefined && (typeof c.compensate !== "string" || c.compensate.length === 0)) return false;
+  if (c.undoOnly !== undefined && (c.undoOnly !== true || c.effect !== "write")) return false;
   if (c.completion !== undefined && !isOperationCompletion(c.completion)) return false;
   if (c.implementation !== undefined && !isSha256Digest(c.implementation)) return false;
   const bag = new DiagnosticBag();
@@ -76,8 +86,8 @@ export function isOperationContract(value: unknown): value is OperationContract 
  * The digest a flow pins: `sha256:` of the canonical JSON of the contract,
  * tagged with {@link OPERATION_CONTRACT_VERSION}. Key order and absent
  * optional fields do not change it, so a field added later (`completion`,
- * `implementation`) leaves the digest of every contract without it as it
- * was.
+ * `implementation`, `undoOnly`) leaves the digest of every contract without
+ * it as it was.
  */
 export function operationDigest(contract: OperationContract): Sha256Digest {
   const body: JsonObject = {
@@ -90,6 +100,7 @@ export function operationDigest(contract: OperationContract): Sha256Digest {
     output: contract.output as JsonObject,
   };
   if (contract.compensate !== undefined) body.compensate = contract.compensate;
+  if (contract.undoOnly === true) body.undoOnly = true;
   if (contract.completion !== undefined) body.completion = { windowMs: contract.completion.windowMs };
   if (contract.implementation !== undefined) body.implementation = contract.implementation;
   return sha256Digest(body);

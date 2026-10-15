@@ -13,7 +13,7 @@ import type { CompiledCollection } from "./compile.js";
 import { MAX_ITEM_OPS } from "./collections-compile.js";
 import type { Read } from "./expr-eval.js";
 import { checkJson, isJsonObject, own, type JsonObject, type JsonValue } from "./json.js";
-import { readable } from "./reader.js";
+import { readable, readFor, wasTooCostly } from "./reader.js";
 import type { FactState, ItemOp, ItemState, RunState } from "./state.js";
 
 /** The live item ids of a collection, in list order. */
@@ -50,16 +50,19 @@ export function readList(state: RunState, collection: CompiledCollection, fields
   const names = fields === "*" ? [...collection.fields.keys()] : fields.filter((f) => collection.fields.has(f));
   const rows: JsonValue[] = [];
   const missing: string[] = [];
+  let costly: true | undefined;
   for (const id of list.items ?? []) {
     const row: JsonObject = { id };
     for (const f of names) {
-      const r = readable(fieldState(state, id, f));
+      const field = fieldState(state, id, f);
+      const r = readable(field);
       if (r.known) row[f] = r.value;
       else missing.push(fieldAddress(collection.name, id, f));
+      if (!r.known && wasTooCostly(field)) costly = true;
     }
     rows.push(row);
   }
-  if (missing.length > 0) return { known: false, missing: { facts: missing, results: [] } };
+  if (missing.length > 0) return { known: false, missing: costly ? { facts: missing, results: [], costly } : { facts: missing, results: [] } };
   return { known: true, value: rows };
 }
 
@@ -87,8 +90,9 @@ export function readSelf(state: RunState, id: string, field: string): Read {
   const item = own(state.items, id);
   if (!item) return { known: false };
   if (field === "id") return { known: true, value: id };
-  const r = readable(own(item.fields, field));
-  return r.known ? r : { known: false, missing: { facts: [fieldAddress(item.collection, id, field)], results: [] } };
+  const address = fieldAddress(item.collection, id, field);
+  const r = readFor(own(item.fields, field), address);
+  return r.known || r.missing ? r : { known: false, missing: { facts: [address], results: [] } };
 }
 
 /** What a list reads as, for telling whether a change is visible: its ids while settled and valid, null otherwise. */

@@ -17,6 +17,7 @@ import { checkInputOps, startCollections } from "./core-items.js";
 import { bumpRows } from "./core-items-stale.js";
 import { fingerprint } from "./hash.js";
 import { cloneJson, hasOwn, own, type JsonValue } from "./json.js";
+import { MAX_PATTERN_WORK, type PatternBudget } from "./schema.js";
 import { callError, RunReader } from "./reader.js";
 import { eventShapeProblem } from "./event-shape.js";
 import {
@@ -253,6 +254,12 @@ export class Machine extends RunReader {
   readonly rows = new Set<string>();
   /** Item fields an output's own rule wrote exactly as its view gave them. */
   readonly ownRows = new Set<string>();
+  /**
+   * Pattern work this event may spend: every value it validates, given or
+   * derived, draws on one budget, so a request of many values costs what one
+   * does. A value met after it ran out is reported as too costly to check.
+   */
+  readonly patternBudget: PatternBudget = { left: MAX_PATTERN_WORK };
   readonly rev: number;
   /** the status each value the fill policy let through is written with. */
   readonly assisting = new Map<string, "valid" | "needs_confirmation">();
@@ -268,6 +275,12 @@ export class Machine extends RunReader {
     this.event = event;
     this.rev = state.revision + 1;
     this.wasLive = !isTerminal(state.status);
+  }
+
+  /** Says, once an event, that an expression was too costly to work out: what it decides is held back. */
+  protected override tooCostly(): void {
+    if (this.notices.some((n) => n.code === "flow/expr-too-costly")) return;
+    this.note("flow/expr-too-costly", "Something here took too much work to work out, so it is held back.");
   }
 
   /**

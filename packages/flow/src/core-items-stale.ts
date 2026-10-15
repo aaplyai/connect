@@ -8,7 +8,8 @@ import { splitTemplate, fieldAddress, parseKey, templateOf, keyOf } from "./addr
 import { type CompiledCollection, factNode, type CompiledStep, type CompiledAction } from "./compile.js";
 import { liveItems, fieldState, liveItem } from "./items.js";
 import { own, jsonByteLength, formatPath, jsonEqual } from "./json.js";
-import { readable } from "./reader.js";
+import { otherSchemas, readable, TOO_COSTLY_ISSUE, unchangedValid } from "./reader.js";
+import { isTooCostly } from "./expr-eval.js";
 import { validateValue } from "./schema.js";
 import type { FactState, OutputEvent, RunState } from "./state.js";
 import { type ItemMachine, put, putField, checkFields } from "./core-items.js";
@@ -77,11 +78,14 @@ export function recomputeField(m: ItemMachine, template: string): void {
     const r = m.eval(field.derive!, undefined, id);
     const prev = fieldState(s, id, t.field);
     let next: FactState;
-    if (!r.known) next = { status: "missing", rev: prev?.rev ?? 0 };
+    // Too costly to work out is a failure, never a value and never "not known yet".
+    if (isTooCostly(r)) next = { status: "invalid", issues: [{ ...TOO_COSTLY_ISSUE }], provenance: "derived", rev: m.rev };
+    else if (!r.known) next = { status: "missing", rev: prev?.rev ?? 0 };
+    else if (unchangedValid(prev, r.value, otherSchemas(m.flow, m.state, m.event))) continue;
     else if (jsonByteLength(r.value) > m.flow.limits.maxFactBytes) {
       next = { status: "invalid", issues: [{ code: "too-large", message: "This is too large.", path: "" }], provenance: "derived", rev: m.rev };
     } else {
-      const issues = validateValue(field.schema, r.value).map((i) => ({ code: i.code, message: i.message, path: formatPath(i.path) }));
+      const issues = validateValue(field.schema, r.value, [], m.patternBudget).map((i) => ({ code: i.code, message: i.message, path: formatPath(i.path) }));
       next = issues.length > 0 ? { status: "invalid", value: r.value, issues, provenance: "derived", rev: m.rev } : { status: "valid", value: r.value, provenance: "derived", rev: m.rev };
     }
     if (prev ? prev.status === next.status && jsonEqual(prev.value, next.value) : next.status === "missing") continue;
