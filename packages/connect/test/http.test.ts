@@ -77,7 +77,7 @@ describe.skipIf(postgresUnavailable())("Connect over HTTP", () => {
     }
   });
 
-  it("stays ready while a burst holds every client of the pool, and answers 503 once the database is gone", async () => {
+  it("stays ready while a burst holds every client of the pool, but not when no client came back for 30 s, and answers 503 once the database is gone", async () => {
     const own = await startTestDatabase();
     const pool = new pg.Pool({ host: own.host, port: own.port, user: "connect_app", database: "connect", max: 3, connectionTimeoutMillis: 300 });
     pool.on("error", () => {});
@@ -87,10 +87,18 @@ describe.skipIf(postgresUnavailable())("Connect over HTTP", () => {
     const base = `http://127.0.0.1:${(served.server.address() as { port: number }).port}`;
     try {
       // A burst: every client is checked out, so the readiness query waits connectionTimeoutMillis and gets none.
-      const sleeps = Array.from({ length: 3 }, () => pool.query("SELECT pg_sleep(1.5)"));
+      // A query came back moments ago (createConnect's own), so the pool is busy with work: ready.
+      const sleeps = Array.from({ length: 3 }, () => pool.query("SELECT pg_sleep(3)"));
       while (pool.totalCount < 3 || pool.idleCount > 0) await new Promise((r) => setTimeout(r, 10));
       expect((await fetch(`${base}/ready`)).status).toBe(200);
+      // Still every client held, and none came back for over 30 s: stuck (a half-open socket after a failover), not busy.
+      now += 31_000;
+      expect(pool.idleCount).toBe(0);
+      expect((await fetch(`${base}/ready`)).status).toBe(503);
+      // The clients come back, and the next probe after the answer that stands finds the pool well.
       await Promise.all(sleeps);
+      now += 10_000;
+      expect((await fetch(`${base}/ready`)).status).toBe(200);
 
       // The database stops. The answer stands for a few seconds, then the next probe finds it gone.
       await own.close();

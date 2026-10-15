@@ -16,7 +16,10 @@
  *   made: it takes the page's id and created time from the create's output,
  *   and refuses a page whose creator is not the integration's bot user or
  *   whose created time differs. A page no longer shared with Aaply is
- *   refused, for a person to check, rather than counted as removed.
+ *   refused, for a person to check, rather than counted as removed. A flow's
+ *   compensate for `pages.create` must pass both, as
+ *   `{ pageId: { resource: ["output", "id"] }, createdTime: { resource: ["output", "createdTime"] } }`:
+ *   one that leaves out `createdTime` publishes, and every undo is refused.
  *
  * Notion's access tokens do not expire; Connect renews one only when Notion
  * refuses it (401).
@@ -115,7 +118,8 @@ const listOf = (item: JsonSchema): JsonSchema => ({
 
 export const notion = defineConnector({
   id: "notion",
-  version: "1.0.0",
+  // 2.0.0: pages.removeCreated takes the page's createdTime too.
+  version: "2.0.0",
   title: "Notion",
   description: "Creates, reads, updates and finds pages in the connected Notion workspace.",
   auth: { kind: "oauth2", scopes: [] },

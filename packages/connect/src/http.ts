@@ -12,8 +12,9 @@
  * - `POST /admin/<operation>` is the admin API, each request signed by the
  *   Aaply backend (see admin-http.ts and `createAdminClient`).
  * - `GET /health` answers while the process runs; `GET /ready` while the
- *   store answers too (503 otherwise). A pool busy with calls is ready, and
- *   one answer stands for 5 s (`Connect.ready`).
+ *   store answers too (503 otherwise). A pool busy with calls is ready, one
+ *   whose clients are all stuck is not, and one answer stands for 5 s
+ *   (`Connect.ready`).
  *
  * The engine's transport must be authenticated: give `performToken` and
  * configure the engine's host to send `authorization: Bearer <token>`

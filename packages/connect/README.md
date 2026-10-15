@@ -17,7 +17,10 @@ const connect = await createConnect({
   audience: "connect.aaply.internal",
   engineKeys: { "engine-2026-10": process.env.ENGINE_PUBLIC_KEY! }, // the engine's public key, base64url
   connectors: [gmail, googleDrive, notion],                          // imported modules of this build only
-  pool: new pg.Pool({ connectionString: process.env.CONNECT_DATABASE_URL, max: 10, connectionTimeoutMillis: 2_000, statement_timeout: 5_000 }),
+  pool: new pg.Pool({                                                // query_timeout and keepAlive free a client stuck on a dead socket
+    connectionString: process.env.CONNECT_DATABASE_URL, max: 10, connectionTimeoutMillis: 2_000,
+    statement_timeout: 5_000, query_timeout: 10_000, keepAlive: true,
+  }),
   keys: localKeyProvider({ keyId: "local-1", key: Buffer.from(process.env.CONNECT_WRAPPING_KEY!, "base64") }),
   adminKeys: { "backend-2026-10": process.env.BACKEND_PUBLIC_KEY! }, // the Aaply backend's public key, for /admin
   egress: { allowPrivate: ["db.internal.aaply.ai"] },                // operator config, never tenant data
@@ -49,8 +52,11 @@ await serveConnect(connect, { port: 8080, host: "0.0.0.0", performToken: process
 
 `GET /health` answers while the process runs and `GET /ready` while the database answers too (503
 otherwise). A pool whose clients are all busy (no client came free within `connectionTimeoutMillis`)
-is ready, so a burst does not take the instance out of a load balancer; only a connection or login
-that fails is 503. One readiness answer stands for 5 s.
+is ready while some client came back from a query in the last 30 s, so a burst does not take the
+instance out of a load balancer; a pool whose clients are all stuck (a half-open socket after a
+failover) is 503, as is a connection or login that fails. One readiness answer stands for 5 s, and
+probes in that time share it. Give the pool `query_timeout` and `keepAlive` (above), so a stuck client
+is freed rather than held until the operating system gives up on its socket.
 
 Each call is cut off 2 s before its deadline and at 55 s, and `serveConnect` lets calls in flight finish
 when it shuts down. Shut down with `await served.close()` and then `await connect.close()`, which also
