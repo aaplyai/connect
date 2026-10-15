@@ -94,6 +94,10 @@ export interface ConnectOptions {
 
 /** How long `close` waits for deletes of files calls stored and did not answer. */
 const CLOSE_SETTLE_MS = 10_000;
+/** How long one readiness answer stands, so a burst of probes does not queue for clients the calls need. */
+const READY_CACHE_MS = 5_000;
+/** pg-pool's error when no client came free within `connectionTimeoutMillis`: the pool is busy, not the database gone. */
+const POOL_BUSY = "timeout exceeded when trying to connect";
 
 /** Whose account a new connection is. */
 export type ConnectionOwner = { business: true; role?: string } | { person: string };
@@ -162,7 +166,11 @@ export interface Connect {
   adminRequest(request: AdminRequest): Promise<AdminAnswer>;
   /** `GET /oauth/start` and `GET /oauth/callback` (`@aaply/connect/http` routes them here). */
   oauthRequest(request: { path: string; query: URLSearchParams; cookie: string | undefined }): Promise<OAuthAnswer>;
-  /** Whether the store answers. */
+  /**
+   * Whether the store answers. A pool whose clients are all busy (pg-pool's
+   * `connectionTimeoutMillis` passed while waiting for one) is ready: only a
+   * connection or login that fails is not. One answer stands for 5 s.
+   */
   ready(): Promise<boolean>;
   /** Deletes expired replay claims, OAuth attempts and dead refresh leases; run it every minute from any instance (several at once is safe). */
   purgeExpired(): Promise<number>;
@@ -229,6 +237,7 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
   });
 
   let closing: Promise<void> | undefined;
+  let readiness: { at: number; answer: Promise<boolean> } | undefined;
 
   const connectorOf = (id: string): Connector => {
     const c = newest(options.connectors, id);
@@ -365,13 +374,16 @@ export async function createConnect(options: ConnectOptions): Promise<Connect> {
       if (request.path === "/oauth/callback") return oauth.complete(request.query, cookies);
       return { status: 404, text: "Not found." };
     },
-    async ready() {
-      try {
-        await options.pool.query("SELECT 1");
-        return true;
-      } catch {
-        return false;
-      }
+    ready() {
+      // A burst that fills the pool must not answer 503: a load balancer would take the instance out and send the burst to the rest.
+      const at = (options.now ?? Date.now)();
+      if (readiness && at - readiness.at < READY_CACHE_MS) return readiness.answer;
+      const answer = options.pool.query("SELECT 1").then(
+        () => true,
+        (error: unknown) => error instanceof Error && error.message === POOL_BUSY,
+      );
+      readiness = { at, answer };
+      return answer;
     },
     purgeExpired: () => store.purgeExpired(),
     close: () =>

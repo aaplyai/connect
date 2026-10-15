@@ -309,13 +309,15 @@ describe.skipIf(postgresUnavailable())("Connect", () => {
     const handler = (e: unknown) => uncaught.push(e);
     process.on("uncaughtException", handler);
     try {
-      const alone = await createConnect({ audience: AUDIENCE, engineKeys: engine.engineKeys, connectors: [v1], pool, keys, observer: { error: (_e, where) => reported.push(where) } });
+      let now = Date.now();
+      const alone = await createConnect({ audience: AUDIENCE, engineKeys: engine.engineKeys, connectors: [v1], pool, keys, now: () => now, observer: { error: (_e, where) => reported.push(where) } });
       expect(await alone.ready()).toBe(true);
       // The database restarts, or a pooler recycles: every idle socket of this pool errors at once.
       await db.pool("postgres").query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'pool-error-test'");
       await new Promise((r) => setTimeout(r, 300));
       expect(uncaught).toEqual([]);
       expect(reported).toContain("pool");
+      now += 10_000; // past the readiness answer that stands, so the pool is asked again
       expect(await alone.ready()).toBe(true);
       await alone.close();
     } finally {

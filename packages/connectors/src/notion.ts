@@ -12,10 +12,11 @@
  * - `pages.get`, `dataSources.query` and `search` read, a page at a time.
  * - `pages.update` changes a page's properties and needs at least a
  *   person's confirmation.
- * - `pages.removeCreated` moves a page to the trash, only if this
- *   integration created it (the page's creator is the integration's bot
- *   user). A page no longer shared with Aaply is refused, for a person to
- *   check, rather than counted as removed.
+ * - `pages.removeCreated` moves a page to the trash, only the one a create
+ *   made: it takes the page's id and created time from the create's output,
+ *   and refuses a page whose creator is not the integration's bot user or
+ *   whose created time differs. A page no longer shared with Aaply is
+ *   refused, for a person to check, rather than counted as removed.
  *
  * Notion's access tokens do not expire; Connect renews one only when Notion
  * refuses it (401).
@@ -215,12 +216,12 @@ export const notion = defineConnector({
     },
     "pages.removeCreated": {
       title: "Remove a created page",
-      description: "The undo of a create: moves the page to Notion's trash, only if this integration created it.",
+      description: "The undo of a create, given the page's id and created time from the create's output: moves that page to Notion's trash, only if this integration created it.",
       effect: "write",
       idempotent: true,
-      input: { type: "object", required: ["pageId"], properties: { pageId: id }, additionalProperties: false },
+      input: { type: "object", required: ["pageId", "createdTime"], properties: { pageId: id, createdTime: { type: "string", minLength: 1, maxLength: 64 } }, additionalProperties: false },
       output: { type: "object", required: ["pageId", "inTrash"], properties: { pageId: { type: "string" }, inTrash: { const: true } }, additionalProperties: false },
-      async handler(input: { pageId: string }, ctx) {
+      async handler(input: { pageId: string; createdTime: string }, ctx) {
         let page: JsonValue;
         try {
           page = await call(ctx, { path: `/pages/${input.pageId}` });
@@ -232,7 +233,11 @@ export const notion = defineConnector({
         const me = await call(ctx, { path: "/users/me" });
         const creator = isObject(page) && isObject(page.created_by) ? page.created_by.id : undefined;
         if (!isObject(me) || typeof me.id !== "string" || creator !== me.id) throw ConnectorError.final("notion/not-created-here", "Only a page this integration created can be removed this way.");
-        if (!pageOf(page).inTrash) await call(ctx, { method: "PATCH", path: `/pages/${input.pageId}`, json: { in_trash: true } });
+        // The bot made every page Aaply made in the workspace: the created time binds the undo to the one this create made.
+        const found = pageOf(page);
+        const created = Date.parse(found.createdTime ?? "");
+        if (!Number.isFinite(created) || created !== Date.parse(input.createdTime)) throw ConnectorError.final("notion/not-created-here", "Only the page this create made can be removed this way.");
+        if (!found.inTrash) await call(ctx, { method: "PATCH", path: `/pages/${input.pageId}`, json: { in_trash: true } });
         return { pageId: input.pageId, inTrash: true };
       },
     },

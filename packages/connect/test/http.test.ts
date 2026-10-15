@@ -4,6 +4,7 @@ import { CONFORMANCE_SCOPE, draftApprovedAction } from "@aaply/action-contract/c
 import { createConnect, type Connect } from "@aaply/connect";
 import { serveConnect } from "@aaply/connect/http";
 import { postgresUnavailable, startTestDatabase, testEngineKeys, testKeyProvider, type TestDatabase } from "@aaply/connect/testing";
+import pg from "pg";
 import { notesConnector, notesService } from "./support.js";
 
 const TOKEN = "a-transport-token-long-enough-for-the-check-0123";
@@ -73,6 +74,34 @@ describe.skipIf(postgresUnavailable())("Connect over HTTP", () => {
       expect((await fetch(`${base}/nowhere`)).status).toBe(404);
     } finally {
       await served.close();
+    }
+  });
+
+  it("stays ready while a burst holds every client of the pool, and answers 503 once the database is gone", async () => {
+    const own = await startTestDatabase();
+    const pool = new pg.Pool({ host: own.host, port: own.port, user: "connect_app", database: "connect", max: 3, connectionTimeoutMillis: 300 });
+    pool.on("error", () => {});
+    let now = Date.now();
+    const busy = await createConnect({ audience: "connect.test", engineKeys: engine.engineKeys, connectors: [notesConnector("1.0.0", "v1")], pool, keys: testKeyProvider(), fetch: notesService(), now: () => now });
+    const served = await serveConnect(busy, { port: 0, performToken: TOKEN });
+    const base = `http://127.0.0.1:${(served.server.address() as { port: number }).port}`;
+    try {
+      // A burst: every client is checked out, so the readiness query waits connectionTimeoutMillis and gets none.
+      const sleeps = Array.from({ length: 3 }, () => pool.query("SELECT pg_sleep(1.5)"));
+      while (pool.totalCount < 3 || pool.idleCount > 0) await new Promise((r) => setTimeout(r, 10));
+      expect((await fetch(`${base}/ready`)).status).toBe(200);
+      await Promise.all(sleeps);
+
+      // The database stops. The answer stands for a few seconds, then the next probe finds it gone.
+      await own.close();
+      expect((await fetch(`${base}/ready`)).status).toBe(200);
+      now += 10_000;
+      expect((await fetch(`${base}/ready`)).status).toBe(503);
+    } finally {
+      await served.close();
+      await busy.close();
+      await pool.end().catch(() => {});
+      await own.close();
     }
   });
 

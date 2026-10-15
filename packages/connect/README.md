@@ -47,6 +47,11 @@ await serveConnect(connect, { port: 8080, host: "0.0.0.0", performToken: process
 5. A write that does not de-duplicate is claimed once in the store just before it is sent, so the same
    envelope reaching two instances is performed once.
 
+`GET /health` answers while the process runs and `GET /ready` while the database answers too (503
+otherwise). A pool whose clients are all busy (no client came free within `connectionTimeoutMillis`)
+is ready, so a burst does not take the instance out of a load balancer; only a connection or login
+that fails is 503. One readiness answer stands for 5 s.
+
 Each call is cut off 2 s before its deadline and at 55 s, and `serveConnect` lets calls in flight finish
 when it shuts down. Shut down with `await served.close()` and then `await connect.close()`, which also
 waits (up to 10 s) for the deletes of files calls stored and did not answer.
