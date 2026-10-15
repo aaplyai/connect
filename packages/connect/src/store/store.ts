@@ -42,11 +42,20 @@ export interface Installation {
   previous: Array<{ definition: JsonObject; digest: string }>;
 }
 
+/** The installation as a call sees it: digests only. A SQL definition is read by `sqlDefinition` when an instance has not built it yet. */
+export interface ResolvedInstallation {
+  id: string;
+  kind: "code" | "sql";
+  digest: string | null;
+  /** For a SQL connector, the digests of the definitions this one replaced (newest first, at most 4). */
+  previousDigests: string[];
+}
+
 /** What one call needs, read in one round trip. */
 export interface Resolution {
   global: { disabled: boolean };
   policy: { disabled: boolean; denied: string[] } | null;
-  installation: Installation | null;
+  installation: ResolvedInstallation | null;
   connection: (Omit<Connection, "scope" | "connectorId"> & { secret: { sealed: SealedSecret; dataKey: WrappedDataKey } | null }) | null;
 }
 
@@ -115,6 +124,8 @@ const COLUMNS = "id, tenant_id, app_id, environment_id, connector_id, owner_subj
 
 export interface ConnectStore {
   resolve(query: ResolveQuery): Promise<Resolution>;
+  /** A SQL connector's definition by digest (the installed one or one it replaced); null when the scope has none with that digest. */
+  sqlDefinition(scope: Scope, connectorId: string, digest: string): Promise<JsonObject | null>;
   claim(tenantId: string, key: string, until: number): Promise<boolean>;
   currentDataKey(tenantId: string, create: () => Promise<WrappedDataKey>): Promise<WrappedDataKey>;
   /** Installs a connector for a scope. A SQL definition replaces the scope's earlier one for that connector id; a code connector is installed once. */
@@ -209,7 +220,7 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
         global: { disabled: r.global.disabled },
         policy: r.policy ? { disabled: r.policy.disabled, denied: r.policy.denied } : null,
         installation: r.installation
-          ? { id: r.installation.id, kind: r.installation.kind, definition: r.installation.definition ?? null, digest: r.installation.digest ?? null, previous: r.installation.previous ?? [] }
+          ? { id: r.installation.id, kind: r.installation.kind, digest: r.installation.digest ?? null, previousDigests: r.installation.previousDigests ?? [] }
           : null,
         connection: c
           ? {
@@ -233,6 +244,10 @@ export function createPgStore(pool: pg.Pool): ConnectStore {
       };
     },
 
+    async sqlDefinition(scope, connectorId, digest) {
+      const { rows } = await pool.query("SELECT aaply_connect.sql_definition($1, $2, $3, $4, $5) AS d", [...scopeParams(scope), connectorId, digest]);
+      return (rows[0]?.d as JsonObject | null | undefined) ?? null;
+    },
     async claim(tenantId, key, until) {
       // Held well past the deadline: the database's clock and each instance's may differ, and a claim that lapsed early would let a late copy through.
       const { rows } = await pool.query("SELECT aaply_connect.claim($1, $2, to_timestamp($3::double precision / 1000)) AS claimed", [tenantId, key, until + CLAIM_MARGIN_MS]);

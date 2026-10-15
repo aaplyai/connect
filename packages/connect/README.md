@@ -78,10 +78,20 @@ CREATE ROLE connect_app LOGIN PASSWORD '...' IN ROLE aaply_connect_app;
 Every tenant's rows sit behind forced row-level security. `createConnect` refuses to start as a
 superuser, a role that can bypass row security, or the schema's owner, and refuses a database made by
 another build (pre-1.0 builds do not migrate). Run `connect.purgeExpired()` every minute from any
-instance to delete expired replay claims; it deletes in batches until none are left (up to 5 s).
+instance to delete expired replay claims, used-up OAuth attempts and dead renewal leases; nothing
+schedules it for you, and without it `replay_claims` grows by a row per write attempt and per admin
+request. It deletes in batches until none are left (up to 5 s).
 
-`resolve` reads by the `connections_resolve` index, so a call costs the same with 200 or 200,000
-connections. Measured on one process against a local PostgreSQL 16 (warm cache, a pool of 10): a read
+The pool is the deployment's: `connect.close()` closes Connect's own egress sockets and the tenants'
+SQL pools, and the deployment ends the pool it passed in. Connect listens for the pool's `error`
+event when nothing else does (pg raises an idle socket's error there, and an unheard one ends the
+process), and reports it to `observer.error` as `pool`.
+
+`resolve` finds the call's connection by index whichever side it is on, a person's by its owner
+(`connections_resolve_person`) and the business's by its role (`connections_resolve_business`), so a
+call costs the same with 200 or 200,000 connections, also when they all belong to one app's people.
+It reads the installation's digests only; a declared SQL definition is read once per instance, when
+that digest is first served. Measured on one process against a local PostgreSQL 16 (warm cache, a pool of 10): a read
 costs about 1.9 ms p50 and 2.6 ms p95 in all, of which about 1.4 ms is Connect's own; 64 calls in flight
 run at about 1,500 calls per second, bound by CPU.
 
@@ -181,5 +191,8 @@ CIDR or host. A refused request counts as never sent. A host name in `allowPriva
 address, so prefer CIDRs. Connector requests keep at most `connectionsPerOrigin` sockets (default 64) per
 origin; calls beyond that wait for one.
 
-Connect has no rate limiter of its own (the engine's lanes pace work per tenant and connector); put a
+Connect has no rate limiter of its own (the engine's lanes pace work per tenant and connector), only
+caps on calls in flight: `maxInFlight` per instance (default 256) and `maxInFlightPerTenant` (default
+32). A call past a cap is refused `connect/unavailable`, retryable after a second, before anything is
+read, so one tenant's slow calls cannot hold every socket and call budget of the instance. Put a
 request limit in front of `/perform` at the load balancer if the network it listens on is shared.

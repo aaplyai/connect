@@ -233,11 +233,19 @@ export function createSqlExecutor(options: SqlExecutorOptions): SqlExecutor {
       }),
     );
     pools.set(call.poolKey, held);
+    // Room is made by dropping the least recently used pool that nothing uses: pg-pool never serves a call already queued
+    // on a pool it is ending, so a busy pool stays (its idle timer reaps it later) and the cap is exceeded for that long.
+    const idle = (h: Held) => h.pool.waitingCount === 0 && h.pool.idleCount === h.pool.totalCount;
     const mine = [...pools].filter(([, h]) => h.tenantId === call.tenantId);
-    if (mine.length > perTenant) drop(mine[0]![0], mine[0]![1]);
-    while (pools.size > maxPools) {
-      const [oldest, h] = pools.entries().next().value as [string, Held];
-      drop(oldest, h);
+    if (mine.length > perTenant) {
+      const victim = mine.find(([, h]) => h !== held && idle(h));
+      if (victim) drop(victim[0], victim[1]);
+    }
+    if (pools.size > maxPools) {
+      for (const [key, h] of pools) {
+        if (pools.size <= maxPools) break;
+        if (h !== held && idle(h)) drop(key, h);
+      }
     }
     return pool;
   }

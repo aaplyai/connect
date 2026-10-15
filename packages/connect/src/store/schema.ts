@@ -11,7 +11,7 @@
  */
 
 /** The schema this build writes and reads. A database with another is refused. */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /** The role the service's login role is a member of. */
 export const APP_ROLE = "aaply_connect_app";
@@ -22,6 +22,21 @@ const TENANT_TABLES = ["data_keys", "policy", "installations", "connections", "s
 
 /** Tables the app role may change; the admin log is append-only to it. */
 const WRITABLE_TABLES = TENANT_TABLES.filter((t) => t !== "admin_log");
+
+/**
+ * How `resolve()` finds the call's connection: one query per side, so each is
+ * served by its own index (`connections_resolve_person`, `connections_resolve_business`).
+ * `params` names the six values in order: tenant, app, environment, connector,
+ * environment kind, then the owner (a person's) or the role (the business's).
+ * Exported so a test can ask the planner about the very text the function runs.
+ */
+export function resolveConnectionSql(side: "endUser" | "business", params: readonly [string, string, string, string, string, string]): string {
+  const [tenant, app, env, connector, kind, last] = params;
+  const who = side === "endUser" ? `c.owner_subject = ${last}` : `c.owner_subject IS NULL AND c.role = ${last}`;
+  return `SELECT c.id FROM aaply_connect.connections c
+      WHERE c.tenant_id = ${tenant} AND c.app_id = ${app} AND c.environment_id = ${env} AND c.connector_id = ${connector} AND c.environment_kind = ${kind} AND ${who}
+      ORDER BY (c.status <> 'revoked') DESC, c.created_at DESC LIMIT 1`;
+}
 
 export const SCHEMA_SQL = `
 CREATE SCHEMA aaply_connect;
@@ -97,8 +112,11 @@ CREATE TABLE aaply_connect.connections (
   updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK ((owner_subject IS NULL) <> (role IS NULL))
 );
--- What resolve() reads on every call (it also sees revoked rows, which the partial unique indexes leave out).
-CREATE INDEX connections_resolve ON aaply_connect.connections (tenant_id, app_id, environment_id, connector_id, environment_kind);
+-- What resolve() reads on every call, one index per side (it also sees revoked rows, which the partial unique indexes leave out):
+-- a person's connection by owner, the business's by role. One app with many people connected is the common shape, so the
+-- owner is in the key; without it every such call scanned the scope's rows.
+CREATE INDEX connections_resolve_person ON aaply_connect.connections (tenant_id, app_id, environment_id, connector_id, environment_kind, owner_subject);
+CREATE INDEX connections_resolve_business ON aaply_connect.connections (tenant_id, app_id, environment_id, connector_id, environment_kind, role) WHERE owner_subject IS NULL;
 CREATE UNIQUE INDEX connections_business ON aaply_connect.connections (tenant_id, app_id, environment_id, connector_id, role, environment_kind) WHERE owner_subject IS NULL AND status <> 'revoked';
 CREATE UNIQUE INDEX connections_person ON aaply_connect.connections (tenant_id, app_id, environment_id, connector_id, owner_subject, environment_kind) WHERE role IS NULL AND status <> 'revoked';
 
@@ -189,18 +207,27 @@ ALTER TABLE aaply_connect.${t} FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant ON aaply_connect.${t} USING (tenant_id = ${TENANT}) WITH CHECK (tenant_id = ${TENANT});`,
 ).join("\n")}
 
--- Everything one call needs, in one round trip: the kill switches, the scope's policy, the installation, the connection, its sealed secret and the data key it is sealed under.
+-- Everything one call needs, in one round trip: the kill switches, the scope's policy, the installation (its digests; a SQL
+-- definition is read separately, only when this instance has not built it yet), the connection, its sealed secret and the data
+-- key it is sealed under. The connection is found by one of two queries, each served by its own index (RESOLVE_CONNECTION).
 CREATE FUNCTION aaply_connect.resolve(p_tenant text, p_app text, p_env text, p_connector text, p_acting text, p_role text, p_subject text, p_kind text)
 RETURNS jsonb LANGUAGE plpgsql VOLATILE SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
   result jsonb;
+  conn_id text;
 BEGIN
   PERFORM set_config('aaply_connect.tenant', p_tenant, true);
+  IF p_acting = 'endUser' THEN
+    ${resolveConnectionSql("endUser", ["p_tenant", "p_app", "p_env", "p_connector", "p_kind", "p_subject"])} INTO conn_id;
+  ELSE
+    ${resolveConnectionSql("business", ["p_tenant", "p_app", "p_env", "p_connector", "p_kind", "p_role"])} INTO conn_id;
+  END IF;
   SELECT jsonb_build_object(
     'global', (SELECT jsonb_build_object('disabled', g.disabled) FROM aaply_connect.global_policy g),
     'policy', (SELECT jsonb_build_object('disabled', p.disabled, 'denied', to_jsonb(p.denied)) FROM aaply_connect.policy p
                WHERE p.tenant_id = p_tenant AND p.app_id = p_app AND p.environment_id = p_env),
-    'installation', (SELECT jsonb_build_object('id', i.id, 'kind', i.kind, 'definition', i.definition, 'digest', i.digest, 'previous', i.previous) FROM aaply_connect.installations i
+    'installation', (SELECT jsonb_build_object('id', i.id, 'kind', i.kind, 'digest', i.digest, 'previousDigests', jsonb_path_query_array(i.previous, '$[*].digest'))
+               FROM aaply_connect.installations i
                WHERE i.tenant_id = p_tenant AND i.app_id = p_app AND i.environment_id = p_env AND i.connector_id = p_connector),
     'connection', (SELECT jsonb_build_object(
                      'id', c.id, 'ownerSubject', c.owner_subject, 'role', c.role, 'environmentKind', c.environment_kind,
@@ -210,12 +237,23 @@ BEGIN
                                 FROM aaply_connect.secrets s JOIN aaply_connect.data_keys k ON k.tenant_id = s.tenant_id AND k.data_key_id = s.data_key_id
                                 WHERE s.connection_id = c.id))
                    FROM aaply_connect.connections c
-                   WHERE c.tenant_id = p_tenant AND c.app_id = p_app AND c.environment_id = p_env AND c.connector_id = p_connector
-                     AND c.environment_kind = p_kind
-                     AND CASE WHEN p_acting = 'endUser' THEN c.owner_subject = p_subject ELSE c.owner_subject IS NULL AND c.role = p_role END
-                   ORDER BY (c.status <> 'revoked') DESC, c.created_at DESC
-                   LIMIT 1)
+                   WHERE c.id = conn_id)
   ) INTO result;
+  RETURN result;
+END
+$$;
+
+-- A SQL connector's definition by digest: the installed one or one it replaced. Read only when an instance has not built that digest yet.
+CREATE FUNCTION aaply_connect.sql_definition(p_tenant text, p_app text, p_env text, p_connector text, p_digest text)
+RETURNS jsonb LANGUAGE plpgsql VOLATILE SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+  result jsonb;
+BEGIN
+  PERFORM set_config('aaply_connect.tenant', p_tenant, true);
+  SELECT CASE WHEN i.digest = p_digest THEN i.definition ELSE (SELECT e->'definition' FROM jsonb_array_elements(i.previous) e WHERE e->>'digest' = p_digest LIMIT 1) END
+    INTO result
+    FROM aaply_connect.installations i
+    WHERE i.tenant_id = p_tenant AND i.app_id = p_app AND i.environment_id = p_env AND i.connector_id = p_connector AND i.kind = 'sql';
   RETURN result;
 END
 $$;
@@ -264,6 +302,6 @@ GRANT SELECT, UPDATE ON aaply_connect.global_policy TO ${APP_ROLE};
 GRANT SELECT, INSERT, UPDATE, DELETE ON ${WRITABLE_TABLES.map((t) => `aaply_connect.${t}`).join(", ")} TO ${APP_ROLE};
 GRANT SELECT, INSERT ON aaply_connect.admin_log TO ${APP_ROLE};
 REVOKE ALL ON aaply_connect.oauth_states FROM PUBLIC;
-REVOKE ALL ON FUNCTION aaply_connect.resolve, aaply_connect.claim, aaply_connect.purge_expired, aaply_connect.oauth_state_create, aaply_connect.oauth_state_begin, aaply_connect.oauth_state_take FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION aaply_connect.resolve, aaply_connect.claim, aaply_connect.purge_expired, aaply_connect.oauth_state_create, aaply_connect.oauth_state_begin, aaply_connect.oauth_state_take TO ${APP_ROLE};
+REVOKE ALL ON FUNCTION aaply_connect.resolve, aaply_connect.sql_definition, aaply_connect.claim, aaply_connect.purge_expired, aaply_connect.oauth_state_create, aaply_connect.oauth_state_begin, aaply_connect.oauth_state_take FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION aaply_connect.resolve, aaply_connect.sql_definition, aaply_connect.claim, aaply_connect.purge_expired, aaply_connect.oauth_state_create, aaply_connect.oauth_state_begin, aaply_connect.oauth_state_take TO ${APP_ROLE};
 `;

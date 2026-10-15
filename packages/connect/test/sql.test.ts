@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { operationDigest, signApprovedAction, type ApprovedAction, type ApprovedActionSigner, type Scope } from "@aaply/action-contract";
 import { CONFORMANCE_SCOPE, draftApprovedAction, type ApprovedActionDraft } from "@aaply/action-contract/conformance";
-import { createConnect, type Connect } from "@aaply/connect";
+import { createConnect, egressPolicy, type Connect, type SqlOperation } from "@aaply/connect";
+import { createSqlExecutor } from "../src/sql/executor.js";
 import { postgresUnavailable, startTestDatabase, testEngineKeys, testKeyProvider, type TestDatabase } from "@aaply/connect/testing";
 import { BOOKING_SCHEMA, bookingConnector } from "./booking.js";
 
@@ -104,6 +105,56 @@ describe.skipIf(postgresUnavailable())("declared SQL connectors", () => {
     expect(Array.isArray(await ids(repinned))).toBe(true);
     for (const v of ["1.0.2", "1.0.3", "1.0.4", "1.0.5"]) await connect.admin.installSql(s, bookingConnector(v, `starts_at desc, id /* ${v} */`));
     expect(await ids(pinned)).toMatchObject({ status: "final", error: { code: "connect/contract-mismatch" } });
+  });
+
+  it("carries an installation's digests into a call, never its definitions", async () => {
+    const s = { ...scope, appId: "pins" };
+    const { rows } = await db.app.query("SELECT aaply_connect.resolve($1, $2, $3, 'booking-db', 'business', 'default', NULL, 'production') AS r", [s.tenantId, s.appId, s.environmentId]);
+    const r = rows[0]!.r as { installation: Record<string, unknown> };
+    expect(r.installation.kind).toBe("sql");
+    expect(typeof r.installation.digest).toBe("string");
+    expect(r.installation.previousDigests).toHaveLength(4);
+    expect(r.installation).not.toHaveProperty("definition");
+    expect(r.installation).not.toHaveProperty("previous");
+    expect(JSON.stringify(r).length).toBeLessThan(4096);
+  });
+
+  it("answers a call queued on a pool that makes room for another tenant's, instead of stranding it", async () => {
+    const executor = createSqlExecutor({ egress: egressPolicy({ allowPrivate: ["127.0.0.1/32"] }), privateTenants: ["t1"], maxPools: 1, poolSize: 1 });
+    const sleep: SqlOperation = {
+      title: "sleep",
+      effect: "read",
+      statement: "select true as slept from pg_sleep($1)",
+      params: ["s"],
+      rows: "one",
+      input: { type: "object", properties: { s: { type: "number" } } },
+      output: { type: "object" },
+    };
+    const call = (poolKey: string, s: number) => ({
+      tenantId: "t1",
+      poolKey,
+      target: { host: "127.0.0.1", port: db.port, database: "booking", user: "booking_app", tls: "disable" as const },
+      password: "booking-pw",
+      op: sleep,
+      input: { s },
+      signal: AbortSignal.timeout(20_000),
+      deadline: Date.now() + 20_000,
+      now: Date.now(),
+    });
+    try {
+      const started = Date.now();
+      const a1 = executor.run(call("A", 1));
+      await new Promise((r) => setTimeout(r, 200));
+      const a2 = executor.run(call("A", 0.1));
+      await new Promise((r) => setTimeout(r, 200));
+      // Another key while A is busy: B gets its pool, A's is kept until nothing waits on it.
+      expect(await executor.run(call("B", 0.1))).toMatchObject({ slept: true });
+      expect(await a1).toMatchObject({ slept: true });
+      expect(await a2).toMatchObject({ slept: true });
+      expect(Date.now() - started).toBeLessThan(5_000);
+    } finally {
+      await executor.close();
+    }
   });
 
   it("answers a write stopped before COMMIT as not applied, and rolls it back", async () => {

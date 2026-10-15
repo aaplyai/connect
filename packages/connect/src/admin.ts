@@ -61,6 +61,9 @@ function scopeProblem(scope: unknown): string | null {
   return null;
 }
 
+const isId = (v: unknown) => typeof v === "string" && v.length > 0 && v.length <= 200;
+const isObject = (v: unknown) => typeof v === "object" && v !== null && !Array.isArray(v);
+const ENVIRONMENT_KINDS = new Set(["production", "preview", "test"]);
 const isStrings = (v: unknown, max: number) => Array.isArray(v) && v.length <= max && v.every((x) => typeof x === "string" && x.length > 0 && x.length <= 256);
 
 const CHANGE_KEYS = new Set(["secret", "status", "grantedScopes", "account", "config"]);
@@ -155,6 +158,7 @@ export function adminAs(raw: RawAdmin, store: ConnectStore, actor: AdminActor): 
     install(scope, connectorId) {
       scoped(scope);
       requireAdmin("installing a connector");
+      if (!isId(connectorId)) throw new AdminError("admin/invalid", "connectorId is a connector id");
       return admin.install(scope, connectorId);
     },
     installSql(scope, definition) {
@@ -165,6 +169,7 @@ export function adminAs(raw: RawAdmin, store: ConnectStore, actor: AdminActor): 
     uninstall(scope, connectorId) {
       scoped(scope);
       requireAdmin("removing a connector");
+      if (!isId(connectorId)) throw new AdminError("admin/invalid", "connectorId is a connector id");
       return admin.uninstall(scope, connectorId);
     },
     setPolicy(scope, change) {
@@ -177,11 +182,17 @@ export function adminAs(raw: RawAdmin, store: ConnectStore, actor: AdminActor): 
     createConnection(input) {
       if (typeof input !== "object" || input === null || typeof input.owner !== "object" || input.owner === null) throw new AdminError("admin/invalid", "input is { scope, connectorId, owner, … }");
       scoped(input.scope);
+      if (!isId(input.connectorId)) throw new AdminError("admin/invalid", "connectorId is a connector id");
+      if (input.environmentKind !== undefined && !ENVIRONMENT_KINDS.has(input.environmentKind)) throw new AdminError("admin/invalid", "environmentKind is production, preview or test");
+      if ((input.account !== undefined && !isObject(input.account)) || (input.config !== undefined && !isObject(input.config))) throw new AdminError("admin/invalid", "account and config are objects");
+      if (input.secret !== null && input.secret !== undefined && !isObject(input.secret)) throw new AdminError("admin/invalid", "secret is an object of strings, or null");
       if (input.grantedScopes !== undefined && !isStrings(input.grantedScopes, 200)) throw new AdminError("admin/invalid", "grantedScopes is a list of scopes");
       if ("person" in input.owner) {
         if (input.owner.person !== personOf(actor)) throw new AdminError("admin/forbidden", "a person connects only their own account");
-        // Where a connection points, and what it may do, are the business's to set.
-        if (input.config !== undefined || input.grantedScopes !== undefined) throw new AdminError("admin/forbidden", "config and grantedScopes of a connection need the " + ADMIN_ROLE + " role");
+        // Where a connection points, what it may do, and whose account it says it is, are the business's to set (OAuth sets the account from the provider).
+        if (input.config !== undefined || input.grantedScopes !== undefined || input.account !== undefined) {
+          throw new AdminError("admin/forbidden", "config, grantedScopes and account of a connection need the " + ADMIN_ROLE + " role");
+        }
       } else requireAdmin("connecting the business's account");
       return admin.createConnection(input);
     },
@@ -192,7 +203,9 @@ export function adminAs(raw: RawAdmin, store: ConnectStore, actor: AdminActor): 
       const c = await visible(tenantId, id);
       if (c.ownerSubject === null) requireAdmin("changing the business's connection");
       else if (c.ownerSubject !== personOf(actor)) throw new AdminError("admin/forbidden", "only its owner changes a person's connection");
-      else if (!isAdmin && (change.config !== undefined || change.grantedScopes !== undefined)) throw new AdminError("admin/forbidden", "config and grantedScopes of a connection need the " + ADMIN_ROLE + " role");
+      else if (!isAdmin && (change.config !== undefined || change.grantedScopes !== undefined || change.account !== undefined)) {
+        throw new AdminError("admin/forbidden", "config, grantedScopes and account of a connection need the " + ADMIN_ROLE + " role");
+      }
       return admin.updateConnection(tenantId, id, expectedVersion, change);
     },
     async revokeConnection(tenantId, id) {
@@ -210,7 +223,9 @@ export function adminAs(raw: RawAdmin, store: ConnectStore, actor: AdminActor): 
     },
     connections(scope, filter = {}) {
       scoped(scope);
-      if (typeof filter !== "object" || filter === null) throw new AdminError("admin/invalid", "filter is { connectorId?, ownerSubject? }");
+      if (!isObject(filter) || (filter.connectorId !== undefined && !isId(filter.connectorId)) || (filter.ownerSubject !== undefined && !isId(filter.ownerSubject))) {
+        throw new AdminError("admin/invalid", "filter is { connectorId?, ownerSubject? }");
+      }
       if (isAdmin) return admin.connections(scope, filter);
       if (filter.ownerSubject !== undefined && filter.ownerSubject !== personOf(actor)) throw new AdminError("admin/forbidden", "a person lists only their own connections");
       return admin.connections(scope, { ...filter, ownerSubject: personOf(actor) });

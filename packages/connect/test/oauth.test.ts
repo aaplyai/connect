@@ -303,13 +303,16 @@ describe.skipIf(postgresUnavailable())("OAuth connections", () => {
     await db.pool("postgres").query("DELETE FROM aaply_connect.refresh_leases");
   });
 
-  it("refuses a sign-in that unticked a scope the connector needs, or used another account than expected", async () => {
+  it("refuses a sign-in that unticked a scope the connector needs, or used another account than expected, and gives the grant back", async () => {
+    const revoked = google.callsTo(REVOKE).length;
     google.on(TOKEN_URL, (r) => ({ ...tokens(r), json: { ...(tokens(r) as { json: Record<string, unknown> }).json, scope: "openid email" } }));
     expect((await connectInBrowser(boss)).landed!.searchParams.get("reason")).toBe("scopes-declined");
     google.on(TOKEN_URL, tokens);
     const wrong = await connectInBrowser(ana, { owner: { person: "member:ana" }, expectAccount: "ana@clinic.example" });
     expect(wrong.atGoogle.searchParams.get("login_hint")).toBe("ana@clinic.example");
     expect(wrong.landed!.searchParams.get("reason")).toBe("different-account");
+    // A grant Connect keeps no connection for is revoked at Google, so the person's account is not left with an empty "Aaply" grant.
+    expect(google.callsTo(REVOKE).length).toBe(revoked + 2);
     account = { sub: "g-ana", email: "Ana@Clinic.example" };
     expect((await connectInBrowser(ana, { owner: { person: "member:ana" }, expectAccount: "ana@clinic.example" })).landed!.searchParams.get("connect")).toBe("ok");
     account = { sub: "g-111", email: "desk@clinic.example" };

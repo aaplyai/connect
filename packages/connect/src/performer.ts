@@ -55,6 +55,9 @@ import type { Vault } from "./vault.js";
 /** The role a business connection serves when the flow names none. */
 export const DEFAULT_ROLE = "default";
 
+/** How long a call refused for want of room is asked to wait. */
+const BUSY_RETRY_MS = 1_000;
+
 export interface PerformerOptions {
   /** This Connect's audience: envelopes for any other are refused. */
   audience: string;
@@ -76,6 +79,14 @@ export interface PerformerOptions {
   ceilingMs?: number;
   /** How long before the envelope's deadline Connect answers, in ms. Default 2 000. */
   marginMs?: number;
+  /**
+   * Calls one instance runs at once, in all and per tenant (default 256 and
+   * 32). A call past either cap is refused `connect/unavailable` (retryable,
+   * after a second) before anything is read, so one tenant's slow calls
+   * cannot hold every socket and every call budget of the instance.
+   */
+  maxInFlight?: number;
+  maxInFlightPerTenant?: number;
   log?: ConnectorLogSink;
   observer?: { error?(error: unknown, where: string): void };
 }
@@ -110,6 +121,13 @@ interface CallState {
   commitSent?: boolean;
   /** The opened secret, once a request asked for it. */
   secret?: Readonly<Record<string, string>> | null;
+}
+
+/** The store could not be read (or the budget ran out while reading it): the call is refused `connect/unavailable`, not `unknown-action`. */
+class StoreFailure extends Error {
+  constructor(cause: unknown) {
+    super("the store could not be read", { cause });
+  }
 }
 
 /** `work`, or a rejection once `signal` aborts (a store that stalls must not hold the answer past the deadline). */
@@ -239,15 +257,18 @@ export function createPerformer(options: PerformerOptions): Performer {
   }
 
   // Declared SQL connectors: one kit port per installed definition, built on first use (by its digest), at most 500 kept.
+  // The definition itself is read from the store only on a miss: a call carries digests, not the definitions (up to 256 KiB each).
   const sqlPorts = new Map<string, { port: ConnectorActionPort; digests: ReadonlyMap<string, Sha256Digest> }>();
-  const sqlPortFor = (digest: string, definition: SqlConnectorDefinition) => {
+  const sqlPortFor = async (digest: string, load: () => Promise<unknown>) => {
     const hit = sqlPorts.get(digest);
     if (hit) {
       sqlPorts.delete(digest);
       sqlPorts.set(digest, hit);
       return hit;
     }
-    if (!options.sql || definitionDigest(definition) !== digest) return null;
+    if (!options.sql) return null;
+    const definition = (await load()) as SqlConnectorDefinition | null;
+    if (!definition || definitionDigest(definition) !== digest) return null;
     const executor = options.sql;
     const connector = sqlConnector(definition, executor, async () => {
       const s = state();
@@ -273,10 +294,34 @@ export function createPerformer(options: PerformerOptions): Performer {
     return list[0]!;
   };
 
+  // Calls in flight, in all and per tenant: counted only for envelopes that verified, so the count is the tenant's own.
+  const maxInFlight = options.maxInFlight ?? 256;
+  const maxInFlightPerTenant = options.maxInFlightPerTenant ?? 32;
+  let inFlight = 0;
+  const inFlightByTenant = new Map<string, number>();
+
   async function perform(value: unknown, signal?: AbortSignal): Promise<ActionOutcome> {
     const checked = await verifyApprovedAction(value, { now: now(), audience: options.audience, verifier: options.verifier });
     if (!checked.ok) return checked.outcome;
     const a: ApprovedAction = checked.action;
+    const tenantId = a.scope.tenantId;
+    const mine = inFlightByTenant.get(tenantId) ?? 0;
+    if (inFlight >= maxInFlight || mine >= maxInFlightPerTenant) {
+      return refuse("connect/unavailable", "Connect is busy; try again shortly.", { detail: mine >= maxInFlightPerTenant ? "tenant cap" : "instance cap", retryAfterMs: BUSY_RETRY_MS });
+    }
+    inFlight++;
+    inFlightByTenant.set(tenantId, mine + 1);
+    try {
+      return await performVerified(a, signal);
+    } finally {
+      inFlight--;
+      const left = (inFlightByTenant.get(tenantId) ?? 1) - 1;
+      if (left <= 0) inFlightByTenant.delete(tenantId);
+      else inFlightByTenant.set(tenantId, left);
+    }
+  }
+
+  async function performVerified(a: ApprovedAction, signal?: AbortSignal): Promise<ActionOutcome> {
     // A person is stored as domain:id; a domain with a colon in it would read as another person.
     if (a.subject?.domain.includes(":")) return refuse("connect/invalid-envelope", "The run's person is malformed.", { detail: "subject.domain contains ':'" });
     const dot = a.action.id.indexOf(".");
@@ -313,14 +358,24 @@ export function createPerformer(options: PerformerOptions): Performer {
       // The current definition, then the ones it replaced: a run pinned to an operation of an earlier one (its undo, say) is still served.
       let chosen: ConnectorActionPort | null = null;
       try {
-        for (const d of [{ definition: installation.definition, digest: installation.digest }, ...installation.previous]) {
-          const sql = d.definition && d.digest ? sqlPortFor(d.digest, d.definition as unknown as SqlConnectorDefinition) : null;
+        for (const digest of [installation.digest, ...installation.previousDigests]) {
+          const sql = digest
+            ? await sqlPortFor(digest, () =>
+                whileOpen(capped, options.store.sqlDefinition(a.scope, connectorId, digest)).catch((cause: unknown) => {
+                  throw new StoreFailure(cause);
+                }),
+              )
+            : null;
           if (sql && (chosen === null || (a.action.contract !== undefined && sql.digests.get(operation) === a.action.contract))) {
             chosen = sql.port;
             if (a.action.contract === undefined || sql.digests.get(operation) === a.action.contract) break;
           }
         }
       } catch (error) {
+        if (error instanceof StoreFailure) {
+          report(error.cause, "store.sqlDefinition");
+          return refuse("connect/unavailable", "Connect cannot reach its store right now.");
+        }
         // A stored definition this build's kit no longer accepts: no retry will change that.
         report(error, "perform.sql");
         return refuse("connect/unknown-action", "This action is not available here.", { detail: `${connectorId} cannot be built by this Connect` });

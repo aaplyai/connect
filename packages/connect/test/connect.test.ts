@@ -6,6 +6,8 @@ import type { MockFetch } from "@aaply/connector-sdk/testing";
 import { createConnect, type Connect } from "@aaply/connect";
 import { serveConnect } from "@aaply/connect/http";
 import { postgresUnavailable, startTestDatabase, testEngineKeys, testKeyProvider, type TestDatabase } from "@aaply/connect/testing";
+import pg from "pg";
+import { resolveConnectionSql } from "../src/store/schema.js";
 import { countingPool, httpPort, notesConnector, notesService } from "./support.js";
 
 const AUDIENCE = "connect.test";
@@ -281,18 +283,64 @@ describe.skipIf(postgresUnavailable())("Connect", () => {
     }
   });
 
-  it("finds the call's connection by index however many connections there are", async () => {
+  it("finds the call's connection by index however many connections there are, also when one app's people hold them all", async () => {
+    // The common shape: one scope and connector, many people connected, one business connection. Both lookups are
+    // asked of the planner in the very text resolve() runs.
     const admin = db.pool("postgres");
+    await admin.query(`INSERT INTO aaply_connect.connections (id, tenant_id, app_id, environment_id, connector_id, owner_subject, environment_kind)
+      SELECT 'conn_bulk' || g, 'tenant-bulk', 'app', 'env', 'notes', 'member:' || g, 'production' FROM generate_series(1, 20000) g`);
     await admin.query(`INSERT INTO aaply_connect.connections (id, tenant_id, app_id, environment_id, connector_id, role, environment_kind)
-      SELECT 'conn_bulk' || g, 'tenant-' || (g % 500), 'app', 'env', 'notes', 'r' || g, 'production' FROM generate_series(1, 20000) g`);
+      VALUES ('conn_bulk_business', 'tenant-bulk', 'app', 'env', 'notes', 'default', 'production')`);
     await admin.query("ANALYZE aaply_connect.connections");
-    const plan = await admin.query(`EXPLAIN SELECT id FROM aaply_connect.connections c
-      WHERE c.tenant_id = 'tenant-7' AND c.app_id = 'app' AND c.environment_id = 'env' AND c.connector_id = 'notes' AND c.environment_kind = 'production'
-        AND c.owner_subject IS NULL AND c.role = 'r7' ORDER BY (c.status <> 'revoked') DESC, c.created_at DESC LIMIT 1`);
-    const text = plan.rows.map((r) => r["QUERY PLAN"]).join("\n");
-    expect(text).toMatch(/Index Scan|Bitmap Index Scan/);
-    expect(text).not.toMatch(/Seq Scan/);
+    const params = ["'tenant-bulk'", "'app'", "'env'", "'notes'", "'production'"] as const;
+    for (const [side, last] of [["endUser", "'member:7'"], ["business", "'default'"]] as const) {
+      const plan = await admin.query(`EXPLAIN ${resolveConnectionSql(side, [...params, last])}`);
+      const text = plan.rows.map((r) => r["QUERY PLAN"]).join("\n");
+      expect(text, side).toMatch(/Index Scan|Bitmap Index Scan/);
+      expect(text, side).not.toMatch(/Seq Scan/);
+    }
     await admin.query("DELETE FROM aaply_connect.connections WHERE id LIKE 'conn_bulk%'");
+  });
+
+  it("survives the database dropping its idle sockets, and reports it, when the deployment listens for nothing", async () => {
+    const pool = new pg.Pool({ host: db.host, port: db.port, user: "connect_app", database: "connect", max: 4, application_name: "pool-error-test" });
+    const uncaught: unknown[] = [];
+    const reported: string[] = [];
+    const handler = (e: unknown) => uncaught.push(e);
+    process.on("uncaughtException", handler);
+    try {
+      const alone = await createConnect({ audience: AUDIENCE, engineKeys: engine.engineKeys, connectors: [v1], pool, keys, observer: { error: (_e, where) => reported.push(where) } });
+      expect(await alone.ready()).toBe(true);
+      // The database restarts, or a pooler recycles: every idle socket of this pool errors at once.
+      await db.pool("postgres").query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'pool-error-test'");
+      await new Promise((r) => setTimeout(r, 300));
+      expect(uncaught).toEqual([]);
+      expect(reported).toContain("pool");
+      expect(await alone.ready()).toBe(true);
+      await alone.close();
+    } finally {
+      process.off("uncaughtException", handler);
+      await pool.end().catch(() => {});
+    }
+  });
+
+  it("refuses a call past the instance's or the tenant's in-flight cap before reading anything, retryable after a second", async () => {
+    const slow = notesConnector("1.0.0", "slow", { slowMs: 800 });
+    const busy = await make({ connectors: [slow], maxInFlightPerTenant: 2, maxInFlight: 2 });
+    try {
+      const first = busy.perform(await read());
+      const second = busy.perform(await read());
+      await new Promise((r) => setTimeout(r, 50));
+      counter.reset();
+      expect(await busy.perform(await read())).toMatchObject({ status: "retryable", error: { code: "connect/unavailable" }, retryAfterMs: 1000 });
+      expect(counter.count()).toBe(0);
+      expect((await first).status).toBe("ok");
+      expect((await second).status).toBe("ok");
+      // Room again once they answered.
+      expect((await busy.perform(await read())).status).toBe("ok");
+    } finally {
+      await busy.close();
+    }
   });
 
   it("gives handlers the backend's file store, and refuses file references made for another workspace", async () => {

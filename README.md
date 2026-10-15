@@ -10,7 +10,7 @@ Gmail, Google Drive or Notion. The engine never holds a credential.
 
 | Package | What it is |
 | --- | --- |
-| [`@aaply/connect`](packages/connect) | The service: performs approved actions, holds connections and secrets, runs OAuth and declared SQL connectors. Being built (see the plan's build order). |
+| [`@aaply/connect`](packages/connect) | The service: performs approved actions, holds connections and secrets, runs OAuth and declared SQL connectors. Not yet: a sink for deferred results, webhooks and watches, and outside developers' connectors (designed, built with the first one). |
 | [`@aaply/connectors`](packages/connectors) | First-party connectors, one subpath each: `/gmail`, `/google-drive`, `/notion`. |
 | [`@aaply/connector-sdk`](packages/connector-sdk) | The public connector kit: define a connector and its operations once, test it, and run it behind the engine's action port. **Vendored** from `aaplyai/flow`, which owns it until both libraries publish to a registry. |
 | [`@aaply/action-contract`](packages/action-contract) | The contract between the engine and whatever performs its actions. **Vendored**: a read-only copy owned by `aaplyai/flow`, pinned in its `VENDORED.json`. |
