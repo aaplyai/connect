@@ -342,6 +342,7 @@ export async function follow(rt: RuntimeContext, t: Turn, proposal: DecisionProp
         access: { ctx },
         chain,
         why: { basis: "model", turnId: t.turnId },
+        loaded: active.state,
       });
       if (stale) return clarifyTurn(rt, t, policyText(policy, "changed"), "flow/decision-stale");
       // As for any person's call: a move its version's policy makes now (one the turn could not make before).
@@ -355,7 +356,8 @@ export async function follow(rt: RuntimeContext, t: Turn, proposal: DecisionProp
       const unclear = resolved && resolved.unclear.length > 0 ? [{ code: "flow/assist-unclear", message: "Some details could not be used. Please say them again.", facts: resolved.unclear }] : [];
       return {
         kind: "run",
-        workspace: busy ? await workspaceAfter(rt, ctx, workspaceId, busy) : await turnView(rt, t),
+        // The run just changed is shown as it was recorded, not loaded again.
+        workspace: busy ? await workspaceAfter(rt, ctx, workspaceId, busy, applied) : await turnView(rt, t, applied),
         accepted: response.accepted,
         notices: [...response.notices, ...unclear],
         ...(response.rejection ? { rejection: response.rejection } : {}),

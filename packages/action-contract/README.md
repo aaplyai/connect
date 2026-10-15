@@ -70,7 +70,7 @@ An `ApprovedAction` is plain JSON. It carries:
 
 It **never** carries an account, a credential or a secret. It is a grant, though: whoever
 holds a valid one can have the action performed. So the engine's host signs it for one
-performer, and the performer verifies it before anything else. See
+performer, and the performer verifies it before it performs anything. See
 [Connectors](../../docs/connectors.md#the-approved-action) for every field.
 
 ### Signing

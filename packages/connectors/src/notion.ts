@@ -16,10 +16,17 @@
  *   made: it takes the page's id and created time from the create's output,
  *   and refuses a page whose creator is not the integration's bot user or
  *   whose created time differs. A page no longer shared with Aaply is
- *   refused, for a person to check, rather than counted as removed. A flow's
- *   compensate for `pages.create` must pass both, as
- *   `{ pageId: { resource: ["output", "id"] }, createdTime: { resource: ["output", "createdTime"] } }`:
- *   one that leaves out `createdTime` publishes, and every undo is refused.
+ *   refused, for a person to check, rather than counted as removed. It is
+ *   undo-only: a flow names it only as the compensate of `pages.create`,
+ *   as `{ pageId: { resource: ["output", "id"] }, createdTime: { resource: ["output", "createdTime"] } }`.
+ *   One that leaves out `createdTime`, or reads anything but the create's
+ *   output, is refused at publish, and the port refuses it as a step.
+ * - The create's output holds only what Notion made (`id`, `url`,
+ *   `createdTime`), never the parent or properties the flow sent: an undo
+ *   reads only that output, so an echo of the flow's own input there would
+ *   let it aim the undo at a page it read (another page's id as the parent,
+ *   its created time as the title). The url's slug follows the title, but
+ *   matches neither the id nor the created time the undo takes.
  *
  * Notion's access tokens do not expire; Connect renews one only when Notion
  * refuses it (401).
@@ -52,6 +59,17 @@ const pageSchema: JsonSchema = {
   },
   additionalProperties: false,
 };
+
+/** What a create answers: only what Notion made for the new page, none of the input it echoes. */
+const createdSchema: JsonSchema = {
+  type: "object",
+  required: ["id", "url", "createdTime"],
+  properties: { id: { type: "string" }, url: { type: "string" }, createdTime: { type: "string" } },
+  additionalProperties: false,
+};
+
+/** Notion's created times, as the undo compares them. Anything else (a url, a title) is refused before a call. */
+const createdTime: JsonSchema = { type: "string", maxLength: 64, pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(:\\d{2}(\\.\\d{1,9})?)?(Z|[+-]\\d{2}:\\d{2})$" };
 
 type Page = { id: string; url: string; inTrash: boolean; createdTime?: string; lastEditedTime?: string; parent?: JsonObject; properties: JsonObject };
 
@@ -118,8 +136,8 @@ const listOf = (item: JsonSchema): JsonSchema => ({
 
 export const notion = defineConnector({
   id: "notion",
-  // 2.0.0: pages.removeCreated takes the page's createdTime too.
-  version: "2.0.0",
+  // 3.0.0: pages.removeCreated is undo-only and pages.create answers only id, url and createdTime. 2.0.0: removeCreated takes createdTime.
+  version: "3.0.0",
   title: "Notion",
   description: "Creates, reads, updates and finds pages in the connected Notion workspace.",
   auth: { kind: "oauth2", scopes: [] },
@@ -145,15 +163,16 @@ export const notion = defineConnector({
         },
         additionalProperties: false,
       },
-      output: pageSchema,
+      output: createdSchema,
       async handler(input: { parent: { dataSourceId: string } | { pageId: string }; properties: JsonObject; children?: JsonObject[] }, ctx) {
         const parent = "dataSourceId" in input.parent ? { type: "data_source_id", data_source_id: input.parent.dataSourceId } : { type: "page_id", page_id: input.parent.pageId };
         const body = await call(ctx, { method: "POST", path: "/pages", json: { parent, properties: input.properties, ...(input.children ? { children: input.children } : {}) } });
-        try {
-          return pageOf(body);
-        } catch {
-          throw ConnectorError.unknown("notion/bad-response", "Notion answered the create without the page's id.");
+        const v = isObject(body) ? body : {};
+        // Without its created time the page could not be undone: it may exist, so a person must look.
+        if (typeof v.id !== "string" || typeof v.url !== "string" || typeof v.created_time !== "string") {
+          throw ConnectorError.unknown("notion/bad-response", "Notion answered the create without the page's id, URL or created time.");
         }
+        return { id: v.id, url: v.url, createdTime: v.created_time };
       },
     },
     "pages.get": {
@@ -223,7 +242,8 @@ export const notion = defineConnector({
       description: "The undo of a create, given the page's id and created time from the create's output: moves that page to Notion's trash, only if this integration created it.",
       effect: "write",
       idempotent: true,
-      input: { type: "object", required: ["pageId", "createdTime"], properties: { pageId: id, createdTime: { type: "string", minLength: 1, maxLength: 64 } }, additionalProperties: false },
+      undoOnly: true,
+      input: { type: "object", required: ["pageId", "createdTime"], properties: { pageId: id, createdTime }, additionalProperties: false },
       output: { type: "object", required: ["pageId", "inTrash"], properties: { pageId: { type: "string" }, inTrash: { const: true } }, additionalProperties: false },
       async handler(input: { pageId: string; createdTime: string }, ctx) {
         let page: JsonValue;

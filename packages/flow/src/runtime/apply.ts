@@ -39,19 +39,33 @@ export async function apply(rt: RuntimeContext, scope: Scope, runId: string, opt
       latencyMs?: number;
       /** Writes a cancel took back: recorded withdrawn in the event's own commit, ahead of it, or not at all (`stepWithdrawals`). */
       withdraw?: readonly TakenWrite[];
+      /**
+       * The run as the caller loaded it in this request, so the first attempt need not load it again.
+       * It is used only for an event that changes the run, whose commit then proves it current (or
+       * conflicts, and the run is loaded again, which spends no conflict retry); anything else is
+       * decided again on a fresh load.
+       */
+      loaded?: RunState;
     }): Promise<Applied> {
   const housekeeping = options.housekeeping ?? {};
   const traced = options.access?.ctx ?? options.traceCtx;
   let withdraw = options.withdraw;
   let reported = false;
+  let given = options.loaded;
   for (let attempt = 0; ; attempt++) {
-    const state = await rt.store.loadRun(scope, runId);
+    const preloaded = given !== undefined;
+    const state = given ?? (await rt.store.loadRun(scope, runId));
+    given = undefined;
     if (!state) {
       await commitHousekeeping(rt, scope, runId, housekeeping);
       throw new FlowError("not_found", "Not found.");
     }
     let flow = options.access ? await flowForCaller(rt, options.access, state) : await flowFor(rt, scope, state);
     const event = options.build(state, flow);
+    if (!event && preloaded) {
+      attempt -= 1;
+      continue;
+    }
     if (!event) {
       await commitHousekeeping(rt, scope, runId, housekeeping);
       return { state, flow, result: null };
@@ -66,6 +80,10 @@ export async function apply(rt: RuntimeContext, scope: Scope, runId: string, opt
     const base = pre?.state ?? state;
     const result = event.type === "run.migrated" && options.to ? migrateStep(flow, options.to, base, event) : step(flow, base, event);
     if (result.accepted && result.changed && event.type === "run.migrated" && options.to) flow = options.to;
+    if ((!result.accepted || !result.changed) && preloaded) {
+      attempt -= 1;
+      continue;
+    }
     if (!result.accepted || !result.changed) {
       if (!(options.deferHousekeeping === true && result.accepted)) await commitHousekeeping(rt, scope, runId, housekeeping);
       trace(rt, state, state, flow, event, result, started, options.why, options.latencyMs);
@@ -78,6 +96,11 @@ export async function apply(rt: RuntimeContext, scope: Scope, runId: string, opt
       // The cancel outlived a taken write's lease, and another owner holds it now (sending it): decide again without it.
       if (committed.conflict === "outbox" && withdraw?.some((t) => t.id === committed.id)) {
         withdraw = withdraw.filter((t) => t.id !== committed.id);
+        attempt -= 1;
+        continue;
+      }
+      // The run the caller loaded moved on since: load it now, without spending a retry or pausing, since nobody competed.
+      if (preloaded) {
         attempt -= 1;
         continue;
       }

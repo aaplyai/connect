@@ -176,6 +176,12 @@ pinned to its exact SQL, and changing a statement is a new pin.
 - Each call sets `statement_timeout` and `lock_timeout` from the call's budget.
 - A write de-duplicates on a business reference (`insert … on conflict do nothing returning …` with
   `onConflictEmpty`), so the engine may send it again safely.
+- An operation that exists only to undo another (`"undoOnly": true`, the write's `compensate`) is
+  refused as a step, and its undo reads only that write's output: return nothing from the write the
+  flow chose (a reference it passed in), or a flow can aim the undo at another row through it.
+  Marking an operation in a new definition does not mark it in the definitions it replaced, which
+  keep serving the runs pinned to them (below): until four newer ones push those out, such a run can
+  still call the old, unmarked operation as a step.
 - A failure before `COMMIT` is retryable (connection, timeout, serialization) or final (a declared
   SQLSTATE in `errors`, or any other database error); a failed `COMMIT` on a write is `unknown`.
 - The database host is checked by egress like any other. A private address needs `allowPrivate` and

@@ -108,6 +108,12 @@ export interface OperationDefinition {
   idempotent?: boolean;
   /** The write operation that undoes this one. */
   compensate?: string;
+  /**
+   * Only an undo (another operation's `compensate`), such as a delete bound to what one create
+   * made: a flow may use it only as that undo, reading the write's output. Publish refuses it as a
+   * step or aimed at a target the flow chose, and the port refuses it as a step. In the contract.
+   */
+  undoOnly?: boolean;
   /** Cannot be undone (a sent email, a payment). */
   irreversible?: boolean;
   /** Writes only. */
@@ -176,6 +182,8 @@ export interface Operation {
   readonly output: JsonSchema;
   readonly idempotent: boolean;
   readonly compensate?: string;
+  /** Present when the operation may run only as another's undo. */
+  readonly undoOnly?: true;
   readonly irreversible: boolean;
   readonly riskFloor: RiskFloor;
   /** Effective egress: the operation's own rules, or else the connector's. */
@@ -213,6 +221,7 @@ export interface OperationManifest {
   output: JsonSchema;
   idempotent: boolean;
   compensate?: string;
+  undoOnly?: true;
   irreversible: boolean;
   riskFloor: RiskFloor;
   egress: string[];
@@ -258,7 +267,7 @@ export const CONNECTOR_LIMITS = deepFreeze({
 const RISK_FLOORS: readonly RiskFloor[] = ["none", "confirm", "approval"];
 const RISK_RANK: Record<RiskFloor, number> = { none: 0, confirm: 1, approval: 2 };
 const CONNECTOR_KEYS = ["id", "version", "title", "description", "auth", "egress", "operations", "webhooks", "propagateTrace"];
-const OPERATION_KEYS = ["title", "description", "effect", "input", "output", "idempotent", "compensate", "irreversible", "riskFloor", "egress", "scopes", "completion", "implementation"];
+const OPERATION_KEYS = ["title", "description", "effect", "input", "output", "idempotent", "compensate", "undoOnly", "irreversible", "riskFloor", "egress", "scopes", "completion", "implementation"];
 
 /** Whether `risk` is at least `floor`. */
 export function riskAtLeast(risk: RiskFloor, floor: RiskFloor): boolean {
@@ -489,7 +498,7 @@ function checkInto(raw: unknown, bag: DiagnosticBag, mode: Mode): void {
         bag.error("connector/input-not-object", [...path, "input", "type"], 'the input schema must be type "object"');
       }
     }
-    for (const flag of ["idempotent", "irreversible"] as const) {
+    for (const flag of ["idempotent", "irreversible", "undoOnly"] as const) {
       if (op[flag] !== undefined && typeof op[flag] !== "boolean") bag.error("connector/invalid-field", [...path, flag], `${flag} must be a boolean`);
     }
     if (op.riskFloor !== undefined && !RISK_FLOORS.includes(op.riskFloor as RiskFloor)) {
@@ -520,16 +529,22 @@ function checkInto(raw: unknown, bag: DiagnosticBag, mode: Mode): void {
       } else if (target.effect !== "write") {
         bag.error("connector/compensate-not-write", [...path, "compensate"], `"${op.compensate}" is not a write, so it cannot undo anything`);
       } else {
+        // An undo-only operation that cannot be an undo either is usable nowhere: an error, not a warning.
+        const report = target.undoOnly === true ? bag.error.bind(bag) : bag.warn.bind(bag);
         if (target.idempotent !== true) {
-          bag.warn("connector/compensate-not-idempotent", [...path, "compensate"], `"${op.compensate}" should be idempotent: the engine may send an undo more than once`);
+          report("connector/compensate-not-idempotent", [...path, "compensate"], `"${op.compensate}" should be idempotent: the engine may send an undo more than once`);
         }
         if (target.riskFloor !== undefined && target.riskFloor !== "none") {
-          bag.warn("connector/compensate-reviewed", [...path, "compensate"], `"${op.compensate}" has risk floor "${String(target.riskFloor)}", but nobody reviews an undo: flows cannot use it as one`);
+          report("connector/compensate-reviewed", [...path, "compensate"], `"${op.compensate}" has risk floor "${String(target.riskFloor)}", but nobody reviews an undo: flows cannot use it as one`);
         }
       }
     }
+    if (op.undoOnly === true && effect === "write" && !names.some((other) => other !== name && opOf(other)?.compensate === name)) {
+      bag.error("connector/undo-only-undeclared", [...path, "undoOnly"], "an undo-only operation must be the compensate of another operation of this connector");
+    }
     if (effect === "read") {
       if (op.compensate !== undefined) bag.error("connector/read-with-write-option", [...path, "compensate"], "compensate only applies to writes");
+      if (op.undoOnly === true) bag.error("connector/read-with-write-option", [...path, "undoOnly"], "undoOnly only applies to writes");
       if (op.irreversible === true) bag.error("connector/read-with-write-option", [...path, "irreversible"], "irreversible only applies to writes");
       if (op.riskFloor !== undefined && op.riskFloor !== "none") bag.error("connector/read-with-write-option", [...path, "riskFloor"], "reads have no risk floor");
     }
@@ -651,6 +666,7 @@ export function defineConnector(definition: ConnectorDefinition): Connector {
       output: frozenSchema(def.output),
       idempotent: def.idempotent === true,
       ...(def.compensate !== undefined ? { compensate: def.compensate } : {}),
+      ...(def.undoOnly === true ? { undoOnly: true as const } : {}),
       irreversible: def.irreversible === true,
       riskFloor: def.riskFloor ?? "none",
       egress,
@@ -704,6 +720,7 @@ export function manifestOf(connector: Connector): ConnectorManifest {
       output: cloneJson(op.output as unknown as JsonValue) as unknown as JsonSchema,
       idempotent: op.idempotent,
       ...(op.compensate !== undefined ? { compensate: op.compensate } : {}),
+      ...(op.undoOnly === true ? { undoOnly: true as const } : {}),
       irreversible: op.irreversible,
       riskFloor: op.riskFloor,
       egress: [...op.egress],
@@ -744,8 +761,8 @@ export function manifestDigest(manifest: ConnectorManifest): string {
 
 /**
  * What one operation promises, as the contract's `OperationContract`: its
- * effect, idempotency, undo (`compensate` as an action id), risk floor,
- * schemas and, when it declares them, its completion window and the digest
+ * effect, idempotency, undo (`compensate` as an action id), whether it is
+ * only an undo (`undoOnly`), risk floor, schemas and, when it declares them, its completion window and the digest
  * of the declared data it runs (`implementation`). Its
  * `operationDigest` is what a flow pins. Null for an unknown operation.
  */
@@ -758,6 +775,7 @@ export function operationContractOf(connector: Connector, operation: string): Op
     idempotent: op.idempotent,
     irreversible: op.irreversible,
     ...(op.compensate !== undefined ? { compensate: `${c.connector.id}.${op.compensate}` } : {}),
+    ...(op.undoOnly === true ? { undoOnly: true as const } : {}),
     riskFloor: op.riskFloor,
     input: cloneJson(op.input as unknown as JsonValue) as unknown as JsonSchema,
     output: cloneJson(op.output as unknown as JsonValue) as unknown as JsonSchema,

@@ -1,7 +1,7 @@
 /**
  * Evaluation of the flow expression language (expr.ts): three-valued, total
  * and bounded. A read of something not yet known yields unknown, with what is
- * missing; work on lists and the size of built values are capped.
+ * missing; the work of one evaluation and the size of built values are capped.
  */
 
 import { type JsonValue, jsonEqual, canonicalJson, getPath, isJsonObject, type JsonObject } from "./json.js";
@@ -25,6 +25,8 @@ export interface EvalEnv {
   items?(name: string): JsonValue;
   /** True when the fact's value is known and valid. */
   isKnown(name: string): boolean;
+  /** True when the fact is not known because it was too costly to work out (so `known` of it is too costly too). */
+  costly?(name: string): boolean;
   result(name: string): Read;
   /** True when the action's current result is a final failure. */
   isFailed(name: string): boolean;
@@ -39,6 +41,12 @@ export interface EvalEnv {
 export interface Missing {
   facts: string[];
   results: string[];
+  /**
+   * The evaluation ran past its work cap ({@link MAX_EVAL_WORK}, a list
+   * operation's {@link MAX_LIST_WORK}, or the work its step had left): what
+   * it decides is not known, and waiting for facts will not make it so.
+   */
+  costly?: true;
 }
 
 export type Evaluated = { known: true; value: JsonValue } | { known: false; missing: Missing };
@@ -48,9 +56,25 @@ export const UNKNOWN_EMPTY: Missing = { facts: [], results: [] };
 /**
  * Work one evaluation may spend on list operations: one unit per element and
  * per node evaluated for it, plus the data compared or built there (a unit per
- * 64 bytes). A list operation that would go past it gives null.
+ * 64 bytes). A list operation that would go past it is too costly (see
+ * {@link Missing}).
  */
 export const MAX_LIST_WORK = 100_000;
+
+/**
+ * Work one evaluation may spend in all, counted as for lists: one unit per
+ * node evaluated and per 64 bytes of data compared, searched, measured or
+ * built, wherever that happens (a unit is about 60 ns at worst). An
+ * evaluation that goes past it is too costly, so its cost is bounded
+ * whatever the data, not only by its 512 nodes. A step's evaluations also
+ * share one budget (see {@link EvalBudget}).
+ */
+export const MAX_EVAL_WORK = 1_000_000;
+
+/** Work the evaluations one caller makes share, drawn on in place (a run's step shares one). */
+export interface EvalBudget {
+  left: number;
+}
 
 /**
  * Largest value an expression builds: text from `concat` (in characters) and
@@ -58,6 +82,13 @@ export const MAX_LIST_WORK = 100_000;
  * Anything larger evaluates to null.
  */
 export const MAX_BUILT_SIZE = 1024 * 1024;
+
+/**
+ * How many times copying them it costs to write a list or object out as
+ * canonical JSON, which comparing, searching and joining them does: their
+ * keys are sorted and their text escaped (measured at 7 to 27 ns a byte).
+ */
+const CANONICAL_COST = 16;
 
 export function unknown(missing: Missing = UNKNOWN_EMPTY): Evaluated {
   return { known: false, missing };
@@ -67,14 +98,26 @@ export function val(value: JsonValue): Evaluated {
   return { known: true, value };
 }
 
+/** The outcome of an evaluation past its work cap: unknown, and never known by waiting. */
+export function tooCostly(): Evaluated {
+  return { known: false, missing: { facts: [], results: [], costly: true } };
+}
+
+/** Whether an evaluation was cut short by its work cap. */
+export function isTooCostly(r: Evaluated): boolean {
+  return !r.known && r.missing.costly === true;
+}
+
 export function joinMissing(list: Missing[]): Missing {
   const facts = new Set<string>();
   const results = new Set<string>();
+  let costly = false;
   for (const m of list) {
     for (const f of m.facts) facts.add(f);
     for (const r of m.results) results.add(r);
+    if (m.costly) costly = true;
   }
-  return { facts: [...facts], results: [...results] };
+  return { facts: [...facts], results: [...results], ...(costly ? { costly: true as const } : {}) };
 }
 
 /** Falsy values are false, null, 0 and the empty string. */
@@ -115,6 +158,10 @@ export interface Ctx {
   env: EvalEnv;
   items: JsonValue[];
   work: number;
+  /** The work spent inside list operations, held to {@link MAX_LIST_WORK}. */
+  listWork: number;
+  /** The most work this evaluation may spend: {@link MAX_EVAL_WORK}, or less when its budget has less left. */
+  cap: number;
   reads: Map<string, Read | boolean>;
   sizes: WeakMap<object, number>;
 }
@@ -146,9 +193,26 @@ export function sizeOf(value: JsonValue, c: Ctx, cap = MAX_BUILT_SIZE): number {
   return n;
 }
 
-/** Charges data work while a list operation is running (outside lists, the node limit bounds evaluation). */
+/** Adds units of work, counted against the list cap too while a list operation runs. */
+function work(c: Ctx, units: number): void {
+  c.work += units;
+  if (c.items.length > 0) c.listWork += units;
+}
+
+/** Charges data work: a unit per 64 bytes, inside a list operation or not. */
 export function charge(c: Ctx, bytes: number): void {
-  if (c.items.length > 0) c.work += bytes >> 6;
+  work(c, bytes >> 6);
+}
+
+/** Whether the evaluation has spent more than it may. */
+function over(c: Ctx): boolean {
+  return c.work > c.cap || c.listWork > MAX_LIST_WORK;
+}
+
+/** Charges data work about to be done; true when that takes the evaluation past its cap, so it is not done. */
+function spent(c: Ctx, bytes: number): boolean {
+  charge(c, bytes);
+  return over(c);
 }
 
 export function memo<T extends Read | boolean>(c: Ctx, key: string, read: () => T): T {
@@ -159,13 +223,22 @@ export function memo<T extends Read | boolean>(c: Ctx, key: string, read: () => 
   return r;
 }
 
-/** Evaluates a compiled expression. Never throws for well-formed nodes. */
-export function evaluate(node: Node, env: EvalEnv): Evaluated {
-  return ev(node, { env, items: [], work: 0, reads: new Map(), sizes: new WeakMap() });
+/**
+ * Evaluates a compiled expression. Never throws for well-formed nodes. Past
+ * its cap ({@link MAX_EVAL_WORK}, or what `budget` has left, which it draws
+ * on) nothing more is worked out: what depended on that work is unknown and
+ * marked too costly ({@link isTooCostly}), never read as a value.
+ */
+export function evaluate(node: Node, env: EvalEnv, budget?: EvalBudget): Evaluated {
+  const c: Ctx = { env, items: [], work: 0, listWork: 0, cap: Math.min(MAX_EVAL_WORK, budget?.left ?? Infinity), reads: new Map(), sizes: new WeakMap() };
+  const r = ev(node, c);
+  if (budget) budget.left -= c.work;
+  return r;
 }
 
 export function ev(node: Node, c: Ctx): Evaluated {
-  c.work++;
+  work(c, 1);
+  if (over(c)) return tooCostly();
   const env = c.env;
   switch (node.k) {
     case "lit":
@@ -202,8 +275,10 @@ export function ev(node: Node, c: Ctx): Evaluated {
       return val(env.env(node.name));
     case "now":
       return val(env.now);
-    case "known":
-      return val(memo(c, `k:${node.name}`, () => env.isKnown(node.name)));
+    case "known": {
+      const known = memo(c, `k:${node.name}`, () => env.isKnown(node.name));
+      return !known && env.costly?.(node.name) ? unknown({ facts: [node.name], results: [], costly: true }) : val(known);
+    }
     case "failed":
       return val(memo(c, `x:${node.name}`, () => env.isFailed(node.name)));
     case "not": {
@@ -255,6 +330,7 @@ export function ev(node: Node, c: Ctx): Evaluated {
     else missing.push(r.missing);
   }
   if (missing.length > 0) return unknown(joinMissing(missing));
+  if (over(c)) return tooCostly();
   const [a = null, b = null] = values;
   switch (node.k) {
     case "eq":
@@ -263,36 +339,38 @@ export function ev(node: Node, c: Ctx): Evaluated {
     case "lte":
     case "gt":
     case "gte":
-      if (c.items.length > 0) charge(c, sizeOf(a, c) + sizeOf(b, c));
+      if (spent(c, (sizeOf(a, c) + sizeOf(b, c)) * (isStructured(a) && isStructured(b) ? CANONICAL_COST : 1))) return tooCostly();
       return val(compare(node.k, a, b));
     case "in": {
       if (Array.isArray(b)) {
-        if (c.items.length > 0) charge(c, sizeOf(b, c) + sizeOf(a, c));
+        if (spent(c, (sizeOf(b, c) + sizeOf(a, c)) * (isStructured(a) ? CANONICAL_COST : 1))) return tooCostly();
         if (a === null || typeof a !== "object") return val(b.includes(a));
         const key = canonicalJson(a);
         return val(b.some((item) => item !== null && typeof item === "object" && canonicalJson(item) === key));
       }
       if (typeof b === "string" && typeof a === "string") {
-        charge(c, b.length);
+        // A search may read the text several times over (measured at up to 5 ns a character).
+        if (spent(c, (b.length + a.length) * 4)) return tooCostly();
         return val(b.includes(a));
       }
       return val(false);
     }
     case "len": {
       if (typeof a === "string") {
-        charge(c, a.length * 4);
-        return val([...a].length);
+        // Counting reads every character: about three times the cost of copying them.
+        if (spent(c, a.length * 3)) return tooCostly();
+        return val(codePoints(a));
       }
       if (Array.isArray(a)) return val(a.length);
       if (isJsonObject(a)) {
-        if (c.items.length > 0) charge(c, sizeOf(a, c));
+        if (spent(c, sizeOf(a, c))) return tooCostly();
         return val(Object.keys(a).length);
       }
       return val(null);
     }
     case "sum": {
       if (!Array.isArray(a)) return val(null);
-      c.work += a.length;
+      work(c, a.length);
       let total = 0;
       for (const n of a) {
         if (typeof n !== "number") return val(null);
@@ -316,20 +394,21 @@ export function ev(node: Node, c: Ctx): Evaluated {
       const parts: string[] = [];
       let length = 0;
       for (const v of values) {
-        if (v !== null && typeof v === "object" && sizeOf(v, c) > MAX_BUILT_SIZE) return val(null);
+        if (isStructured(v) && sizeOf(v, c) > MAX_BUILT_SIZE) return val(null);
+        // Charged before it is made, so text given up on for being too long still counts.
+        if (spent(c, isStructured(v) ? sizeOf(v, c) * CANONICAL_COST : typeof v === "string" ? v.length : 0)) return tooCostly();
         const text = toText(v);
         length += text.length;
         if (length > MAX_BUILT_SIZE) return val(null);
         parts.push(text);
       }
-      charge(c, length);
       return val(parts.join(""));
     }
     case "lower":
-      if (typeof a === "string") charge(c, a.length);
+      if (typeof a === "string" && spent(c, a.length)) return tooCostly();
       return val(typeof a === "string" ? a.toLowerCase() : null);
     case "trim":
-      if (typeof a === "string") charge(c, a.length);
+      if (typeof a === "string" && spent(c, a.length)) return tooCostly();
       return val(typeof a === "string" ? a.trim() : null);
     case "ms":
       return val(toMs(a));
@@ -345,6 +424,27 @@ export function ev(node: Node, c: Ctx): Evaluated {
     default:
       return val(null);
   }
+}
+
+/** A list or an object: what is written out as canonical JSON to compare or join. */
+function isStructured(value: JsonValue): value is JsonValue[] | JsonObject {
+  return value !== null && typeof value === "object";
+}
+
+/** Code points in `text`, counted without copying it: a surrogate pair is one. */
+function codePoints(text: string): number {
+  let n = text.length;
+  for (let i = 0; i < text.length - 1; i++) {
+    const hi = text.charCodeAt(i);
+    if (hi >= 0xd800 && hi <= 0xdbff) {
+      const lo = text.charCodeAt(i + 1);
+      if (lo >= 0xdc00 && lo <= 0xdfff) {
+        n--;
+        i++;
+      }
+    }
+  }
+  return n;
 }
 
 /** A list or object an expression built: null when it would be larger than {@link MAX_BUILT_SIZE}. */
@@ -367,11 +467,11 @@ export function evList(node: Extract<Node, { k: ListOp }>, c: Ctx): Evaluated {
   const missing: Missing[] = [];
   let size = 2;
   for (const element of list.value) {
-    if (++c.work > MAX_LIST_WORK) return val(null);
     c.items.push(element);
-    const r = ev(node.b, c);
+    work(c, 1);
+    const r = over(c) ? tooCostly() : ev(node.b, c);
     c.items.pop();
-    if (c.work > MAX_LIST_WORK) return val(null);
+    if (over(c)) return tooCostly();
     if (!r.known) {
       missing.push(r.missing);
       continue;
@@ -383,7 +483,10 @@ export function evList(node: Extract<Node, { k: ListOp }>, c: Ctx): Evaluated {
     if (node.k === "map") {
       const s = sizeOf(r.value, c, MAX_BUILT_SIZE - size);
       size += s + 1;
+      // Building the list is the list operation's work.
       c.work += s >> 6;
+      c.listWork += s >> 6;
+      if (over(c)) return tooCostly();
       if (size > MAX_BUILT_SIZE) return val(null);
       out.push(r.value);
     }
@@ -394,12 +497,12 @@ export function evList(node: Extract<Node, { k: ListOp }>, c: Ctx): Evaluated {
   return val(out);
 }
 
-/** Evaluates a map of named expressions into an object. */
-export function evaluateRecord(nodes: ReadonlyArray<readonly [string, Node]>, env: EvalEnv): Evaluated {
+/** Evaluates a map of named expressions into an object, each drawing on `budget` when one is given. */
+export function evaluateRecord(nodes: ReadonlyArray<readonly [string, Node]>, env: EvalEnv, budget?: EvalBudget): Evaluated {
   const out: JsonObject = {};
   const missing: Missing[] = [];
   for (const [key, node] of nodes) {
-    const r = evaluate(node, env);
+    const r = evaluate(node, env, budget);
     if (r.known) Object.defineProperty(out, key, { value: r.value, enumerable: true, writable: true, configurable: true });
     else missing.push(r.missing);
   }

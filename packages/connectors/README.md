@@ -23,12 +23,16 @@ pass through the engine.
 
 | Operation | Effect | Notes |
 | --- | --- | --- |
-| `files.upload` | write, idempotent | Takes a stored file's reference. Runs once per action: the file carries a private mark made from the action's idempotency key (answered as `mark`), and a retry finds it, in shared drives too. Resumable, in 4 MiB chunks; an interrupted part resumes the same session. Undo: `files.removeCreated`. |
+| `files.upload` | write, idempotent | Takes a stored file's reference. Runs once per action: the file carries a private mark made from the action's idempotency key (answered as `mark`), and a retry finds it, in shared drives too. Resumable, in 4 MiB chunks; an interrupted part resumes the same session. Answers only what Drive and the connector made: `id`, `mark`, and `webViewLink`, `createdTime` and `modifiedTime` when Drive gives them (`files.get` reads the rest). Undo: `files.removeCreated`. |
 | `files.get` | read | A file's details. |
 | `files.list` | read, paged | By name, folder or type; the query is built from checked values, never passed through. |
 | `files.download` | read | Stores the content and answers its reference. Read in 4 MiB ranges and checked against Drive's MD5; Docs, Sheets and Slides are exported to `exportAs`, in one response (5 MiB by default). |
 | `files.trash` | write, idempotent, confirm | Moves a file to Drive's trash (restorable for 30 days). |
-| `files.removeCreated` | write, idempotent | The undo of an upload, given its `fileId` and `mark`: trashes that file only. |
+| `files.removeCreated` | write, idempotent, undo-only | The undo of an upload, given its `fileId` and `mark` from the upload's output: trashes that file only. A flow cannot call it as a step. |
+
+The upload's undo is `{ "fileId": { "resource": ["output", "id"] }, "mark": { "resource": ["output", "mark"] } }`.
+Version 2.0.0 made `files.removeCreated` undo-only and took the name, folder, type and size out of the
+upload's output, where a flow could have set them to another file's id and mark for its undo to read.
 
 Google's 403 rate limits answer `retryable`. Downloads over 16 MiB need the deployment to raise
 `httpLimits.maxTotalResponseBytes`, and files over 25 MiB the file store's `maxBlobBytes`. Two
@@ -43,17 +47,17 @@ person shared with Aaply.
 
 | Operation | Effect | Notes |
 | --- | --- | --- |
-| `pages.create` | write | Under a data source or a page. Notion has no idempotency key, so a lost answer (or a 503, which Notion says may have saved) is `unknown` and the engine asks a person. Undo: `pages.removeCreated`. |
+| `pages.create` | write | Under a data source or a page. Notion has no idempotency key, so a lost answer (or a 503, which Notion says may have saved) is `unknown` and the engine asks a person. Answers only `id`, `url` and `createdTime` (`pages.get` reads the rest). Undo: `pages.removeCreated`. |
 | `pages.get` | read | |
 | `pages.update` | write, idempotent, confirm | Sets the given properties. |
 | `dataSources.query` | read, paged | Notion's own filter and sorts. |
 | `search` | read, paged | Pages or data sources by title. |
-| `pages.removeCreated` | write, idempotent | The undo of a create, given its `pageId` and `createdTime` from the create's output: moves that page to the trash, only if this integration's bot created it and its created time is the same. A page no longer shared with Aaply is refused for a person to check. |
+| `pages.removeCreated` | write, idempotent, undo-only | The undo of a create, given its `pageId` and `createdTime` from the create's output: moves that page to the trash, only if this integration's bot created it and its created time is the same. A page no longer shared with Aaply is refused for a person to check. A flow cannot call it as a step. |
 
-**A flow's undo of `pages.create` must pass both `pageId` and `createdTime`, read from the create's
-output.** A compensate that passes only `pageId`, or reads `createdTime` from anywhere else, still
-publishes, and then every undo is refused (`notion/not-created-here`, or an input error) and
-lands with a person. Write it as:
+**A flow's undo of `pages.create` passes both `pageId` and `createdTime`, read from the create's
+output.** Publish refuses a compensate that leaves one out (`connector/flow-input-mismatch`) or
+reads one from anywhere but the create's output (`connector/flow-undo-unbound`), and both publish
+and Connect refuse `removeCreated` called as a step. Write it as:
 
 ```json
 "compensate": {
@@ -63,16 +67,20 @@ lands with a person. Write it as:
 }
 ```
 
-Version 2.0.0 added `createdTime` to the undo's input; a flow pinned to 1.0.0's `removeCreated`
-answers `connect/contract-mismatch` until it is published again with the input above.
+Version 3.0.0 made `removeCreated` undo-only and narrowed the create's output to what Notion made.
+The create used to answer the parent and properties it was sent, so an undo reading its output
+could still be aimed: create a page under a page the flow read, titled with that page's created
+time, and read both back as the undo's input. Version 2.0.0 added `createdTime` to the undo's
+input. A flow pinned to an older version answers `connect/contract-mismatch` until it is published
+again with the input above.
 
 Property values, filters and blocks are Notion's own JSON, passed on as given. A conflict (409)
 and an overload (529) answer `retryable`. A data source query answers pages only (a wiki's data source
 lists child data sources too). Notion has no private place to mark a page with the action that made
 it (Drive's undo checks such a mark), so the undo is bound by the page's created time instead: an undo
 pointed at another page Aaply made is refused, unless that page was created in the same instant (Notion
-may give created times to the minute only). A flow that calls `removeCreated` as an ordinary step, with
-a page's id and created time it read, can still trash any page this integration made. Not yet checked
+may give created times to the minute only). The undo reads only the create's output, which holds
+nothing the flow chose, so a flow cannot point it at a page it read. Not yet checked
 against a live workspace: whether a reconnect gives the integration a new bot user (then `removeCreated`
 refuses pages made before it). Connect it with Connect's OAuth (`oauthProviders.notion`); Notion's tokens do
 not expire, so Connect renews one only when Notion refuses it.

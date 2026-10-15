@@ -5,7 +5,8 @@
  * a malformed, expired, unknown, mismatched or unreviewed one, one for a
  * connection of another kind of environment, or an undo with an operation
  * that is not declared as one, that is not the undo its write declares, that
- * needs a review or that does not de-duplicate, is refused before anything
+ * needs a review or that does not de-duplicate, or an undo-only operation
+ * sent as a step, is refused before anything
  * is sent, never thrown, and never answered `unknown`. An attempt refused for
  * its contract version is performed when the same attempt comes again in a
  * version the port serves: the refusal performed and claimed nothing.
@@ -205,6 +206,11 @@ export interface ConformanceCall {
 export interface ConformanceUndo extends ConformanceCall {
   /** The action id of the write whose operation declares this undo. */
   undoes: string;
+  /**
+   * Whether its operation is undo-only (`undoOnly` in its contract). Required, so a port's
+   * suite says it for every undo: when true, the suite checks that it is refused as a step.
+   */
+  undoOnly: boolean;
 }
 
 /** What `actionPortConformance` exercises: a read and a write the port serves, and how to watch what it performed. */
@@ -576,6 +582,16 @@ export function actionPortConformance(port: ActionPort, options: ActionPortConfo
           await refused(`${undo.action} with its own idempotency`, await asUndo(undo, { risk: "none", idempotent: false }), ["connect/idempotency-mismatch"]);
           await refused(`${undo.action} marked safe to send again`, await asUndo(undo, { risk: "none", idempotent: true }), ["connect/idempotency-mismatch"]);
         }
+      },
+    });
+  }
+  const undoOnly = undos.filter((u) => u.undoOnly === true);
+  if (undoOnly.length > 0) {
+    cases.push({
+      name: "refuses an undo-only operation sent as a step",
+      async run() {
+        // As a step it is bound to nothing one write made: it would act on whatever the flow names.
+        for (const undo of undoOnly) await refused(`${undo.action} as a step`, await envelope(undo, "write"), ["connect/effect-mismatch"]);
       },
     });
   }

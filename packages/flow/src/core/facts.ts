@@ -9,10 +9,10 @@ import { type CompiledStep, type CompiledRule, type CompiledAction, factNode } f
 import { suppliedItems, invalidateItems, recomputeField } from "../core-items-stale.js";
 import { applyItemRule } from "../core-items-rules.js";
 import { type Node } from "../expr.js";
-import { truthy } from "../expr-eval.js";
+import { isTooCostly } from "../expr-eval.js";
 import { safeEqual } from "../hash.js";
 import { type JsonValue, own, type JsonObject, jsonByteLength, formatPath, jsonEqual, cloneJson } from "../json.js";
-import { confirmDigest, readable } from "../reader.js";
+import { checkIssue, confirmDigest, otherSchemas, readable, TOO_COSTLY_ISSUE, unchangedValid } from "../reader.js";
 import { validateValue } from "../schema.js";
 import { secretsOf } from "../secrets.js";
 import type { Provenance, FactState, ActorRef } from "../state.js";
@@ -56,6 +56,7 @@ export function applyRule(this: Machine, step: CompiledStep, rule: CompiledRule,
     // already known) keeps its fact, rather than reading as null.
     if (node.k === "payload" && !payloadHas(payload, node.path)) continue;
     const r = this.eval(node, { payload }, item);
+    if (isTooCostly(r)) reject("flow/expr-too-costly", `"${fact}" took too much work to work out`, [fact]);
     if (!r.known) reject("flow/rule-incomplete", `"${fact}" depends on something not known yet`, r.missing.facts);
     else if (fact.includes(".") || this.flow.collections.has(fact)) itemValues.push([fact, r.value, node]);
     else values.push([fact, r.value]);
@@ -179,7 +180,7 @@ export function applyFacts(this: Machine, values: Array<[string, FactWrite]>, pr
       accepted.push(name);
       continue;
     }
-    const issues = validateValue(fact.schema, value).map((i) => ({ code: i.code, message: i.message, path: formatPath(i.path) }));
+    const issues = validateValue(fact.schema, value, [], this.patternBudget).map((i) => ({ code: i.code, message: i.message, path: formatPath(i.path) }));
     const assisted = provenance === "model" ? this.assisting.get(name) : undefined;
     if (assisted !== undefined && issues.length > 0) {
       // An assistant's value that does not fit is not written; the person is told why.
@@ -217,8 +218,8 @@ export function applyFacts(this: Machine, values: Array<[string, FactWrite]>, pr
     if (current.status !== "valid" && current.status !== "needs_confirmation") continue;
     const issues = [];
     for (const check of fact.checks) {
-      const r = this.eval(check.test, { value: current.value ?? null });
-      if (r.known && !truthy(r.value)) issues.push({ code: check.code, message: check.message, path: "" });
+      const issue = checkIssue(this.eval(check.test, { value: current.value ?? null }), check);
+      if (issue) issues.push(issue);
     }
     if (issues.length === 0) continue;
     if (replaced.has(name)) {
@@ -310,11 +311,14 @@ export function recomputeDerived(this: Machine): void {
     const r = this.eval(fact.derive!);
     const prev = own(s.facts, name);
     let next: FactState;
-    if (!r.known) next = { status: "missing", rev: prev?.rev ?? 0 };
+    // Too costly to work out is a failure, never a value and never "not known yet".
+    if (isTooCostly(r)) next = { status: "invalid", issues: [{ ...TOO_COSTLY_ISSUE }], provenance: "derived", rev: this.rev };
+    else if (!r.known) next = { status: "missing", rev: prev?.rev ?? 0 };
+    else if (unchangedValid(prev, r.value, otherSchemas(this.flow, this.state, this.event))) continue;
     else if (jsonByteLength(r.value) > this.flow.limits.maxFactBytes) {
       next = { status: "invalid", issues: [{ code: "too-large", message: "This is too large.", path: "" }], provenance: "derived", rev: this.rev };
     } else {
-      const issues = validateValue(fact.schema, r.value).map((i) => ({ code: i.code, message: i.message, path: formatPath(i.path) }));
+      const issues = validateValue(fact.schema, r.value, [], this.patternBudget).map((i) => ({ code: i.code, message: i.message, path: formatPath(i.path) }));
       next = issues.length > 0 ? { status: "invalid", value: r.value, issues, provenance: "derived", rev: this.rev } : { status: "valid", value: r.value, provenance: "derived", rev: this.rev };
     }
     if (prev && prev.status === next.status && jsonEqual(prev.value, next.value)) continue;

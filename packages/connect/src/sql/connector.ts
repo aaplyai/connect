@@ -1,8 +1,9 @@
 /**
  * A declared SQL connector as a kit connector: each operation's handler runs
  * its statement through the executor. The kit's port then makes every check
- * it makes for code connectors (effect, undo pairing, risk floor, input and
- * output schemas, the connection, its environment, the replay claim), and
+ * it makes for code connectors (effect, undo pairing, an undo-only operation
+ * sent as a step, risk floor, input and output schemas, the connection, its
+ * environment, the replay claim), and
  * the operation contract carries the statement's digest as its
  * `implementation`, so a pin covers the SQL.
  */
@@ -26,6 +27,7 @@ export function sqlConnector(definition: SqlConnectorDefinition, executor: SqlEx
       output: op.output,
       ...(op.idempotent !== undefined ? { idempotent: op.idempotent } : {}),
       ...(op.compensate !== undefined ? { compensate: op.compensate } : {}),
+      ...(op.undoOnly !== undefined ? { undoOnly: op.undoOnly } : {}),
       ...(op.irreversible !== undefined ? { irreversible: op.irreversible } : {}),
       ...(op.riskFloor !== undefined ? { riskFloor: op.riskFloor } : {}),
       implementation,

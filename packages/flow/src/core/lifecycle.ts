@@ -12,9 +12,11 @@ import { truthy } from "../expr-eval.js";
 import { fingerprint, safeEqual } from "../hash.js";
 import { own, type JsonObject } from "../json.js";
 import { liveItems, liveItem } from "../items.js";
-import { confirmDigest } from "../reader.js";
+import { checkIssue, confirmDigest } from "../reader.js";
 import { type RunRevokedEvent, type TimerFiredEvent, type ActionOutcome, type ActionSettledEvent, EVENT_VERSION, type ExternalEvent } from "../state.js";
 import { type Machine, reject, MAX_UPDATE_MESSAGE, type MoveInput, type StepAccepted } from "../core.js";
+import { unsentError } from "./advance.js";
+import { undoInDoubt } from "./settle.js";
 
 export function resume(this: Machine): void {
   delete this.state.lapsed;
@@ -90,8 +92,8 @@ export function moved(this: Machine, move: MoveInput): StepAccepted {
     if (!fact || !current || (current.status !== "valid" && current.status !== "needs_confirmation")) continue;
     const issues = [];
     for (const check of fact.checks) {
-      const r = this.eval(check.test, { value: current.value ?? null });
-      if (r.known && !truthy(r.value)) issues.push({ code: check.code, message: check.message, path: "" });
+      const issue = checkIssue(this.eval(check.test, { value: current.value ?? null }), check);
+      if (issue) issues.push(issue);
     }
     if (issues.length > 0) this.putFact(name, { ...current, status: "invalid", issues, rev: this.rev });
   }
@@ -232,7 +234,13 @@ export function resend(this: Machine, effectId: string): boolean {
       delete s.inflight[effectId];
       return true;
     }
-    this.startEffect("compensate", action, this.frozenInput(action.compensate!.input, { input: resource.input, output: resource.output }), attempt, effectId, inflight.target, resource.item);
+    const input = this.frozenInput(action.compensate!.input, { input: resource.input, output: resource.output });
+    if (!input.known) {
+      delete s.inflight[effectId];
+      undoInDoubt(this, resource, effectId, action.name, unsentError(input));
+      return true;
+    }
+    this.startEffect("compensate", action, input.value as JsonObject, attempt, effectId, inflight.target, resource.item);
     return true;
   }
   const item = own(s.inflight, inflight.target ?? "")?.item;
@@ -241,7 +249,13 @@ export function resend(this: Machine, effectId: string): boolean {
     delete s.inflight[effectId];
     return true;
   }
-  this.startEffect("reconcile", action, this.frozenInput(action.reconcile!.input, { input: res.input }), attempt, effectId, inflight.target, item);
+  const input = this.frozenInput(action.reconcile!.input, { input: res.input });
+  if (!input.known) {
+    delete s.inflight[effectId];
+    this.markInDoubt(action, inflight.target!, unsentError(input));
+    return true;
+  }
+  this.startEffect("reconcile", action, input.value as JsonObject, attempt, effectId, inflight.target, item);
   return true;
 }
 

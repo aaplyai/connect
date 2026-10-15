@@ -9,10 +9,11 @@
  *   compiler, views and export masking use), for the toolkit's masking and
  *   `flow diff`.
  * - `FLOW_HINTS`: the hint table the toolkit extends.
- * - `checkFlowCalls`, `readCallEnd`, `CALL_ACTOR`, `CALL_START_RETRIES`: the
- *   call rules the toolkit's scenarios replay.
+ * - `readCallEnd`, `CALL_ACTOR`, `CALL_START_RETRIES`: the call rules the
+ *   toolkit's scenarios replay (`checkFlowCalls` is public: a host's own
+ *   catalog runs it at publish).
  */
 
-export { CALL_ACTOR, CALL_START_RETRIES, checkFlowCalls, readCallEnd } from "../calls.js";
+export { CALL_ACTOR, CALL_START_RETRIES, readCallEnd } from "../calls.js";
 export { FLOW_HINTS } from "../hints.js";
 export { secretsOf, type SecretTracer } from "../secrets.js";

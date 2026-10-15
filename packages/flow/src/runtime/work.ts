@@ -122,6 +122,8 @@ export async function runInline(rt: RuntimeContext, scope: Scope, state: RunStat
   if (rt.store.lanes) items = (await claimInline(rt, scope, items, chain)) as ActionItem[];
   if (items.length === 0) return fromCalls;
   const calls = items.map((item) => execute(rt, item, flow, state));
+  // The run as committed, unless a call item recorded something on it since.
+  const committed = all.every(isActionItem) ? state : undefined;
   const record = async (next: Chain): Promise<Applied | null> => {
     let latest: Applied | null = null;
     for (let i = 0; i < items.length; i++) {
@@ -131,7 +133,9 @@ export async function runInline(rt: RuntimeContext, scope: Scope, state: RunStat
       if (performed === null) continue;
       await renew(rt, item);
       try {
-        latest = await recordOutcome(rt, item, performed, next);
+        // The run as this request committed or last recorded it, so the outcome need not load it again. After the
+        // request answered, the request has usually moved the run since it committed: that state is not used then.
+        latest = await recordOutcome(rt, item, performed, next, latest?.state ?? (next === NO_INLINE ? undefined : committed));
       } catch (error) {
         // The row stays leased; when the lease ends a worker settles it instead.
         rt.observer.error?.(error, "inline");
@@ -142,8 +146,19 @@ export async function runInline(rt: RuntimeContext, scope: Scope, state: RunStat
     return latest;
   };
   if (await within(Promise.all(calls), chain.deadline - rt.clock.now())) return record(deeper(chain));
-  void record(NO_INLINE).catch((error: unknown) => rt.observer.error?.(error, "inline"));
+  const recording = record(NO_INLINE).catch((error: unknown) => rt.observer.error?.(error, "inline"));
+  rt.background.add(recording);
+  void recording.finally(() => rt.background.delete(recording));
   return null;
+}
+
+/**
+ * Waits until every outcome being recorded after its request answered is
+ * recorded, including any started meanwhile. Never throws: a recording
+ * that fails goes to `observer.error` as `inline`.
+ */
+export async function drain(rt: RuntimeContext): Promise<void> {
+  while (rt.background.size > 0) await Promise.allSettled(rt.background);
 }
 
 /**
@@ -313,7 +328,7 @@ export async function record(rt: RuntimeContext, item: ActionItem, performed: Pe
  * completion is recorded as disputed, so neither outcome is lost and a
  * person checks the effect.
  */
-export async function recordOutcome(rt: RuntimeContext, item: ActionItem, performed: Performed, chain: Chain): Promise<Applied> {
+export async function recordOutcome(rt: RuntimeContext, item: ActionItem, performed: Performed, chain: Chain, loaded?: RunState): Promise<Applied> {
   const outcome = performed.outcome;
   // The lane signal is about the service's answer, so it rides along however the run takes it.
   const done: Housekeeping = { outboxDone: [item.id], ...signalsOf(rt, item, performed) };
@@ -321,7 +336,7 @@ export async function recordOutcome(rt: RuntimeContext, item: ActionItem, perfor
   // attempt's timeout, whatever the run's format.
   const repeat = (state: RunState) => outcome.status === "pending" && own(state.inflight, item.effect.effectId)?.attempt === item.effect.attempt && own(state.inflight, item.effect.effectId)?.pending === true;
   const timed = performed.latencyMs !== undefined ? { latencyMs: performed.latencyMs } : {};
-  const applied = await apply(rt, item.scope, item.runId, { build: (state) => (repeat(state) ? null : settled(rt, item, outcome, performed.windowMs)), housekeeping: done, chain, deferHousekeeping: true, ...timed });
+  const applied = await apply(rt, item.scope, item.runId, { build: (state) => (repeat(state) ? null : settled(rt, item, outcome, performed.windowMs)), housekeeping: done, chain, deferHousekeeping: true, ...timed, ...(loaded ? { loaded } : {}) });
   if (!applied.result?.accepted || applied.result.changed) return applied;
   const effect = item.effect;
   const first = claimOf(outcome, effect.effect) !== null ? await earlierCompletion(rt, item.scope, item.runId, effect.effectId, effect.attempt) : null;
@@ -382,7 +397,7 @@ export async function execute(rt: RuntimeContext, item: ActionItem, flow: Compil
   const dispatch = item.context.dispatch ?? (state ? dispatchFor(state, SYSTEM_ACTOR, effect) : { revision: 0, actor: null });
   const revision = item.context.dispatch?.revision;
   // The input must be what the action accepts, and a review must still be current: otherwise nothing is sent.
-  const refused = refuseBeforeSending(flow, effect, dispatch, rt.clock.now());
+  const refused = refuseBeforeSending(flow, effect, dispatch, rt.clock.now(), rt.operations);
   if (refused) return { outcome: refused, fromPort: false };
   const admitted = await Promise.resolve()
     .then(() =>

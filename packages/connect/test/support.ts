@@ -5,7 +5,7 @@ import type { ActionOutcome, ActionPort, ActionPortDescription, ApprovedAction }
 
 export const API = "https://api.notes.test/v1";
 
-/** A notes service: a read, a write that does not de-duplicate (with an undo), and its undo. `tag` marks which version answered. */
+/** A notes service: a read, a write that does not de-duplicate (with an undo), and its undo, which is undo-only. `tag` marks which version answered. */
 export function notesConnector(version: string, tag: string, extra: { slowMs?: number } = {}): Connector {
   return defineConnector({
     id: "notes",
@@ -41,6 +41,7 @@ export function notesConnector(version: string, tag: string, extra: { slowMs?: n
         title: "Remove a note",
         effect: "write",
         idempotent: true,
+        undoOnly: true,
         input: { type: "object" },
         output: { type: "object" },
         handler: async (_input, ctx) => (await ctx.http({ method: "DELETE", url: `${API}/notes/n1` })).ensureOk().json(),

@@ -37,7 +37,7 @@ import { canonicalJson, cloneJson, formatPath, jsonByteLength, jsonEqual, jsonPo
 import { carriedKey, carryItems, listsAskedAgain, staleTemplate, TOO_LARGE, type CarriedItems } from "./migrate-items.js";
 import type { CompiledMigration } from "./migration-def.js";
 import { readable, RunReader } from "./reader.js";
-import { validateValue } from "./schema.js";
+import { MAX_PATTERN_WORK, validateValue, type PatternBudget } from "./schema.js";
 import { CORE_VERSION, EVENT_VERSION, isTerminal, RUN_STATE_VERSION, type Confirmation, type FactState, type Provenance, type RunMigratedEvent, type RunState, type RunStatus, type VersionRef } from "./state.js";
 
 /** Most moves one run may make; also stops a rollback and roll-forward from bouncing a run. */
@@ -338,7 +338,7 @@ interface Classified {
 }
 
 /** Places each fact of `to` per the carry rules (see the module comment). */
-function classifyFacts(from: CompiledFlow, to: CompiledFlow, migration: CompiledMigration | undefined, state: RunState, rev: number): Classified {
+function classifyFacts(from: CompiledFlow, to: CompiledFlow, migration: CompiledMigration | undefined, state: RunState, rev: number, budget: PatternBudget): Classified {
   const facts: Record<string, FactState> = {};
   const outcomes: Classified["outcomes"] = new Map();
   const source = new Map<string, string>();
@@ -386,7 +386,7 @@ function classifyFacts(from: CompiledFlow, to: CompiledFlow, migration: Compiled
       put(missing(), "dropped", "sensitivity");
       continue;
     }
-    const fits = (value: JsonValue): boolean => jsonByteLength(value) <= to.limits.maxFactBytes && validateValue(fact.schema, value).length === 0;
+    const fits = (value: JsonValue): boolean => jsonByteLength(value) <= to.limits.maxFactBytes && validateValue(fact.schema, value, [], budget).length === 0;
     const stale = (value: JsonValue | undefined): FactState => {
       const keep = value !== undefined && fits(value);
       return { status: "stale", rev: old.status === "stale" && keep === (old.value !== undefined) ? old.rev : rev, ...(keep ? { value: cloneJson(value) } : {}) };
@@ -433,7 +433,7 @@ function classifyFacts(from: CompiledFlow, to: CompiledFlow, migration: Compiled
       outcome = "invalid";
       reason = "too-large";
     } else {
-      const issues = validateValue(fact.schema, value).map((i) => ({ code: i.code, message: i.message, path: formatPath(i.path) }));
+      const issues = validateValue(fact.schema, value, [], budget).map((i) => ({ code: i.code, message: i.message, path: formatPath(i.path) }));
       // An assistant's value the person has not confirmed yet stays unconfirmed: a move never says yes for them.
       const unconfirmed = old.status === "needs_confirmation" && old.assist !== undefined;
       const status = issues.length > 0 ? "invalid" : old.provenance === "model" && (fact.def.confirm || unconfirmed) ? "needs_confirmation" : "valid";
@@ -576,8 +576,10 @@ function transition(from: CompiledFlow, to: CompiledFlow, state: RunState, ev: R
     waits: { kept: [] },
     after: { current: state.current, status: state.status, starts: [], releases: [] },
   };
-  const classified = classifyFacts(from, to, migration, state, rev);
-  const carried = from.collections.size > 0 || to.collections.size > 0 ? carryItems(from, to, migration, state, rev) : null;
+  // Every value the move checks, facts and item fields alike, draws on one budget of pattern work.
+  const budget: PatternBudget = { left: MAX_PATTERN_WORK };
+  const classified = classifyFacts(from, to, migration, state, rev, budget);
+  const carried = from.collections.size > 0 || to.collections.size > 0 ? carryItems(from, to, migration, state, rev, budget) : null;
   if (carried) {
     for (const [name, list] of Object.entries(carried.lists)) {
       classified.facts[name] = list;

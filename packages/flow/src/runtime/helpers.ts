@@ -70,6 +70,35 @@ export function portFailure(error: unknown, port: string): FlowError {
   return failure;
 }
 
+/**
+ * SQLSTATEs a retry can outlive beyond classes 08 and 57P: out of memory,
+ * disk or connections (53000, 53100, 53200, 53300; not 53400, a configured
+ * limit a retry meets again), and a transaction lost to a concurrent one.
+ */
+const TRANSIENT_SQLSTATE = new Set(["53000", "53100", "53200", "53300", "40001", "40P01"]);
+
+/** Network errors a retry can outlive (Node's `code`). */
+const TRANSIENT_ERRNO = new Set(["EPIPE", "ECONNRESET", "ECONNREFUSED", "ECONNABORTED", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EAI_AGAIN"]);
+
+/**
+ * Whether a store's error is one a retry can outlive: the connection or the
+ * network failed (Node's network error codes, node-postgres's messages for
+ * a dead or late connection), the database is shutting down or starting
+ * (SQLSTATE class 08, 57P01 to 57P03) or out of resources (53000 to 53300),
+ * or a transaction lost to a concurrent one (40001, 40P01). Anything else (a missing table, a
+ * refused permission, a broken constraint, a bug in a custom store) is not,
+ * and a retry would meet it again.
+ */
+export function isTransient(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const code = (error as { code?: unknown }).code;
+  if (typeof code === "string") {
+    if (TRANSIENT_ERRNO.has(code) || /^08[0-9A-Z]{3}$/.test(code) || /^57P0[1-3]$/.test(code) || TRANSIENT_SQLSTATE.has(code)) return true;
+  }
+  const message = error instanceof Error ? error.message : "";
+  return /^(Connection terminated unexpectedly|Connection terminated due to connection timeout|Client has encountered a connection error and is not queryable|timeout exceeded when trying to connect)$/.test(message);
+}
+
 export function isNotFound(error: unknown): boolean {
   return error instanceof FlowError && error.code === "not_found";
 }

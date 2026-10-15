@@ -43,7 +43,9 @@ export function laneOps(m: MemoryContext): LaneOps {
         const limits = limitsFor(m, scope, lane);
         const state = laneStates.get(key);
         const controlled = isControlled(limits, state);
-        const quota = laneQuota(limits, state, controlled ? inFlightOf(m, scope, lane, o.now, deciding) : 0, o.now);
+        // Only claimed items are in flight here: a reservation not yet decided, this call's or another
+        // turn's, is counted once it is granted (as claim_inline does).
+        const quota = laneQuota(limits, state, controlled ? inFlightOf(m, scope, lane, o.now, true) : 0, o.now);
         if (1 > (priority === "interactive" ? quota.interactive : quota.background)) {
           if (quota.halfOpen && limits) setLaneState(m, scope, lane, state, afterGrant(limits, state, 0, o.now, true));
           refuse(quota.blocked?.reason ?? "capacity", quota.blocked?.retryAfterMs);
@@ -162,12 +164,13 @@ export function isDue(item: OutboxItem, now: number) {
   return item.availableAt <= now && (item.leaseUntil === undefined || item.leaseUntil <= now);
 }
 
-export function inFlightOf(m: MemoryContext, scope: Scope, lane: string, now: number, except?: Set<string>) {
+/** A lane's items with a live lease; `claimedOnly` leaves out reservations (claims 0) not yet decided. */
+export function inFlightOf(m: MemoryContext, scope: Scope, lane: string, now: number, claimedOnly = false) {
   const { outbox } = m;
   const sk = scopeKey(scope);
   let n = 0;
   for (const item of outbox.values()) {
-    if (laneOf(item) === lane && scopeKey(item.scope) === sk && item.leaseUntil !== undefined && item.leaseUntil > now && !except?.has(item.id)) n++;
+    if (laneOf(item) === lane && scopeKey(item.scope) === sk && item.leaseUntil !== undefined && item.leaseUntil > now && (!claimedOnly || item.claims > 0)) n++;
   }
   return n;
 }

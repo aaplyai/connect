@@ -26,7 +26,8 @@ import { type InputVouch, inputVouch } from "../runtime-blobs.js";
 import type { FlowView } from "../view.js";
 import * as privacy from "../privacy-runtime.js";
 import { type RuntimeOptions, type RuntimeLimits, DEFAULT_RUNTIME_LIMITS } from "../runtime.js";
-import { portFailure } from "./helpers.js";
+import { isTransient, portFailure } from "./helpers.js";
+import { FlowError } from "../errors.js";
 import { revokedOf } from "../versions.js";
 
 export const SYSTEM_ACTOR: ActorRef = { kind: "system", id: "system:runtime", roles: [] };
@@ -158,6 +159,8 @@ export class RuntimeContext {
   /** The host's vouch for the file references a caller gives, asked after the request's own checks (ADR-0008 §4). */
   readonly vouch: InputVouch;
   readonly workerId: string;
+  /** Outcomes of inline calls still being recorded after their request answered (`drain` waits for them). */
+  readonly background = new Set<Promise<unknown>>();
   /** Inline calls this instance has reserved for: each call's reservations get an owner of their own. */
   inlineCalls = 0;
   withdrawals = 0;
@@ -173,8 +176,8 @@ export class RuntimeContext {
 
   constructor(options: RuntimeOptions) {
     this.catalog = typedCatalog(options.catalog);
-    // A workspace of an unknown version (a newer engine's) is refused as it loads.
-    this.store = versionCheckedStore(options.store);
+    // A workspace of an unknown version (a newer engine's) is refused as it loads, and a store failure is `unavailable`.
+    this.store = guardedStore(versionCheckedStore(options.store), (error) => this.observer.error?.(error, "store"));
     this.actions = options.actions;
     this.keys = options.keys;
     this.envelopes = options.envelopes;
@@ -239,6 +242,39 @@ export function typedCatalog(inner: FlowCatalog): FlowCatalog {
     },
   });
   return typed;
+}
+
+/**
+ * The store, with the failures a retry can outlive typed: a driver's error
+ * that is transient (`isTransient`: the database restarting, a connection
+ * reset) reaches the caller as `unavailable`, with the driver's error as its
+ * `cause`, so a host answers 503 and the client tries again; each is told to
+ * `onError` first (the observer's `error`, as `store`), so none is silent.
+ * Any other error (a missing table, a refused permission, a bug) passes
+ * unchanged, as does a `FlowError`, and a host answers it 500. Only the
+ * store's own methods are wrapped; its `lanes`, `blobs` and `privacy`
+ * operations are read as they are, where the runtime handles their failures
+ * itself, and so is `health`, which reports the store's own error code to
+ * operators.
+ */
+export function guardedStore<S extends RunStore>(store: S, onError: (error: unknown) => void): S {
+  return new Proxy(store, {
+    get(target, prop) {
+      const value: unknown = Reflect.get(target, prop, target);
+      if (typeof value !== "function") return value;
+      const method = (value as (...a: unknown[]) => unknown).bind(target);
+      if (prop === "health") return method;
+      return async (...args: unknown[]) => {
+        try {
+          return await method(...args);
+        } catch (error) {
+          if (error instanceof FlowError || !isTransient(error)) throw error;
+          onError(error);
+          throw portFailure(error, "store");
+        }
+      };
+    },
+  });
 }
 
 /**

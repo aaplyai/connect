@@ -340,8 +340,9 @@ export async function clearOffer(rt: RuntimeContext, t: Turn): Promise<void> {
   await takeOffer(rt, t.ctx, t.workspaceId, offer.id);
 }
 
-export async function turnView(rt: RuntimeContext, t: Turn): Promise<WorkspaceView> {
-  return t.touched ? workspace(rt, t.ctx, t.workspaceId) : workspaceView(rt, t.ctx, t.ws, t.workspaceId);
+/** The workspace at the end of a turn; `known` is a run the turn has just loaded or recorded, shown without loading it again. */
+export async function turnView(rt: RuntimeContext, t: Turn, known?: Loaded): Promise<WorkspaceView> {
+  return t.touched ? workspace(rt, t.ctx, t.workspaceId, known) : workspaceView(rt, t.ctx, t.ws, t.workspaceId, undefined, known);
 }
 
 export function setOutcome(t: Turn, outcome: TurnOutcome, chosen?: TurnRecord["chosen"]): void {

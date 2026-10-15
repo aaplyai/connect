@@ -70,6 +70,8 @@ const PRIVATE_SUFFIXES: readonly string[] = [
   "xip.io",
   "localtest.me",
   "lvh.me",
+  "vcap.me",
+  "traefik.me",
 ];
 
 const MAX_HOST_LENGTH = 253;

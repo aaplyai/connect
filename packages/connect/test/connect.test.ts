@@ -1,8 +1,11 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { BLOB_REF_SCHEMA, blobDigest, operationDigest, signApprovedAction, type BlobRef, type ApprovedAction, type ApprovedActionSigner, type Scope } from "@aaply/action-contract";
 import { actionPortConformance, CONFORMANCE_SCOPE, draftApprovedAction, type ApprovedActionDraft } from "@aaply/action-contract/conformance";
-import { defineConnector, memoryBlobStore, operationContractOf } from "@aaply/connector-sdk";
-import type { MockFetch } from "@aaply/connector-sdk/testing";
+import { defineConnector, memoryBlobStore, operationContractOf, operationContracts } from "@aaply/connector-sdk";
+import { mockFetch, type MockFetch } from "@aaply/connector-sdk/testing";
+import { gmail } from "@aaply/connectors/gmail";
+import { googleDrive } from "@aaply/connectors/google-drive";
+import { notion } from "@aaply/connectors/notion";
 import { createConnect, type Connect } from "@aaply/connect";
 import { serveConnect } from "@aaply/connect/http";
 import { postgresUnavailable, startTestDatabase, testEngineKeys, testKeyProvider, type TestDatabase } from "@aaply/connect/testing";
@@ -63,13 +66,52 @@ describe.skipIf(postgresUnavailable())("Connect", () => {
         read: { action: "notes.get", input: { id: "n1" }, role: null },
         write: { action: "notes.create", input: { title: "Hi" }, role: null, idempotent: false },
         performedWrite: { action: "notes.create", input: { title: "Hi" }, role: null, idempotent: false },
-        undos: [{ action: "notes.remove", input: {}, role: null, undoes: "notes.create", idempotent: true }],
+        undos: [{ action: "notes.remove", input: {}, role: null, undoes: "notes.create", idempotent: true, undoOnly: true }],
         performed: () => service.calls.length,
       });
       expect(cases.length).toBeGreaterThan(10);
       for (const c of cases) await c.run();
     } finally {
       await served.close();
+    }
+  });
+
+  it("refuses every undo-only operation of the first-party connectors called as a step, and sends nothing", async () => {
+    const connectors = [gmail, googleDrive, notion];
+    const contracts = operationContracts(connectors);
+    const undoOnly = Object.keys(contracts).filter((action) => contracts[action]!.undoOnly === true);
+    expect(undoOnly.sort()).toEqual(["google-drive.files.removeCreated", "notion.pages.removeCreated"]);
+    // Input each would accept, so only the step refusal stands between it and the service.
+    const inputs: Record<string, Record<string, string>> = {
+      "google-drive.files.removeCreated": { fileId: "file_1", mark: "a".repeat(40) },
+      "notion.pages.removeCreated": { pageId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", createdTime: "2026-10-10T04:00:00.000Z" },
+    };
+    const sent = mockFetch({});
+    const other = await make({ connectors, fetch: sent });
+    const s = { ...scope, appId: "undo-only" };
+    const made: string[] = [];
+    try {
+      for (const c of connectors) {
+        await other.admin.install(s, c.id);
+        const { id } = await other.admin.createConnection({ scope: s, connectorId: c.id, owner: { business: true }, grantedScopes: c.auth.kind === "oauth2" ? [...c.auth.scopes] : [], secret: { accessToken: "token" } });
+        made.push(id);
+      }
+      for (const action of undoOnly) {
+        const input = inputs[action]!;
+        const asStep = await sign({ scope: s, action, effect: "write", input, idempotent: true, effectId: `e-${++seq}` });
+        expect(await other.perform(asStep), action).toMatchObject({ status: "final", error: { code: "connect/effect-mismatch" } });
+        expect(sent.calls, action).toEqual([]);
+        // The same call as its write's undo does reach the service: the refusal above is the marker's, not the setup's.
+        const write = Object.keys(contracts).find((a) => contracts[a]!.compensate === action);
+        expect(write, action).toBeDefined();
+        await other.perform(await sign({ scope: s, action, effect: "write", input, idempotent: true, effectId: `e-${++seq}`, purpose: "compensate", target: "t", undoes: write! }));
+        expect(sent.calls.length, action).toBeGreaterThan(0);
+        sent.calls.splice(0);
+      }
+    } finally {
+      // Their secrets go too, so the store holds only what the other tests made.
+      for (const id of made) await other.admin.revokeConnection(s.tenantId, id);
+      await other.close();
     }
   });
 

@@ -6,11 +6,11 @@
 
 import { fieldAddress, itemOfKey, keyOf, nameOfKey, splitTemplate } from "./address.js";
 import { actionNode, factNode, type CompiledAction, type CompiledFlow, type CompiledStep } from "./compile.js";
-import { evaluate, evaluateRecord, truthy, type EvalEnv, type Evaluated, type Missing, type Read } from "./expr-eval.js";
+import { evaluate, evaluateRecord, isTooCostly, truthy, type EvalBudget, type EvalEnv, type Evaluated, type Missing, type Read } from "./expr-eval.js";
 import { fingerprint } from "./hash.js";
 import { fieldState, isLiveItem, readList, readRows, readSelf } from "./items.js";
 import { canonicalJson, jsonEqual, own, type JsonObject, type JsonValue } from "./json.js";
-import type { ActionError, ActorRef, CallState, FactState, ResultState, RunState } from "./state.js";
+import type { ActionError, ActorRef, CallState, FactIssue, FactState, ResultState, RunState } from "./state.js";
 
 export type StepStatus =
   | { kind: "blocked"; missing: Missing }
@@ -77,10 +77,65 @@ export function readable(fact: FactState | undefined): Read {
   return { known: false };
 }
 
+/** The issue of a value whose check or derivation was too costly to work out: it fails, never passes. */
+export const TOO_COSTLY_ISSUE: Readonly<FactIssue> = Object.freeze({ code: "too-costly", message: "This took too much work to work out.", path: "" });
+
+/** Whether a fact or field is not known because working it out, or checking it, was too costly. */
+export function wasTooCostly(fact: FactState | undefined): boolean {
+  return fact !== undefined && fact.status !== "valid" && fact.status !== "declined" && (fact.issues ?? []).some((i) => i.code === TOO_COSTLY_ISSUE.code);
+}
+
+/**
+ * A fact or field as an expression reads it (`address` names it): what was
+ * too costly to work out is too costly to read, so everything that reads it
+ * fails closed (see `Missing.costly`), never treats it as merely not known.
+ */
+export function readFor(fact: FactState | undefined, address: string): Read {
+  const r = readable(fact);
+  return r.known || !wasTooCostly(fact) ? r : { known: false, missing: { facts: [address], results: [], costly: true } };
+}
+
+/**
+ * Whether values checked earlier may have been checked against another
+ * version's schemas: on a move to another version, or when the run's state
+ * names a flow other than the one stepping it.
+ */
+export function otherSchemas(flow: CompiledFlow, state: RunState, event: { type: string }): boolean {
+  return event.type === "run.migrated" || state.flowHash !== flow.hash;
+}
+
+/**
+ * Whether a derived value just worked out is the one `prev` already holds as
+ * valid, so it needs no checking again: its schema is the same while the
+ * flow is (`moving`, from {@link otherSchemas}, checks it afresh).
+ */
+export function unchangedValid(prev: FactState | undefined, value: JsonValue, moving: boolean): prev is FactState {
+  return !moving && prev !== undefined && prev.status === "valid" && prev.provenance === "derived" && prev.value !== undefined && jsonEqual(prev.value, value);
+}
+
+/**
+ * A check's issue: its own when it is false, {@link TOO_COSTLY_ISSUE} when it
+ * was too costly to work out, and none when it holds or waits on something
+ * not known yet.
+ */
+export function checkIssue(r: Evaluated, check: { code: string; message: string }): FactIssue | null {
+  if (r.known) return truthy(r.value) ? null : { code: check.code, message: check.message, path: "" };
+  return isTooCostly(r) ? { ...TOO_COSTLY_ISSUE } : null;
+}
+
+/**
+ * Expression work one reader's evaluations share: a step of the core, or
+ * one rendering of a view (about 0.25 s at worst). Past it, every further
+ * evaluation is too costly (see `Missing.costly`) and fails closed.
+ */
+export const MAX_STEP_EVAL_WORK = 4_000_000;
+
 export class RunReader {
   readonly flow: CompiledFlow;
   state: RunState;
   now: number;
+  /** The expression work this reader's evaluations draw on. */
+  readonly evalBudget: EvalBudget = { left: MAX_STEP_EVAL_WORK };
   /** A call whose end rule is being applied: its own fills are not locked yet. */
   protected settlingCall: string | null = null;
 
@@ -99,8 +154,9 @@ export class RunReader {
     const s = this.state;
     const of = (name: string) => (item !== undefined && this.flow.actions.get(name)?.forEach !== undefined ? item : undefined);
     const env: EvalEnv = {
-      fact: (name) => readable(own(s.facts, name)),
+      fact: (name) => readFor(own(s.facts, name), name),
       isKnown: (name) => own(s.facts, name)?.status === "valid",
+      costly: (name) => wasTooCostly(own(s.facts, name)),
       result: (name) => {
         const res = this.currentResult(name, of(name));
         return res && res.status === "ok" ? { known: true, value: res.output ?? null } : { known: false };
@@ -125,12 +181,35 @@ export class RunReader {
   }
 
   eval(node: Parameters<typeof evaluate>[0], extra?: { payload?: JsonValue; value?: JsonValue; resource?: JsonValue }, item?: string): Evaluated {
-    return evaluate(node, this.env(extra, item));
+    return this.counted(evaluate(node, this.env(extra, item), this.evalBudget));
   }
+
+  /** Evaluates named expressions into an object (an action's or a hold's input), drawing on this reader's budget. */
+  evalRecord(nodes: ReadonlyArray<readonly [string, Parameters<typeof evaluate>[0]]>, extra?: { resource?: JsonValue }, item?: string): Evaluated {
+    return this.counted(evaluateRecord(nodes, this.env(extra, item), this.evalBudget));
+  }
+
+  /**
+   * Evaluates the input of an undo or a reconcile, which reads only what was
+   * sent (`resource`). It has its own evaluation's budget, not this reader's:
+   * what the rest of the step spent must not stop an undo being sent.
+   */
+  evalFrozen(nodes: ReadonlyArray<readonly [string, Parameters<typeof evaluate>[0]]>, resource: JsonValue): Evaluated {
+    return this.counted(evaluateRecord(nodes, this.env({ resource })));
+  }
+
+  /** Passes an evaluation through, telling {@link tooCostly} when it was cut short. */
+  private counted(r: Evaluated): Evaluated {
+    if (isTooCostly(r)) this.tooCostly();
+    return r;
+  }
+
+  /** Told each time an evaluation was too costly to finish; the core's machine reports it. */
+  protected tooCostly(): void {}
 
   /** The action's input as it would be sent now (for a per-item action, for `item`). */
   currentInput(action: CompiledAction, item?: string): Evaluated {
-    return evaluateRecord(action.call.input, this.env({}, item));
+    return this.evalRecord(action.call.input, {}, item);
   }
 
   /** The action's latest result (`name[item]` for a per-item action) if it was produced from the current input. */
@@ -225,7 +304,9 @@ export class RunReader {
     const missingNeeds = step.needs.filter((n) => !readable(this.named(n, item)).known);
     if (missingNeeds.length > 0) {
       const facts = item === undefined ? missingNeeds : missingNeeds.map((n) => (n.includes(".") ? fieldAddress(step.forEach!, item, splitTemplate(n)!.field) : n));
-      return { kind: "blocked", missing: { facts, results: [] } };
+      // A need too costly to work out holds the run here, as a condition too costly to work out does.
+      const costly = missingNeeds.some((n) => wasTooCostly(this.named(n, item)));
+      return { kind: "blocked", missing: costly ? { facts, results: [], costly: true } : { facts, results: [] } };
     }
     const fillsDone = step.fills.every((f) => {
       const st = this.named(f, item)?.status;
@@ -283,7 +364,7 @@ export class RunReader {
 
   /** A call step's input as it would be sent now. */
   callInput(step: CompiledStep): Evaluated {
-    return evaluateRecord(step.call!.input, this.env());
+    return this.evalRecord(step.call!.input);
   }
 
   /** The newest call of a step that is still its own (not retired). */

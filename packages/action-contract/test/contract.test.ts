@@ -45,6 +45,15 @@ describe("digests", () => {
     expect(isOperationContract({ ...contract, riskFloor: "high" })).toBe(false);
     expect(isOperationContract({ ...contract, input: { type: "object", pattern: "(a)\\1" } })).toBe(false);
   });
+
+  it("of an operation contract cover undoOnly when present, and leave every other digest as it was", () => {
+    const undoOnly = { ...contract, undoOnly: true as const };
+    expect(isOperationContract(undoOnly)).toBe(true);
+    expect(operationDigest(undoOnly)).not.toBe(operationDigest(contract));
+    // Only true is a marker: false would be a second spelling of its absence, and a read is never an undo.
+    expect(isOperationContract({ ...contract, undoOnly: false })).toBe(false);
+    expect(isOperationContract({ ...contract, effect: "read", undoOnly: true })).toBe(false);
+  });
 });
 
 describe("normalizeOutcome", () => {
@@ -338,23 +347,23 @@ describe("actionPortConformance", () => {
   const read = { action: "notes.get", input: { id: "n-1" } as JsonObject };
   const write = { action: "notes.create", input: { title: "Hi" } as JsonObject, risk: "confirm" as const, idempotent: false };
   // Each write names the undo it declares; an undo states its own risk floor and idempotency.
-  const served = new Map<string, { effect: "read" | "write"; digest: ReturnType<typeof sha256Digest>; compensate?: string; riskFloor?: "none" | "confirm" | "approval"; idempotent?: boolean }>([
+  const served = new Map<string, { effect: "read" | "write"; digest: ReturnType<typeof sha256Digest>; compensate?: string; riskFloor?: "none" | "confirm" | "approval"; idempotent?: boolean; undoOnly?: true }>([
     ["notes.get", { effect: "read", digest: sha256Digest({ op: "get" }) }],
     ["notes.create", { effect: "write", digest: sha256Digest({ op: "create" }), compensate: "notes.delete" }],
-    ["notes.delete", { effect: "write", digest: sha256Digest({ op: "delete" }), idempotent: true }],
+    ["notes.delete", { effect: "write", digest: sha256Digest({ op: "delete" }), idempotent: true, undoOnly: true }],
     ["notes.share", { effect: "write", digest: sha256Digest({ op: "share" }), compensate: "notes.unshare" }],
     ["notes.unshare", { effect: "write", digest: sha256Digest({ op: "unshare" }), idempotent: true, riskFloor: "confirm" }],
     ["notes.pin", { effect: "write", digest: sha256Digest({ op: "pin" }), compensate: "notes.unpin" }],
     ["notes.unpin", { effect: "write", digest: sha256Digest({ op: "unpin" }), idempotent: false }],
   ]);
   const undos = [
-    { action: "notes.delete", input: { id: "n-1" } as JsonObject, undoes: "notes.create" },
-    { action: "notes.unshare", input: { id: "n-1" } as JsonObject, undoes: "notes.share", risk: "confirm" as const },
-    { action: "notes.unpin", input: { id: "n-1" } as JsonObject, undoes: "notes.pin", idempotent: false },
+    { action: "notes.delete", input: { id: "n-1" } as JsonObject, undoes: "notes.create", undoOnly: true },
+    { action: "notes.unshare", input: { id: "n-1" } as JsonObject, undoes: "notes.share", risk: "confirm" as const, undoOnly: false },
+    { action: "notes.unpin", input: { id: "n-1" } as JsonObject, undoes: "notes.pin", idempotent: false, undoOnly: false },
   ];
 
   /** A minimal performer that follows the contract. */
-  function referencePort(): { port: ActionPort; performed: () => number } {
+  function referencePort(options: { ignoreUndoOnly?: boolean } = {}): { port: ActionPort; performed: () => number } {
     let performed = 0;
     const claimed = new Set<string>();
     const port: ActionPort = {
@@ -368,6 +377,7 @@ describe("actionPortConformance", () => {
         if (a.environment !== "production") return refuse("connect/environment-mismatch", "Another environment.");
         if (a.action.contract !== undefined && a.action.contract !== op.digest) return refuse("connect/contract-mismatch", "Changed.");
         if (a.action.effect === "read" && op.effect === "write") return refuse("connect/effect-mismatch", "A write.");
+        if (a.purpose === "run" && op.undoOnly === true && options.ignoreUndoOnly !== true) return refuse("connect/effect-mismatch", "Only an undo.");
         if (a.purpose === "compensate") {
           if (a.undoes === undefined || served.get(a.undoes)?.compensate !== a.action.id) return refuse("connect/effect-mismatch", "Not its undo.");
           if (op.idempotent !== true) return refuse("connect/idempotency-mismatch", "Not safe to send again.");
@@ -391,12 +401,18 @@ describe("actionPortConformance", () => {
     const cases = actionPortConformance(port, { read: { ...read, contract: served.get("notes.get")!.digest }, write, undos, performed, performedWrite: write });
     expect(cases.length).toBeGreaterThanOrEqual(10);
     expect(cases.map((c) => c.name)).toEqual(
-      expect.arrayContaining(["refuses a declared undo that needs a review", "refuses a declared undo that does not de-duplicate", "refuses an undo sent for a write that does not declare it"]),
+      expect.arrayContaining(["refuses a declared undo that needs a review", "refuses a declared undo that does not de-duplicate", "refuses an undo sent for a write that does not declare it", "refuses an undo-only operation sent as a step"]),
     );
     for (const c of cases) await c.run();
     // The well-formed read, the read with a malformed traceparent, the read and write each sent again after a version
     // refusal, and the write delivered twice (performed once).
     expect(performed()).toBe(5);
+  });
+
+  it("fails a port that runs an undo-only operation as a step", async () => {
+    const { port, performed } = referencePort({ ignoreUndoOnly: true });
+    const step = actionPortConformance(port, { read, undos, performed }).find((c) => c.name === "refuses an undo-only operation sent as a step")!;
+    await expect(step.run()).rejects.toThrow(/notes.delete as a step: expected a refusal/);
   });
 
   it("fails a port that performs a write again when the same envelope arrives twice", async () => {
